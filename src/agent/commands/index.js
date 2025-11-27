@@ -18,6 +18,7 @@ const COMMAND_ALIASES = {
     'pic': 'putInChest',
     'tfc': 'takeFromChest',
     'vc': 'viewChest',
+    'da': 'depositAll',
     'dis': 'discard',
     
     // Movement commands
@@ -42,6 +43,7 @@ const COMMAND_ALIASES = {
     'inv': 'inventory',
     'st': 'stats',
     'nb': 'nearbyBlocks',
+    'sur': 'surroundings',
     'ent': 'entities',
     'cft': 'craftable',
     'gcp': 'getCraftingPlan',

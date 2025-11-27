@@ -60,6 +60,12 @@ const settings = {
     "use_command_aliases": true, // allow short aliases like !pic for !putInChest
     "chat_bot_messages": true, // publicly chat messages to other bots
 
+    // Local embedding settings (Transformers.js)
+    "use_local_embeddings": true, // Enable local Transformers.js embeddings for offline semantic search
+    "local_embedding_model": "Xenova/gte-small", // Model to use: "Xenova/gte-small" (60MB, fast) or "Xenova/all-MiniLM-L6-v2" (90MB, better accuracy)
+    "local_intent_threshold": 0.75, // Minimum similarity (0-1) for command/intent matching. Higher = more strict
+    "enable_simple_classifier": true, // Classify yes/no/help/stop locally without LLM
+
     "spawn_timeout": 30, // num seconds allowed for the bot to spawn before throwing error. Increase when spawning takes a while.
     "block_place_delay": 0, // delay between placing blocks (ms) if using newAction. helps avoid bot being kicked by anti-cheat mechanisms on servers.
   

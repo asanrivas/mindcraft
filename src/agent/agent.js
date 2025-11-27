@@ -16,6 +16,8 @@ import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
+import { LocalClassifier } from './local_classifier.js';
+import { LocalEmbedding } from '../models/local_embedding.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
@@ -34,6 +36,24 @@ export class Agent {
         this.self_prompter = new SelfPrompter(this);
         convoManager.initAgent(this);
         await this.prompter.initExamples();
+        
+        // Initialize local classifier if enabled
+        if (settings.use_local_embeddings) {
+            try {
+                const embeddingModel = new LocalEmbedding(settings.local_embedding_model);
+                this.localClassifier = new LocalClassifier(embeddingModel);
+                // Initialize in background (don't block startup)
+                this.localClassifier.init().catch(err => {
+                    console.warn(`[Agent] Failed to initialize local classifier: ${err.message}`);
+                    this.localClassifier = null;
+                });
+            } catch (error) {
+                console.warn(`[Agent] Local classifier disabled: ${error.message}`);
+                this.localClassifier = null;
+            }
+        } else {
+            this.localClassifier = null;
+        }
 
         // load mem first before doing task
         let save_data = null;
@@ -276,6 +296,89 @@ export class Agent {
         // Now translate the message
         message = await handleEnglishTranslation(message);
         console.log('received message from', source, ':', message);
+
+        // Try local classification before LLM (only for user messages, not system/self-prompt)
+        // Skip for complex structure requests (contain dimensions like "4x4") - let LLM handle those
+        const isComplexStructure = /\d+x\d+/.test(message.toLowerCase());
+        if (!self_prompt && !from_other_bot && this.localClassifier && settings.use_local_embeddings && !isComplexStructure) {
+            try {
+                const classification = await this.localClassifier.classify(message, source);
+                if (classification) {
+                    if (classification.type === 'command' && classification.confidence >= (settings.local_intent_threshold || 0.75)) {
+                        // High confidence command match - execute directly
+                        console.log(`[LocalClassifier] Matched command: ${classification.command} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`);
+                        this.history.add(source, message);
+                        
+                        // Build command string with extracted args
+                        let commandStr = classification.command;
+                        if (classification.args && classification.args.length > 0) {
+                            // Format args: strings in quotes, numbers as-is
+                            const argsStr = classification.args.map(arg => {
+                                // Check if it's a number
+                                if (/^-?\d+(\.\d+)?$/.test(arg)) {
+                                    return arg;
+                                }
+                                return `"${arg}"`;
+                            }).join(', ');
+                            commandStr = `${classification.command}(${argsStr})`;
+                        }
+                        
+                        // Check if command requires args but we didn't extract any
+                        const { getCommand } = await import('./commands/index.js');
+                        const cmd = getCommand(classification.command);
+                        const requiredArgs = cmd && cmd.params ? Object.keys(cmd.params).length : 0;
+                        const extractedArgs = classification.args ? classification.args.length : 0;
+                        
+                        if (requiredArgs > 0 && extractedArgs === 0) {
+                            console.log(`[LocalClassifier] Command ${classification.command} requires ${requiredArgs} args but none extracted, falling back to LLM`);
+                            // Fall through to LLM - don't execute incomplete command
+                        } else {
+                            // Execute the command
+                            this.history.add(this.name, commandStr);
+                            const execute_res = await executeCommand(this, commandStr);
+                            if (execute_res) {
+                                this.history.add('system', execute_res);
+                                this.routeResponse(source, execute_res);
+                            }
+                            this.history.save();
+                            return true;
+                        }
+                    } else if (classification.type === 'simple' && classification.confidence >= (settings.local_intent_threshold * 0.9 || 0.68)) {
+                        // Simple intent match - handle directly
+                        console.log(`[LocalClassifier] Matched simple intent: ${classification.intent} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`);
+                        
+                        if (classification.intent === 'yes') {
+                            this.history.add(source, message);
+                            this.history.add(this.name, 'Yes, I understand.');
+                            this.routeResponse(source, 'Yes, I understand.');
+                            this.history.save();
+                            return true;
+                        } else if (classification.intent === 'no') {
+                            this.history.add(source, message);
+                            this.history.add(this.name, 'No, I understand.');
+                            this.routeResponse(source, 'No, I understand.');
+                            this.history.save();
+                            return true;
+                        } else if (classification.intent === 'help') {
+                            // Let LLM handle help requests (they need context)
+                            // Fall through to normal flow
+                        } else if (classification.intent === 'stop') {
+                            // Execute stop command
+                            this.history.add(source, message);
+                            const execute_res = await executeCommand(this, '!stop');
+                            if (execute_res) {
+                                this.history.add('system', execute_res);
+                                this.routeResponse(source, execute_res);
+                            }
+                            this.history.save();
+                            return true;
+                        }
+                    }
+                }
+            } catch (error) {
+                console.warn(`[Agent] Local classification failed: ${error.message}, falling back to LLM`);
+            }
+        }
 
         const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up || convoManager.responseScheduledFor(source);
         

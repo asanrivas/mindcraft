@@ -34,8 +34,9 @@ export function selectAPI(profile) {
     if (typeof profile === 'string' || profile instanceof String) {
         profile = {model: profile};
     }
-    // backwards compatibility with local->ollama
-    if (profile.api?.includes('local') || profile.model?.includes('local')) {
+    // backwards compatibility with local->ollama (but not local-embed)
+    if ((profile.api?.includes('local') || profile.model?.includes('local')) && 
+        !profile.api?.includes('local-embed') && !profile.model?.includes('local-embed')) {
         profile.api = 'ollama';
         if (profile.model) {
             profile.model = profile.model.replace('local', 'ollama');

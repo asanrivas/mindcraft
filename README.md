@@ -113,9 +113,66 @@ When `use_command_aliases` is enabled, you can use short aliases:
 | `!pic` | `!putInChest` | `!cb` | `!collectBlocks` |
 | `!tfc` | `!takeFromChest` | `!cr` | `!craftRecipe` |
 | `!vc` | `!viewChest` | `!gcp` | `!getCraftingPlan` |
-| `!gtp` | `!goToPlayer` | `!atk` | `!attack` |
-| `!fp` | `!followPlayer` | `!inv` | `!inventory` |
-| `!gtc` | `!goToCoordinates` | `!g` | `!goal` |
+| `!da` | `!depositAll` | `!atk` | `!attack` |
+| `!gtp` | `!goToPlayer` | `!inv` | `!inventory` |
+| `!fp` | `!followPlayer` | `!g` | `!goal` |
+| `!gtc` | `!goToCoordinates` | `!clm` | `!clearMemory` |
+
+## Local Embeddings (Experimental)
+
+Mindcraft now supports **local embedding models** using [Transformers.js](https://github.com/huggingface/transformers.js) for offline semantic processing. This reduces API calls and enables faster responses for common commands.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Command Intent Matching** | "follow me" → `!followPlayer` without LLM call |
+| **Semantic Memory Search** | Find relevant past memories by meaning |
+| **Simple Classification** | Detect yes/no/stop responses locally |
+| **Offline Operation** | Works without internet after first model download |
+
+### Settings
+
+Configure in `settings.js`:
+
+```javascript
+"use_local_embeddings": true,           // Enable local Transformers.js embeddings
+"local_embedding_model": "Xenova/gte-small",  // Model: "Xenova/gte-small" (60MB) or "Xenova/all-MiniLM-L6-v2" (90MB)
+"local_intent_threshold": 0.75,         // Similarity threshold (0-1), higher = more strict
+"enable_simple_classifier": true,       // Classify yes/no/stop locally
+```
+
+### How It Works
+
+When enabled, the bot tries to match natural language to commands locally before calling the LLM:
+
+```
+User: "follow me"
+  ↓
+LocalClassifier (similarity: 92%)
+  ↓
+!followPlayer("username", 3)
+  ↓
+Execute directly (no LLM call)
+```
+
+### Supported Commands
+
+The local classifier can match these commands from natural language:
+
+- **Movement**: `!followPlayer`, `!goToPlayer`, `!goToRememberedPlace`, `!searchForBlock`
+- **Actions**: `!collectBlocks`, `!craftRecipe`, `!equip`, `!consume`, `!attack`, `!smeltItem`
+- **Storage**: `!putInChest`, `!takeFromChest`, `!depositAll`, `!viewChest`
+- **Info**: `!stats`, `!inventory`, `!surroundings`, `!nearbyBlocks`
+- **Control**: `!stop`, `!clearMemory`, `!goToBed`
+
+### Requirements
+
+- First run downloads the model (~60MB) to `~/.cache/huggingface`
+- Minimum 2GB RAM available
+- Node.js 18+ (already required by Mindcraft)
+
+> **Note**: Complex requests (e.g., "build a 4x4 fence") bypass local classification and go to the LLM for proper handling.
 
 ## Online Servers
 To connect to online servers your bot will need an official Microsoft/Minecraft account. You can use your own personal one, but will need another account if you want to connect too and play with it. To connect, change these lines in `settings.js`:
@@ -202,6 +259,8 @@ Here are some commonly used bot commands:
 | `!inventory` | `!inv` | View bot's inventory |
 | `!stats` | `!st` | View bot's health, hunger, position |
 | `!getCraftingPlan("item", num)` | `!gcp` | Get crafting requirements for an item |
+| `!surroundings` | `!sur` | 3D view of blocks in all directions (front/back/left/right/up/down) |
+| `!nearbyBlocks` | `!nb` | List nearby blocks + important blocks with distance/direction |
 
 ### Storage Commands
 The bot can interact with all storage types (chests, ender chests, shulker boxes, barrels):
@@ -211,6 +270,16 @@ The bot can interact with all storage types (chests, ender chests, shulker boxes
 | `!putInChest("item", num)` | `!pic` | Put items in nearest container |
 | `!takeFromChest("item", num)` | `!tfc` | Take items from nearest container |
 | `!viewChest` | `!vc` | View contents of nearest container |
+| `!depositAll("except")` | `!da` | Deposit ALL items (keeps tools by default) |
+
+### Agent Behavior Rules
+
+The bot follows these key rules:
+- **Task Completion**: When given a task, continues until FULLY complete
+- **Self vs Player**: "for yourself" = keep item, "give me" = give to player
+- **Tool Equipping**: After crafting tools, bot is reminded to use `!equip`
+- **Inventory Awareness**: Bot checks inventory before actions, warns when full
+- **Smart Crafting**: Shows alternatives when missing exact ingredients (e.g., any planks work for sticks)
 
 # Bot Profiles
 

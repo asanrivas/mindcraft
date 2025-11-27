@@ -78,9 +78,16 @@ export async function craftRecipe(bot, itemName, num=1) {
      * await skills.craftRecipe(bot, "stick");
      **/
     let placedTable = false;
+    
+    // Check if bot already has enough of this item
+    const currentCount = world.getInventoryCounts(bot)[itemName] || 0;
+    if (currentCount >= num * 10) { // If we have 10x what we're trying to craft, probably don't need more
+        log(bot, `You already have ${currentCount} ${itemName} in inventory. Do you really need to craft more?`);
+    }
 
-    if (mc.getItemCraftingRecipes(itemName).length == 0) {
-        log(bot, `${itemName} is either not an item, or it does not have a crafting recipe!`);
+    const itemRecipes = mc.getItemCraftingRecipes(itemName);
+    if (!itemRecipes || itemRecipes.length === 0) {
+        log(bot, `${itemName} is either not an item, or it does not have a crafting recipe! You cannot craft ${itemName}.`);
         return false;
     }
 
@@ -117,7 +124,26 @@ export async function craftRecipe(bot, itemName, num=1) {
         }
     }
     if (!recipes || recipes.length === 0) {
-        log(bot, `You do not have the resources to craft a ${itemName}. It requires: ${Object.entries(mc.getItemCraftingRecipes(itemName)[0][0]).map(([key, value]) => `${key}: ${value}`).join(', ')}.`);
+        // Build a helpful error message showing what's needed AND what the bot has
+        const recipeReqs = mc.getItemCraftingRecipes(itemName)[0][0];
+        const inventory = world.getInventoryCounts(bot);
+        
+        // Check for generic ingredient alternatives (e.g., any planks work for sticks)
+        let reqStr = Object.entries(recipeReqs).map(([key, value]) => {
+            const have = inventory[key] || 0;
+            // Check for alternatives (planks can be any wood type)
+            if (key.includes('_planks')) {
+                const allPlanks = Object.entries(inventory)
+                    .filter(([k, v]) => k.includes('_planks') && v > 0)
+                    .map(([k, v]) => `${k}(${v})`);
+                if (allPlanks.length > 0) {
+                    return `${key}: ${value} (have ${have}, but you have: ${allPlanks.join(', ')})`;
+                }
+            }
+            return `${key}: ${value} (have ${have})`;
+        }).join(', ');
+        
+        log(bot, `Cannot craft ${itemName}. Requires: ${reqStr}`);
         if (placedTable) {
             await collectBlock(bot, 'crafting_table', 1);
         }
@@ -135,9 +161,42 @@ export async function craftRecipe(bot, itemName, num=1) {
     const requiredIngredients = mc.ingredientsFromPrismarineRecipe(recipe); //Items required to use the recipe once.
     const craftLimit = mc.calculateLimitingResource(inventory, requiredIngredients);
     
-    await bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable);
-    if(craftLimit.num<num) log(bot, `Not enough ${craftLimit.limitingResource} to craft ${num}, crafted ${craftLimit.num}. You now have ${world.getInventoryCounts(bot)[itemName]} ${itemName}.`);
-    else log(bot, `Successfully crafted ${itemName}, you now have ${world.getInventoryCounts(bot)[itemName]} ${itemName}.`);
+    // Don't attempt to craft if we can't craft even once
+    if (craftLimit.num <= 0) {
+        log(bot, `Cannot craft ${itemName}: missing ${craftLimit.limitingResource}. You have: ${inventory[craftLimit.limitingResource] || 0}, need at least 1.`);
+        if (placedTable) {
+            await collectBlock(bot, 'crafting_table', 1);
+        }
+        return false;
+    }
+    
+    try {
+        await bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable);
+        const newCount = world.getInventoryCounts(bot)[itemName] || 0;
+        
+        // Check if this is a tool/weapon that should be equipped
+        const isEquipable = itemName.includes('_sword') || itemName.includes('_pickaxe') || 
+                           itemName.includes('_axe') || itemName.includes('_shovel') || 
+                           itemName.includes('_hoe') || itemName.includes('bow') ||
+                           itemName.includes('shield') || itemName.includes('fishing_rod');
+        const equipHint = isEquipable ? ' Use !equip to use it.' : '';
+        
+        if(craftLimit.num<num) log(bot, `Not enough ${craftLimit.limitingResource} to craft ${num}, crafted ${craftLimit.num}. You now have ${newCount} ${itemName}.${equipHint}`);
+        else log(bot, `Successfully crafted ${itemName}, you now have ${newCount} ${itemName}.${equipHint}`);
+    } catch (err) {
+        // Handle mineflayer craft errors gracefully
+        const errMsg = err.message || String(err);
+        if (errMsg.includes('missing ingredient')) {
+            log(bot, `Crafting ${itemName} failed: ingredients changed during crafting. Try collecting more materials.`);
+        } else {
+            log(bot, `Crafting ${itemName} failed: ${errMsg}`);
+        }
+        if (placedTable) {
+            await collectBlock(bot, 'crafting_table', 1);
+        }
+        return false;
+    }
+    
     if (placedTable) {
         await collectBlock(bot, 'crafting_table', 1);
     }

@@ -179,6 +179,22 @@ export class Prompter {
             prompt = prompt.replaceAll('$EXAMPLES', await examples.createExampleMessage(messages));
         if (prompt.includes('$MEMORY'))
             prompt = prompt.replaceAll('$MEMORY', this.agent.history.memory);
+        if (prompt.includes('$RELEVANT_MEMORIES')) {
+            // Semantic memory search - find relevant memories based on current conversation
+            if (settings.use_local_embeddings && messages && messages.length > 0) {
+                // Use the last user message as search query
+                const lastUserMessage = messages.slice().reverse().find(msg => msg.role === 'user');
+                if (lastUserMessage) {
+                    const query = lastUserMessage.content.replace(/^[^:]+:\s*/, ''); // Remove sender prefix
+                    const relevantMemories = await this.agent.history.getRelevantMemories(query, 3);
+                    prompt = prompt.replaceAll('$RELEVANT_MEMORIES', relevantMemories || '');
+                } else {
+                    prompt = prompt.replaceAll('$RELEVANT_MEMORIES', '');
+                }
+            } else {
+                prompt = prompt.replaceAll('$RELEVANT_MEMORIES', '');
+            }
+        }
         if (prompt.includes('$TO_SUMMARIZE'))
             prompt = prompt.replaceAll('$TO_SUMMARIZE', stringifyTurns(to_summarize));
         if (prompt.includes('$CONVO'))

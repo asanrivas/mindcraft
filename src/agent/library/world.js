@@ -74,6 +74,141 @@ export function getSurroundingBlocks(bot) {
     return res;
 }
 
+export function getDirectionalBlocks(bot, distance=4) {
+    /**
+     * Get blocks in each cardinal direction from the bot, considering bot's facing direction.
+     * @param {Bot} bot - The bot to get blocks for.
+     * @param {number} distance - How far to scan in each direction, default 4.
+     * @returns {object} - Object with directional block arrays.
+     **/
+    const pos = bot.entity.position;
+    const yaw = bot.entity.yaw;
+    
+    // Calculate facing direction (in Minecraft, yaw 0 = south, increases counter-clockwise)
+    // Convert to cardinal: N/S/E/W
+    const facingAngle = ((yaw * 180 / Math.PI) % 360 + 360) % 360;
+    let facing = 'south';
+    if (facingAngle >= 45 && facingAngle < 135) facing = 'west';
+    else if (facingAngle >= 135 && facingAngle < 225) facing = 'north';
+    else if (facingAngle >= 225 && facingAngle < 315) facing = 'east';
+    
+    // Direction vectors based on facing
+    const directions = {
+        north: { front: [0, 0, -1], back: [0, 0, 1], left: [1, 0, 0], right: [-1, 0, 0] },
+        south: { front: [0, 0, 1], back: [0, 0, -1], left: [-1, 0, 0], right: [1, 0, 0] },
+        east: { front: [1, 0, 0], back: [-1, 0, 0], left: [0, 0, -1], right: [0, 0, 1] },
+        west: { front: [-1, 0, 0], back: [1, 0, 0], left: [0, 0, 1], right: [0, 0, -1] }
+    };
+    
+    const dirs = directions[facing];
+    
+    function scanDirection(dx, dy, dz, dist) {
+        let blocks = [];
+        for (let i = 1; i <= dist; i++) {
+            let block = bot.blockAt(pos.offset(dx * i, dy * i, dz * i));
+            blocks.push(block ? block.name : 'air');
+        }
+        return blocks;
+    }
+    
+    return {
+        facing: facing,
+        front: scanDirection(...dirs.front, distance),
+        back: scanDirection(...dirs.back, distance),
+        left: scanDirection(...dirs.left, distance),
+        right: scanDirection(...dirs.right, distance),
+        up: scanDirection(0, 1, 0, distance),
+        down: scanDirection(0, -1, 0, distance)
+    };
+}
+
+export function getImportantBlocksWithDirection(bot, distance=16) {
+    /**
+     * Get important/interactive blocks with their direction and distance from bot.
+     * @param {Bot} bot - The bot to get blocks for.
+     * @param {number} distance - Maximum search distance, default 16.
+     * @returns {string[]} - Array of strings describing block locations.
+     **/
+    const pos = bot.entity.position;
+    const yaw = bot.entity.yaw;
+    
+    // Important blocks to track
+    const importantBlocks = [
+        'chest', 'trapped_chest', 'ender_chest', 'barrel', 'shulker_box',
+        'crafting_table', 'furnace', 'blast_furnace', 'smoker',
+        'anvil', 'enchanting_table', 'brewing_stand', 'grindstone',
+        'bed', 'white_bed', 'red_bed', // etc
+        'water', 'lava',
+        'diamond_ore', 'deepslate_diamond_ore', 'iron_ore', 'deepslate_iron_ore',
+        'gold_ore', 'deepslate_gold_ore', 'coal_ore', 'deepslate_coal_ore',
+        'copper_ore', 'deepslate_copper_ore', 'emerald_ore', 'deepslate_emerald_ore',
+        'ancient_debris', 'spawner'
+    ];
+    
+    // Also include any shulker box colors
+    const colors = ['white', 'orange', 'magenta', 'light_blue', 'yellow', 'lime', 'pink', 
+                   'gray', 'light_gray', 'cyan', 'purple', 'blue', 'brown', 'green', 'red', 'black'];
+    for (const color of colors) {
+        importantBlocks.push(`${color}_shulker_box`);
+        importantBlocks.push(`${color}_bed`);
+    }
+    
+    let blocks = bot.findBlocks({
+        matching: (block) => block && importantBlocks.includes(block.name),
+        maxDistance: distance,
+        count: 50
+    });
+    
+    let results = [];
+    let seen = new Set(); // Avoid duplicates of same type at similar locations
+    
+    for (let blockPos of blocks) {
+        let block = bot.blockAt(blockPos);
+        if (!block) continue;
+        
+        // Calculate direction
+        let dx = blockPos.x - pos.x;
+        let dy = blockPos.y - pos.y;
+        let dz = blockPos.z - pos.z;
+        let dist = Math.round(Math.sqrt(dx*dx + dy*dy + dz*dz));
+        
+        // Determine cardinal direction based on bot's facing
+        let direction = '';
+        
+        // Horizontal direction
+        if (Math.abs(dx) > 1 || Math.abs(dz) > 1) {
+            let angle = Math.atan2(-dx, dz) * 180 / Math.PI; // Minecraft coordinate system
+            angle = ((angle % 360) + 360) % 360;
+            
+            if (angle >= 337.5 || angle < 22.5) direction = 'South';
+            else if (angle >= 22.5 && angle < 67.5) direction = 'SW';
+            else if (angle >= 67.5 && angle < 112.5) direction = 'West';
+            else if (angle >= 112.5 && angle < 157.5) direction = 'NW';
+            else if (angle >= 157.5 && angle < 202.5) direction = 'North';
+            else if (angle >= 202.5 && angle < 247.5) direction = 'NE';
+            else if (angle >= 247.5 && angle < 292.5) direction = 'East';
+            else direction = 'SE';
+        }
+        
+        // Vertical component
+        let vertical = '';
+        if (dy > 1) vertical = `, ${Math.round(dy)} up`;
+        else if (dy < -1) vertical = `, ${Math.round(Math.abs(dy))} down`;
+        
+        // Create unique key to avoid duplicate entries
+        let key = `${block.name}-${direction}-${Math.round(dist/3)}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        
+        let locationStr = direction ? `${dist} blocks ${direction}${vertical}` : `${dist} blocks away${vertical}`;
+        results.push(`${block.name}: ${locationStr}`);
+        
+        if (results.length >= 10) break; // Limit to 10 important blocks
+    }
+    
+    return results;
+}
+
 
 export function getFirstBlockAboveHead(bot, ignore_types=null, distance=32) {
      /**

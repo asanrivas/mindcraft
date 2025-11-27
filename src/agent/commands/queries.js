@@ -102,7 +102,7 @@ export const queryList = [
     },
     {
         name: "!nearbyBlocks",
-        description: "Get the blocks near the bot.",
+        description: "Get the blocks near the bot, including important blocks with distance/direction.",
         perform: function (agent) {
             let bot = agent.bot;
             let res = 'NEARBY_BLOCKS';
@@ -126,6 +126,43 @@ export const queryList = [
                 res += '\n- ' + world.getSurroundingBlocks(bot).join('\n- ');
                 res += `\n- First Solid Block Above Head: ${world.getFirstBlockAboveHead(bot, null, 32)}`;
             }
+            
+            // Add important blocks with direction
+            let important = world.getImportantBlocksWithDirection(bot, 32);
+            if (important.length > 0) {
+                res += '\nIMPORTANT_NEARBY:';
+                for (let item of important) {
+                    res += `\n- ${item}`;
+                }
+            }
+            
+            return pad(res);
+        }
+    },
+    {
+        name: "!surroundings",
+        description: "Get a 3D view of blocks in each direction (front/back/left/right/up/down) based on where the bot is facing.",
+        perform: function (agent) {
+            let bot = agent.bot;
+            let dirBlocks = world.getDirectionalBlocks(bot, 4);
+            
+            let res = `SURROUNDINGS (facing ${dirBlocks.facing.toUpperCase()}):`;
+            res += `\nFront(4): ${dirBlocks.front.join(' → ')}`;
+            res += `\nBack(4): ${dirBlocks.back.join(' → ')}`;
+            res += `\nLeft(4): ${dirBlocks.left.join(' → ')}`;
+            res += `\nRight(4): ${dirBlocks.right.join(' → ')}`;
+            res += `\nUp(4): ${dirBlocks.up.join(' → ')}`;
+            res += `\nDown(4): ${dirBlocks.down.join(' → ')}`;
+            
+            // Add important blocks
+            let important = world.getImportantBlocksWithDirection(bot, 24);
+            if (important.length > 0) {
+                res += '\nIMPORTANT_BLOCKS:';
+                for (let item of important) {
+                    res += `\n- ${item}`;
+                }
+            }
+            
             return pad(res);
         }
     },

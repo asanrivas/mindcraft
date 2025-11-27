@@ -258,6 +258,17 @@ export const actionsList = [
         })
     },
     {
+        name: '!depositAll',
+        description: 'Deposit ALL items from inventory into the nearest storage container. Keeps essential tools (pickaxe, sword, axe, shovel) by default.',
+        params: {
+            'except': { type: 'string', description: 'Comma-separated list of items to keep (e.g., "torch,food,coal"). Optional.' }
+        },
+        perform: runAsAction(async (agent, except) => {
+            const excludeItems = except ? except.split(',').map(s => s.trim()) : [];
+            await skills.depositAllItems(agent.bot, excludeItems);
+        })
+    },
+    {
         name: '!discard',
         description: 'Discard the given item from the inventory.',
         params: {

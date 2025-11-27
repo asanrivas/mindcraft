@@ -1,6 +1,8 @@
 import { writeFileSync, readFileSync, mkdirSync, existsSync } from 'fs';
 import { NPCData } from './npc/data.js';
 import settings from './settings.js';
+import { LocalEmbedding } from '../models/local_embedding.js';
+import { cosineSimilarity } from '../utils/math.js';
 
 
 export class History {
@@ -24,6 +26,13 @@ export class History {
         this.summary_chunk_size = 5; 
         // chunking reduces expensive calls to promptMemSaving and appendFullHistory
         // and improves the quality of the memory summary
+        
+        // Semantic memory search (if local embeddings enabled)
+        this.memoryEmbeddings = []; // Array of {text, embedding, timestamp}
+        this.embedder = null;
+        if (settings.use_local_embeddings) {
+            this.embedder = new LocalEmbedding(settings.local_embedding_model);
+        }
     }
 
     getHistory() { // expects an Examples object
@@ -40,6 +49,25 @@ export class History {
         }
 
         console.log("Memory updated to: ", this.memory);
+        
+        // Store embedding for semantic search
+        if (this.embedder && this.memory.trim().length > 0) {
+            try {
+                const embedding = await this.embedder.embed(this.memory);
+                this.memoryEmbeddings.push({
+                    text: this.memory,
+                    embedding: embedding,
+                    timestamp: Date.now()
+                });
+                
+                // Keep only last 50 memory embeddings to limit memory usage
+                if (this.memoryEmbeddings.length > 50) {
+                    this.memoryEmbeddings.shift();
+                }
+            } catch (error) {
+                console.warn('[History] Failed to create memory embedding:', error.message);
+            }
+        }
     }
 
     async appendFullHistory(to_store) {
@@ -117,5 +145,62 @@ export class History {
     clear() {
         this.turns = [];
         this.memory = '';
+        this.memoryEmbeddings = [];
+    }
+    
+    /**
+     * Search memories semantically using local embeddings
+     * @param {string} query - Search query
+     * @param {number} topK - Number of results to return (default: 3)
+     * @param {number} minSimilarity - Minimum similarity threshold (default: 0.6)
+     * @returns {Promise<Array<{text: string, similarity: number, timestamp: number}>>}
+     */
+    async searchMemory(query, topK = 3, minSimilarity = 0.6) {
+        if (!this.embedder || this.memoryEmbeddings.length === 0) {
+            return [];
+        }
+        
+        try {
+            const queryEmbedding = await this.embedder.embed(query);
+            const results = [];
+            
+            for (const mem of this.memoryEmbeddings) {
+                const similarity = cosineSimilarity(queryEmbedding, mem.embedding);
+                if (similarity >= minSimilarity) {
+                    results.push({
+                        text: mem.text,
+                        similarity: similarity,
+                        timestamp: mem.timestamp
+                    });
+                }
+            }
+            
+            // Sort by similarity descending
+            results.sort((a, b) => b.similarity - a.similarity);
+            
+            return results.slice(0, topK);
+        } catch (error) {
+            console.warn('[History] Failed to search memory:', error.message);
+            return [];
+        }
+    }
+    
+    /**
+     * Get relevant memories for a query (formatted for prompt inclusion)
+     * @param {string} query - Search query
+     * @param {number} topK - Number of memories to retrieve
+     * @returns {Promise<string>} Formatted memory string for prompts
+     */
+    async getRelevantMemories(query, topK = 3) {
+        const results = await this.searchMemory(query, topK, 0.6);
+        if (results.length === 0) {
+            return '';
+        }
+        
+        let formatted = 'Relevant memories:\n';
+        for (let i = 0; i < results.length; i++) {
+            formatted += `${i + 1}. ${results[i].text} (relevance: ${(results[i].similarity * 100).toFixed(0)}%)\n`;
+        }
+        return formatted;
     }
 }

@@ -86,6 +86,37 @@ To install our models, install ollama and run the following terminal command:
 ollama pull sweaterdog/andy-4:micro-q8_0 && ollama pull embeddinggemma
 ```
 
+## Token Optimization
+
+These settings in `settings.js` help reduce API token usage and costs:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `command_docs_mode` | `"full"` | `"full"`, `"compact"`, or `"minimal"` - controls verbosity of command documentation in prompts |
+| `include_inventory` | `true` | Include inventory list in prompt. Set `false` to save ~300 tokens |
+| `include_stats` | `true` | Include bot stats/position in prompt |
+| `include_nearby_blocks` | `true` | Include nearby blocks in prompt. Set `false` to save ~200 tokens |
+| `use_command_aliases` | `true` | Enable short command aliases (e.g., `!pic` for `!putInChest`) |
+
+### Command Docs Modes
+
+- **`full`** (~2000 tokens): Complete command documentation with full descriptions and parameter details
+- **`compact`** (~800 tokens): Shortened descriptions with inline parameters
+- **`minimal`** (~200 tokens): Just command names, best for capable models
+
+### Command Aliases
+
+When `use_command_aliases` is enabled, you can use short aliases:
+
+| Alias | Command | Alias | Command |
+|-------|---------|-------|---------|
+| `!pic` | `!putInChest` | `!cb` | `!collectBlocks` |
+| `!tfc` | `!takeFromChest` | `!cr` | `!craftRecipe` |
+| `!vc` | `!viewChest` | `!gcp` | `!getCraftingPlan` |
+| `!gtp` | `!goToPlayer` | `!atk` | `!attack` |
+| `!fp` | `!followPlayer` | `!inv` | `!inventory` |
+| `!gtc` | `!goToCoordinates` | `!g` | `!goal` |
+
 ## Online Servers
 To connect to online servers your bot will need an official Microsoft/Minecraft account. You can use your own personal one, but will need another account if you want to connect too and play with it. To connect, change these lines in `settings.js`:
 ```javascript
@@ -157,6 +188,29 @@ When running in docker, if you want the bot to join your local minecraft server,
 ```
 
 To connect to an unsupported minecraft version, you can try to use [viaproxy](services/viaproxy/README.md)
+
+## Useful Commands
+
+Here are some commonly used bot commands:
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `!goal("task")` | `!g` | Set a persistent goal for the bot to work towards |
+| `!stop` | - | Stop current action immediately |
+| `!clearMemory` | `!clm` | Reset bot memory completely (useful when bot is confused) |
+| `!clearChat` | `!clr` | Clear conversation history |
+| `!inventory` | `!inv` | View bot's inventory |
+| `!stats` | `!st` | View bot's health, hunger, position |
+| `!getCraftingPlan("item", num)` | `!gcp` | Get crafting requirements for an item |
+
+### Storage Commands
+The bot can interact with all storage types (chests, ender chests, shulker boxes, barrels):
+
+| Command | Alias | Description |
+|---------|-------|-------------|
+| `!putInChest("item", num)` | `!pic` | Put items in nearest container |
+| `!takeFromChest("item", num)` | `!tfc` | Take items from nearest container |
+| `!viewChest` | `!vc` | View contents of nearest container |
 
 # Bot Profiles
 

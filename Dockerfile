@@ -1,51 +1,44 @@
-# Specify a base image
-# FROM ubuntu:22.04
-FROM node:18
+FROM node:18-bookworm
 
-#Install some dependencies
+# Install build dependencies for native modules and Mesa for WebGL
+RUN apt-get update && apt-get install -y \
+    python3 \
+    python-is-python3 \
+    git \
+    make \
+    g++ \
+    build-essential \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libjpeg-dev \
+    libgif-dev \
+    librsvg2-dev \
+    libxi-dev \
+    libglu1-mesa-dev \
+    libglew-dev \
+    pkg-config \
+    mesa-utils \
+    libgl1-mesa-dri \
+    libgl1-mesa-glx \
+    libegl1-mesa \
+    libgbm1 \
+    xvfb \
+    dbus-x11 \
+    && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get -y update
-RUN apt-get -y install git
-RUN apt-get -y install unzip
-RUN apt-get -y install python3
-RUN apt-get -y install python3-pip
-RUN apt-get -y install python3-boto3
-RUN apt-get -y install python3-tqdm
-RUN apt-get -y install tmux
+# Set up headless GL environment
+ENV LIBGL_ALWAYS_INDIRECT=1
+ENV GALLIUM_DRIVER=llvmpipe
 
-RUN git clone https://github.com/mindcraft-bots/mindcraft.git /mindcraft
-WORKDIR /mindcraft
-COPY ./server_data.zip /mindcraft
-RUN unzip server_data.zip
+WORKDIR /app
 
+# Copy package files
+COPY package.json package-lock.json* ./
+
+# Install dependencies
 RUN npm install
 
+# Copy the rest of the application
+COPY . .
 
-# Copy the rest of the application code to the working directory
-# RUN apt update
-# RUN apt install bash ca-certificates wget git -y # install first to avoid openjdk install bug
-# RUN apt install openjdk-17-jre-headless -y
-RUN apt install -y wget apt-transport-https gnupg lsb-release
-
-# Add Adoptium repository key
-RUN wget -O - https://packages.adoptium.net/artifactory/api/gpg/key/public | apt-key add -
-
-# Add Adoptium repository
-RUN echo "deb https://packages.adoptium.net/artifactory/deb $(lsb_release -cs) main" > /etc/apt/sources.list.d/adoptium.list
-
-# Update package lists
-RUN apt update
-
-# Install Temurin (Adoptium) Java 21
-RUN apt install temurin-21-jdk -y
-
-# Install unzip
-
-
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-RUN unzip awscliv2.zip
-RUN ./aws/install
-
-VOLUME /data
-
-EXPOSE 8000
+CMD ["node", "main.js"]

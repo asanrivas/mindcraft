@@ -89,6 +89,25 @@ export const actionsList = [
         }
     },
     {
+        name: '!clearMemory',
+        description: 'Clear all memory including chat history and saved memory. Use when the bot is confused or has wrong information stuck in memory.',
+        perform: async function (agent) {
+            // Clear both turns and memory
+            agent.history.turns = [];
+            agent.history.memory = '';
+            
+            // Reset self-prompter state
+            if (agent.self_prompter.isActive()) {
+                agent.self_prompter.stopLoop();
+            }
+            
+            // Save the cleared state to disk immediately
+            await agent.history.save();
+            
+            return agent.name + "'s memory has been completely cleared and saved. Starting fresh with no prior context.";
+        }
+    },
+    {
         name: '!goToPlayer',
         description: 'Go to the given player.',
         params: {
@@ -210,10 +229,10 @@ export const actionsList = [
     },
     {
         name: '!putInChest',
-        description: 'Put the given item in the nearest chest.',
+        description: 'Put the given item in the nearest storage container (chest, ender chest, shulker box, or barrel).',
         params: {
-            'item_name': { type: 'ItemName', description: 'The name of the item to put in the chest.' },
-            'num': { type: 'int', description: 'The number of items to put in the chest.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'item_name': { type: 'ItemName', description: 'The name of the item to put in the container.' },
+            'num': { type: 'int', description: 'The number of items to put in the container.', domain: [1, Number.MAX_SAFE_INTEGER] }
         },
         perform: runAsAction(async (agent, item_name, num) => {
             await skills.putInChest(agent.bot, item_name, num);
@@ -221,7 +240,7 @@ export const actionsList = [
     },
     {
         name: '!takeFromChest',
-        description: 'Take the given items from the nearest chest.',
+        description: 'Take the given items from the nearest storage container (chest, ender chest, shulker box, or barrel).',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the item to take.' },
             'num': { type: 'int', description: 'The number of items to take.', domain: [1, Number.MAX_SAFE_INTEGER] }
@@ -232,7 +251,7 @@ export const actionsList = [
     },
     {
         name: '!viewChest',
-        description: 'View the items/counts of the nearest chest.',
+        description: 'View the items/counts of the nearest storage container (chest, ender chest, shulker box, or barrel).',
         params: { },
         perform: runAsAction(async (agent) => {
             await skills.viewChest(agent.bot);

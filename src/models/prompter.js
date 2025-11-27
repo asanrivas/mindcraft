@@ -137,14 +137,28 @@ export class Prompter {
         prompt = prompt.replaceAll('$NAME', this.agent.name);
 
         if (prompt.includes('$STATS')) {
-            let stats = await getCommand('!stats').perform(this.agent) + '\n';
-            stats += await getCommand('!entities').perform(this.agent) + '\n';
-            stats += await getCommand('!nearbyBlocks').perform(this.agent);
-            prompt = prompt.replaceAll('$STATS', stats);
+            // Conditional stats based on settings
+            if (settings.include_stats === false) {
+                prompt = prompt.replaceAll('$STATS', ''); // Remove stats section
+            } else {
+                let stats = await getCommand('!stats').perform(this.agent) + '\n';
+                stats += await getCommand('!entities').perform(this.agent) + '\n';
+                
+                // Conditionally include nearby blocks
+                if (settings.include_nearby_blocks !== false) {
+                    stats += await getCommand('!nearbyBlocks').perform(this.agent);
+                }
+                prompt = prompt.replaceAll('$STATS', stats);
+            }
         }
         if (prompt.includes('$INVENTORY')) {
-            let inventory = await getCommand('!inventory').perform(this.agent);
-            prompt = prompt.replaceAll('$INVENTORY', inventory);
+            // Conditional inventory based on settings
+            if (settings.include_inventory === false) {
+                prompt = prompt.replaceAll('$INVENTORY', ''); // Remove inventory section
+            } else {
+                let inventory = await getCommand('!inventory').perform(this.agent);
+                prompt = prompt.replaceAll('$INVENTORY', inventory);
+            }
         }
         if (prompt.includes('$ACTION')) {
             prompt = prompt.replaceAll('$ACTION', this.agent.actions.currentActionLabel);

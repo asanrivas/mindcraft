@@ -2,19 +2,35 @@ version: '3.8'
 
 services:
   app:
-    image: node:18
+    build: .
     working_dir: /app
+    ports:
+      - "3000:8080"
     volumes:
       - .:/app
-    command: node main.js
-    ports:
-      - "3000-3003:3000-3003" # see the view from the camera mounted on your bot head: http://localhost:3000/
+      - /app/node_modules
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    devices:
+      - /dev/dri:/dev/dri
+    environment:
+      - DISPLAY=:99
+      - GALLIUM_DRIVER=softpipe
+      - LIBGL_ALWAYS_SOFTWARE=1
+      - MESA_GL_VERSION_OVERRIDE=3.3
+    command: >
+      sh -c "pkill -f 'Xvfb :99' || true &&
+             rm -f /tmp/.X99-lock &&
+             Xvfb :99 -screen 0 1024x768x24 -ac +extension GLX +render -noreset & 
+             sleep 2 && 
+             node --max-old-space-size=4096 --no-warnings --trace-uncaught main.js"
 
-  viaproxy: #use this service to connect to an unsupported minecraft server versions. more info: ./services/viaproxy/README.md
-    image: ghcr.io/viaversion/viaproxy:latest
-    volumes:
-      - ./services/viaproxy:/app/run
-    ports:
-      - "25568:25568"
-    profiles:
-      - viaproxy
+  # viaproxy: #use this service to connect to an unsupported minecraft server versions. more info: ./services/viaproxy/README.md
+  #   image: ghcr.io/viaversion/viaproxy:latest
+  #   volumes:
+  #     - ./services/viaproxy:/app/run
+  #   ports:
+  #     - "25568:25568"
+  #   profiles:
+  #     - viaproxy

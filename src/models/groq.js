@@ -36,10 +36,9 @@ export class GroqCloudAPI {
 
         try {
             console.log("Awaiting Groq response...");
-
+            
             // Handle deprecated max_tokens parameter
             if (this.params.max_tokens) {
-                console.warn("GROQCLOUD WARNING: A profile is using `max_tokens`. This is deprecated. Please move to `max_completion_tokens`.");
                 this.params.max_completion_tokens = this.params.max_tokens;
                 delete this.params.max_tokens;
             }
@@ -50,7 +49,7 @@ export class GroqCloudAPI {
 
             let completion = await this.groq.chat.completions.create({
                 "messages": messages,
-                "model": this.model_name || "qwen/qwen3-32b",
+                "model": this.model_name || "llama-3.3-70b-versatile",
                 "stream": false,
                 "stop": stop_seq,
                 ...(this.params || {})

@@ -20,12 +20,21 @@ export class Camera extends EventEmitter {
         this.viewDistance = 12;
         this.width = 800;
         this.height = 512;
-        this.canvas = createCanvas(this.width, this.height);
-        this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas });
-        this.viewer = new Viewer(this.renderer);
-        this._init().then(() => {
+        try {
+            this.canvas = createCanvas(this.width, this.height);
+            this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas });
+            this.viewer = new Viewer(this.renderer);
+            this._init().then(() => {
+                this.emit('ready');
+            }).catch((err) => {
+                console.warn('Camera initialization failed:', err.message);
+                this.emit('error', err);
+            });
+        } catch (err) {
+            console.warn('WebGL not available in this environment. Camera disabled.');
+            this.disabled = true;
             this.emit('ready');
-        })
+        }
     }
   
     async _init () {
@@ -41,6 +50,9 @@ export class Camera extends EventEmitter {
     }
   
     async capture() {
+        if (this.disabled) {
+            throw new Error('Camera is disabled - WebGL not available in headless environment');
+        }
         const center = new Vec3(this.bot.entity.position.x, this.bot.entity.position.y+this.bot.entity.height, this.bot.entity.position.z);
         this.viewer.camera.position.set(center.x, center.y, center.z);
         await this.worldView.updatePosition(center);

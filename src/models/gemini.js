@@ -46,20 +46,36 @@ export class Gemini {
             });
         }
 
-        const result = await this.genAI.models.generateContent({
-            model: this.model_name || "gemini-2.5-flash",
-            contents: contents,
-            safetySettings: this.safetySettings,
-            config: {
-                systemInstruction: systemMessage,
-                ...(this.params || {})
+        try {
+            const result = await this.genAI.models.generateContent({
+                model: this.model_name || "gemini-2.5-flash",
+                contents: contents,
+                safetySettings: this.safetySettings,
+                config: {
+                    systemInstruction: systemMessage,
+                    ...(this.params || {})
+                }
+            });
+            
+            // Try different ways to get the text response
+            let response;
+            if (result.text) {
+                response = result.text;
+            } else if (result.response?.text) {
+                response = result.response.text;
+            } else if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+                response = result.candidates[0].content.parts[0].text;
+            } else {
+                console.error('Unexpected Gemini response structure:', JSON.stringify(result, null, 2));
+                throw new Error('Could not extract text from Gemini response');
             }
-        });
-        const response = await result.text;
 
-        console.log('Received.');
-
-        return response;
+            console.log('Received.');
+            return response;
+        } catch (err) {
+            console.error('Gemini API error:', err);
+            throw err;
+        }
     }
 
     async sendVisionRequest(turns, systemMessage, imageBuffer) {
@@ -95,7 +111,18 @@ export class Gemini {
                 },
                 systemInstruction: systemMessage
             });
-            res = await result.text;
+            
+            // Try different ways to get the text response
+            if (result.text) {
+                res = result.text;
+            } else if (result.response?.text) {
+                res = result.response.text;
+            } else if (result.candidates?.[0]?.content?.parts?.[0]?.text) {
+                res = result.candidates[0].content.parts[0].text;
+            } else {
+                throw new Error('Could not extract text from Gemini vision response');
+            }
+            
             console.log('Received.');
         } catch (err) {
             console.log(err);

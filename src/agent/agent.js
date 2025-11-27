@@ -55,6 +55,23 @@ export class Agent {
 
         initModes(this);
 
+        // Handle protocol errors more gracefully
+        this.bot.on('error', (err) => {
+            if (err.message && err.message.includes('PartialReadError')) {
+                console.error(`${this.name}: Protocol error detected. This typically means:`);
+                console.error('  1. Version mismatch between client and server');
+                console.error('  2. Server is sending malformed packets');
+                console.error('  3. Network connection issue');
+                console.error(`Current version setting: ${settings.minecraft_version}`);
+                console.error(`Server version: ${this.bot.version}`);
+                console.error('\nTrying to recover by reconnecting in 5 seconds...');
+                setTimeout(() => {
+                    this.bot.quit();
+                    process.exit(1);
+                }, 5000);
+            }
+        });
+
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
             serverProxy.login();

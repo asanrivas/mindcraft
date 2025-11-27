@@ -80,6 +80,16 @@ export function initBot(username) {
         Item = prismarine_items(mc_version);
     });
 
+    // Add error handlers for protocol parsing errors
+    bot.on('error', (err) => {
+        if (err.message && err.message.includes('PartialReadError')) {
+            console.error('Protocol parsing error - this may indicate a version mismatch or server issue:', err.message);
+            console.error('Tip: Try specifying a specific minecraft version in settings.js instead of "auto"');
+        } else {
+            console.error('Bot error:', err);
+        }
+    });
+
     return bot;
 }
 
@@ -414,8 +424,25 @@ export function initializeLoopingItems() {
  */
 export function getDetailedCraftingPlan(targetItem, count = 1, current_inventory = {}) {
     initializeLoopingItems();
-    if (!targetItem || count <= 0 || !getItemId(targetItem)) {
-        return "Invalid input. Please provide a valid item name and positive count.";
+    if (!targetItem) {
+        return "Error: No item name provided. Usage: !getCraftingPlan(\"item_name\", quantity)";
+    }
+    if (count <= 0) {
+        return `Error: Quantity must be a positive number, got ${count}. Usage: !getCraftingPlan("${targetItem}", 1)`;
+    }
+    if (!getItemId(targetItem)) {
+        // Try to suggest similar valid item names
+        let suggestion = "";
+        if (targetItem === "boat") {
+            suggestion = " Did you mean 'oak_boat', 'spruce_boat', 'birch_boat', 'jungle_boat', 'acacia_boat', or 'dark_oak_boat'?";
+        } else if (targetItem.includes("plank") && !targetItem.endsWith("s")) {
+            suggestion = ` Did you mean '${targetItem}s'?`;
+        } else if (targetItem === "wood" || targetItem === "log") {
+            suggestion = " Did you mean 'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', or 'dark_oak_log'?";
+        } else if (targetItem === "pick" || targetItem === "pickaxe") {
+            suggestion = " Did you mean 'wooden_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'diamond_pickaxe', or 'netherite_pickaxe'?";
+        }
+        return `Error: '${targetItem}' is not a valid Minecraft item name.${suggestion} Use exact item names like 'oak_planks', 'iron_ingot', 'diamond_sword'.`;
     }
 
     if (isBaseItem(targetItem)) {

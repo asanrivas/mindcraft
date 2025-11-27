@@ -1,6 +1,7 @@
 import { getBlockId, getItemId } from "../../utils/mcdata.js";
 import { actionsList } from './actions.js';
 import { queryList } from './queries.js';
+import settings from '../settings.js';
 
 let suppressNoDomainWarning = true;
 
@@ -8,6 +9,80 @@ const commandList = queryList.concat(actionsList);
 const commandMap = {};
 for (let command of commandList) {
     commandMap[command.name] = command;
+}
+
+// ============= COMMAND ALIASES =============
+// Short aliases map to full command names (saves tokens in prompts)
+const COMMAND_ALIASES = {
+    // Storage commands
+    'pic': 'putInChest',
+    'tfc': 'takeFromChest',
+    'vc': 'viewChest',
+    'dis': 'discard',
+    
+    // Movement commands
+    'gtp': 'goToPlayer',
+    'gtc': 'goToCoordinates',
+    'fp': 'followPlayer',
+    'ma': 'moveAway',
+    'sfb': 'searchForBlock',
+    'sfe': 'searchForEntity',
+    
+    // Action commands
+    'cb': 'collectBlocks',
+    'cr': 'craftRecipe',
+    'sm': 'smeltItem',
+    'atk': 'attack',
+    'eq': 'equip',
+    'eat': 'consume',
+    'ph': 'placeHere',
+    'gtb': 'goToBed',
+    
+    // Info commands
+    'inv': 'inventory',
+    'st': 'stats',
+    'nb': 'nearbyBlocks',
+    'ent': 'entities',
+    'cft': 'craftable',
+    'gcp': 'getCraftingPlan',
+    
+    // Memory/Control commands
+    'clr': 'clearChat',
+    'clm': 'clearMemory',
+    'g': 'goal',
+    'eg': 'endGoal',
+    'na': 'newAction',
+    
+    // Places
+    'rh': 'rememberHere',
+    'gtrp': 'goToRememberedPlace',
+    'sp': 'savedPlaces',
+};
+
+// Create reverse map for lookup
+const ALIAS_TO_COMMAND = {};
+for (const [alias, command] of Object.entries(COMMAND_ALIASES)) {
+    ALIAS_TO_COMMAND[alias] = command;
+}
+
+/**
+ * Expand command alias to full command name
+ * @param {string} message - message that may contain alias
+ * @returns {string} - message with alias expanded
+ */
+export function expandCommandAlias(message) {
+    if (!settings.use_command_aliases) return message;
+    
+    // Match !alias or !alias(...) pattern
+    const aliasMatch = message.match(/^!(\w+)/);
+    if (!aliasMatch) return message;
+    
+    const potentialAlias = aliasMatch[1];
+    if (ALIAS_TO_COMMAND[potentialAlias]) {
+        const fullCommand = ALIAS_TO_COMMAND[potentialAlias];
+        return message.replace(`!${potentialAlias}`, `!${fullCommand}`);
+    }
+    return message;
 }
 
 export function getCommand(name) {
@@ -28,6 +103,84 @@ export function blacklistCommands(commands) {
 
 const commandRegex = /!(\w+)(?:\(((?:-?\d+(?:\.\d+)?|true|false|"[^"]*")(?:\s*,\s*(?:-?\d+(?:\.\d+)?|true|false|"[^"]*"))*)\))?/
 const argRegex = /-?\d+(?:\.\d+)?|true|false|"[^"]*"/g;
+
+// Regex for space-separated format: !command "arg1" arg2 or !command arg1 arg2
+const spaceSeparatedRegex = /^!(\w+)\s+(.+)$/;
+
+/**
+ * Normalizes command format from space-separated to parenthesis format
+ * e.g. !getCraftingPlan "torch" 1 -> !getCraftingPlan("torch", 1)
+ * @param {string} message
+ * @returns {string}
+ */
+function normalizeCommandFormat(message) {
+    // If already has parentheses, return as-is
+    if (message.match(/!\w+\(/)) {
+        return message;
+    }
+    
+    const match = message.match(spaceSeparatedRegex);
+    if (!match) {
+        return message;
+    }
+    
+    const commandName = match[1];
+    const argsString = match[2].trim();
+    
+    // Parse space-separated arguments (handles quoted strings and numbers)
+    const args = [];
+    let current = '';
+    let inQuotes = false;
+    let quoteChar = '';
+    
+    for (let i = 0; i < argsString.length; i++) {
+        const char = argsString[i];
+        
+        if ((char === '"' || char === "'") && !inQuotes) {
+            inQuotes = true;
+            quoteChar = char;
+            current += '"'; // Normalize to double quotes
+        } else if (char === quoteChar && inQuotes) {
+            inQuotes = false;
+            current += '"'; // Normalize to double quotes
+            args.push(current);
+            current = '';
+            quoteChar = '';
+        } else if (char === ' ' && !inQuotes) {
+            if (current.trim()) {
+                // If not quoted, check if it's a number or boolean
+                const trimmed = current.trim();
+                if (/^-?\d+(\.\d+)?$/.test(trimmed) || trimmed === 'true' || trimmed === 'false') {
+                    args.push(trimmed);
+                } else {
+                    // Wrap unquoted strings in quotes
+                    args.push(`"${trimmed}"`);
+                }
+                current = '';
+            }
+        } else {
+            current += char;
+        }
+    }
+    
+    // Handle last argument
+    if (current.trim()) {
+        const trimmed = current.trim();
+        if (/^-?\d+(\.\d+)?$/.test(trimmed) || trimmed === 'true' || trimmed === 'false') {
+            args.push(trimmed);
+        } else if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+            args.push(trimmed);
+        } else {
+            args.push(`"${trimmed}"`);
+        }
+    }
+    
+    if (args.length === 0) {
+        return message;
+    }
+    
+    return `!${commandName}(${args.join(', ')})`;
+}
 
 export function containsCommand(message) {
     const commandMatch = message.match(commandRegex);
@@ -95,6 +248,12 @@ function checkInInterval(number, lowerBound, upperBound, endpointType) {
  * @returns {string | Object}
  */
 export function parseCommandMessage(message) {
+    // Expand command aliases first (e.g., !pic -> !putInChest)
+    message = expandCommandAlias(message);
+    
+    // Normalize space-separated format to parenthesis format
+    message = normalizeCommandFormat(message);
+    
     const commandMatch = message.match(commandRegex);
     if (!commandMatch) return `Command is incorrectly formatted`;
 
@@ -174,9 +333,11 @@ export function parseCommandMessage(message) {
 }
 
 export function truncCommandMessage(message) {
-    const commandMatch = message.match(commandRegex);
+    // Normalize space-separated format first
+    const normalized = normalizeCommandFormat(message);
+    const commandMatch = normalized.match(commandRegex);
     if (commandMatch) {
-        return message.substring(0, commandMatch.index + commandMatch[0].length);
+        return normalized.substring(0, commandMatch.index + commandMatch[0].length);
     }
     return message;
 }
@@ -229,31 +390,103 @@ export async function executeCommand(agent, message) {
     }
 }
 
-export function getCommandDocs(agent) {
-    const typeTranslations = {
-        //This was added to keep the prompt the same as before type checks were implemented.
-        //If the language model is giving invalid inputs changing this might help.
-        'float':             'number',
-        'int':               'number',
-        'BlockName':         'string',
-        'ItemName':          'string',
-        'BlockOrItemName':   'string',
-        'boolean':           'bool'
+/**
+ * Get the alias for a command name (if exists)
+ */
+function getCommandAlias(commandName) {
+    const name = commandName.replace('!', '');
+    for (const [alias, fullName] of Object.entries(COMMAND_ALIASES)) {
+        if (fullName === name) return alias;
     }
-    let docs = `\n*COMMAND DOCS\n You can use the following commands to perform actions and get information about the world. 
-    Use the commands with the syntax: !commandName or !commandName("arg1", 1.2, ...) if the command takes arguments.\n
-    Do not use codeblocks. Use double quotes for strings. Only use one command in each response, trailing commands and comments will be ignored.\n`;
-    for (let command of commandList) {
-        if (agent.blocked_actions.includes(command.name)) {
-            continue;
+    return null;
+}
+
+/**
+ * Generate command documentation based on mode setting
+ * @param {Object} agent 
+ * @returns {string} command documentation
+ */
+export function getCommandDocs(agent) {
+    const mode = settings.command_docs_mode || 'full';
+    const showAliases = settings.use_command_aliases;
+    
+    const typeTranslations = {
+        'float': 'num', 'int': 'num', 'BlockName': 'str', 
+        'ItemName': 'str', 'BlockOrItemName': 'str', 'boolean': 'bool', 'string': 'str'
+    };
+    const typeTranslationsFull = {
+        'float': 'number', 'int': 'number', 'BlockName': 'string',
+        'ItemName': 'string', 'BlockOrItemName': 'string', 'boolean': 'bool', 'string': 'string'
+    };
+    
+    let docs = '';
+    
+    if (mode === 'minimal') {
+        // Minimal: just command names and aliases
+        docs = `\n*COMMANDS: Use !cmd or !cmd("arg1",arg2). `;
+        if (showAliases) docs += `Aliases in [brackets]. `;
+        docs += `*\n`;
+        
+        const cmdNames = [];
+        for (let command of commandList) {
+            if (agent.blocked_actions.includes(command.name)) continue;
+            const alias = getCommandAlias(command.name);
+            const aliasStr = (showAliases && alias) ? `[${alias}]` : '';
+            cmdNames.push(`${command.name}${aliasStr}`);
         }
-        docs += command.name + ': ' + command.description + '\n';
-        if (command.params) {
-            docs += 'Params:\n';
-            for (let param in command.params) {
-                docs += `${param}: (${typeTranslations[command.params[param].type]??command.params[param].type}) ${command.params[param].description}\n`;
+        docs += cmdNames.join(', ') + '\n';
+        
+    } else if (mode === 'compact') {
+        // Compact: command + short description + params inline
+        docs = `\n*CMDS - syntax: !cmd or !cmd("arg",num). `;
+        if (showAliases) docs += `[alias]=shortcut. `;
+        docs += `*\n`;
+        
+        for (let command of commandList) {
+            if (agent.blocked_actions.includes(command.name)) continue;
+            
+            const alias = getCommandAlias(command.name);
+            const aliasStr = (showAliases && alias) ? `[${alias}]` : '';
+            
+            // Shorten description to first sentence or 60 chars
+            let shortDesc = command.description.split('.')[0];
+            if (shortDesc.length > 60) shortDesc = shortDesc.substring(0, 57) + '...';
+            
+            // Inline params
+            let paramStr = '';
+            if (command.params) {
+                const params = Object.entries(command.params).map(([name, p]) => {
+                    const type = typeTranslations[p.type] || p.type;
+                    return `${name}:${type}`;
+                });
+                paramStr = params.length > 0 ? `(${params.join(',')})` : '';
+            }
+            
+            docs += `${command.name}${aliasStr}${paramStr}: ${shortDesc}\n`;
+        }
+        
+    } else {
+        // Full: original format with aliases
+        docs = `\n*COMMAND DOCS\nUse commands with syntax: !commandName or !commandName("arg1", 1.2, ...).`;
+        if (showAliases) docs += ` Short aliases shown in [brackets].`;
+        docs += `\nUse double quotes for strings. One command per response.\n`;
+        
+        for (let command of commandList) {
+            if (agent.blocked_actions.includes(command.name)) continue;
+            
+            const alias = getCommandAlias(command.name);
+            const aliasStr = (showAliases && alias) ? ` [${alias}]` : '';
+            
+            docs += `${command.name}${aliasStr}: ${command.description}\n`;
+            if (command.params) {
+                docs += 'Params:\n';
+                for (let param in command.params) {
+                    const type = typeTranslationsFull[command.params[param].type] || command.params[param].type;
+                    docs += `  ${param}: (${type}) ${command.params[param].description}\n`;
+                }
             }
         }
     }
+    
     return docs + '*\n';
 }

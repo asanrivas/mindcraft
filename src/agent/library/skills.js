@@ -33,6 +33,48 @@ export function log(bot, message) {
     bot.output += message + '\n';
 }
 
+/**
+ * Resolve a player name with fuzzy/case-insensitive matching
+ * @param {Bot} bot - The minecraft bot
+ * @param {string} username - The username to search for (can be partial/case-insensitive)
+ * @returns {string|null} - The exact player name if found, null otherwise
+ */
+export function resolvePlayerName(bot, username) {
+    if (!username) return null;
+    
+    // Direct exact match first
+    if (bot.players[username]) {
+        return username;
+    }
+    
+    const searchName = username.toLowerCase();
+    const playerNames = Object.keys(bot.players);
+    
+    // Try case-insensitive exact match
+    let match = playerNames.find(name => name.toLowerCase() === searchName);
+    if (match) return match;
+    
+    // Try matching without leading special characters (like dots)
+    match = playerNames.find(name => {
+        const cleanName = name.replace(/^[^a-zA-Z0-9]+/, '').toLowerCase();
+        return cleanName === searchName;
+    });
+    if (match) return match;
+    
+    // Try partial match (input is contained in player name, case-insensitive)
+    match = playerNames.find(name => name.toLowerCase().includes(searchName));
+    if (match) return match;
+    
+    // Try partial match with cleaned name
+    match = playerNames.find(name => {
+        const cleanName = name.replace(/^[^a-zA-Z0-9]+/, '').toLowerCase();
+        return cleanName.includes(searchName) || searchName.includes(cleanName);
+    });
+    if (match) return match;
+    
+    return null;
+}
+
 async function autoLight(bot) {
     if (world.shouldPlaceTorch(bot)) {
         try {
@@ -171,8 +213,18 @@ export async function craftRecipe(bot, itemName, num=1) {
     }
     
     try {
+        const countBefore = world.getInventoryCounts(bot)[itemName] || 0;
         await bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable);
-        const newCount = world.getInventoryCounts(bot)[itemName] || 0;
+        
+        // Wait for inventory to sync from server (race condition fix)
+        let newCount = world.getInventoryCounts(bot)[itemName] || 0;
+        const expectedCount = countBefore + Math.min(craftLimit.num, num);
+        
+        // Retry up to 10 times (500ms total) waiting for inventory update
+        for (let i = 0; i < 10 && newCount < expectedCount; i++) {
+            await new Promise(resolve => setTimeout(resolve, 50));
+            newCount = world.getInventoryCounts(bot)[itemName] || 0;
+        }
         
         // Check if this is a tool/weapon that should be equipped
         const isEquipable = itemName.includes('_sword') || itemName.includes('_pickaxe') || 
@@ -473,7 +525,20 @@ export async function defendSelf(bot, range=9) {
     bot.modes.pause('self_defense');
     bot.modes.pause('cowardice');
     let attacked = false;
-    let enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), range);
+    let enemy = world.getNearestEntityWhere(bot, entity => {
+        // Double-check hostile status and exclude friendly entities
+        if (!mc.isHostile(entity)) return false;
+
+        // Safety filter: never attack these friendly entities
+        const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot', 'horse', 'donkey', 'mule', 'llama'];
+        const entityName = entity.name || '';
+        if (friendlyEntities.some(name => entityName.includes(name))) {
+            console.log(`[DEFEND_SELF] Skipping ${entityName} - marked as friendly`);
+            return false;
+        }
+
+        return true;
+    }, range);
     while (enemy) {
         await equipHighestAttack(bot);
         if (bot.entity.position.distanceTo(enemy.position) >= 4 && enemy.name !== 'creeper' && enemy.name !== 'phantom') {
@@ -492,7 +557,12 @@ export async function defendSelf(bot, range=9) {
         bot.pvp.attack(enemy);
         attacked = true;
         await new Promise(resolve => setTimeout(resolve, 500));
-        enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), range);
+        enemy = world.getNearestEntityWhere(bot, entity => {
+            if (!mc.isHostile(entity)) return false;
+            const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot', 'horse', 'donkey', 'mule', 'llama'];
+            const entityName = entity.name || '';
+            return !friendlyEntities.some(name => entityName.includes(name));
+        }, range);
         if (bot.interrupt_code) {
             bot.pvp.stop();
             return false;
@@ -920,6 +990,296 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
     }
 }
 
+export async function coverArea(bot, blockType, x1, z1, x2, z2, y) {
+    /**
+     * Cover a rectangular area with blocks at a specified height.
+     * Uses smart placement order - starts from positions with adjacent solid blocks.
+     * Automatically skips positions that already have the target block (resumable).
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {string} blockType, the type of block to place (e.g., "dirt", "cobblestone").
+     * @param {number} x1, the x coordinate of the first corner.
+     * @param {number} z1, the z coordinate of the first corner.
+     * @param {number} x2, the x coordinate of the second corner.
+     * @param {number} z2, the z coordinate of the second corner.
+     * @param {number} y, the y coordinate (height) to place blocks at.
+     * @returns {Promise<number>} the number of blocks successfully placed.
+     * @example
+     * // Cover a 10x10 area with dirt at height 64
+     * await skills.coverArea(bot, "dirt", 0, 0, 10, 10, 64);
+     **/
+    const minX = Math.min(Math.floor(x1), Math.floor(x2));
+    const maxX = Math.max(Math.floor(x1), Math.floor(x2));
+    const minZ = Math.min(Math.floor(z1), Math.floor(z2));
+    const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
+    const floorY = Math.floor(y);
+
+    const emptyBlocks = ['air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
+
+    // Helper to check if a position has an adjacent solid block to build off
+    function hasAdjacentSolid(x, z) {
+        const directions = [
+            [0, -1, 0], [0, 1, 0],  // below, above
+            [-1, 0, 0], [1, 0, 0],  // west, east
+            [0, 0, -1], [0, 0, 1]   // north, south
+        ];
+        for (const [dx, dy, dz] of directions) {
+            const block = bot.blockAt(new Vec3(x + dx, floorY + dy, z + dz));
+            if (block && !emptyBlocks.includes(block.name)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // First scan the area to see what's already done
+    let alreadyDone = 0;
+    let needsPlacing = new Set();
+
+    for (let x = minX; x <= maxX; x++) {
+        for (let z = minZ; z <= maxZ; z++) {
+            const existingBlock = bot.blockAt(new Vec3(x, floorY, z));
+            if (existingBlock && existingBlock.name === blockType) {
+                alreadyDone++;
+            } else if (existingBlock && !emptyBlocks.includes(existingBlock.name) && existingBlock.name !== blockType) {
+                // There's a different solid block here, count as done (don't replace)
+                alreadyDone++;
+            } else {
+                needsPlacing.add(`${x},${z}`);
+            }
+        }
+    }
+
+    const totalBlocks = (maxX - minX + 1) * (maxZ - minZ + 1);
+
+    if (alreadyDone > 0) {
+        log(bot, `Scanned area: ${alreadyDone}/${totalBlocks} already covered. ${needsPlacing.size} blocks remaining.`);
+    }
+
+    if (needsPlacing.size === 0) {
+        log(bot, `Area from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) is already fully covered!`);
+        return 0;
+    }
+
+    log(bot, `Covering area from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) at y=${floorY} with ${blockType}. Placing ${needsPlacing.size} blocks.`);
+
+    let placedCount = 0;
+    let failedCount = 0;
+    const initialSize = needsPlacing.size;
+
+    // Use multiple passes - each pass places blocks that have adjacent solids
+    // This allows building outward from edges/supports
+    let lastPlacedCount = -1;
+    while (needsPlacing.size > 0 && placedCount !== lastPlacedCount) {
+        lastPlacedCount = placedCount;
+
+        // Sort positions by whether they have adjacent solids (prioritize those that do)
+        const positionsThisPass = Array.from(needsPlacing).map(key => {
+            const [x, z] = key.split(',').map(Number);
+            return { x, z, key, hasSupport: hasAdjacentSolid(x, z) };
+        }).sort((a, b) => (b.hasSupport ? 1 : 0) - (a.hasSupport ? 1 : 0));
+
+        for (const pos of positionsThisPass) {
+            if (bot.interrupt_code) {
+                log(bot, `Area covering interrupted. Placed ${placedCount}/${initialSize} blocks. Run same command to resume.`);
+                return placedCount;
+            }
+
+            // Skip if no adjacent support (will try again next pass after more blocks placed)
+            if (!pos.hasSupport && needsPlacing.size > 1) {
+                continue;
+            }
+
+            const success = await placeBlock(bot, blockType, pos.x, floorY, pos.z, 'bottom');
+            if (success) {
+                placedCount++;
+                needsPlacing.delete(pos.key);
+
+                // Progress update every 10 blocks
+                if (placedCount % 10 === 0) {
+                    log(bot, `Progress: ${placedCount}/${initialSize} blocks placed.`);
+                }
+            } else {
+                // If placement failed even with support, mark for retry
+                failedCount++;
+            }
+        }
+    }
+
+    // Report any remaining unplaceable blocks
+    if (needsPlacing.size > 0) {
+        log(bot, `Could not place ${needsPlacing.size} blocks (no adjacent support). Placed ${placedCount}/${initialSize}.`);
+    } else {
+        log(bot, `Finished covering area. Placed ${placedCount} ${blockType} blocks. Total covered: ${alreadyDone + placedCount}/${totalBlocks}.`);
+    }
+
+    return placedCount;
+}
+
+export async function plantTreeGrid(bot, saplingType, x1, z1, x2, z2, spacing = 4) {
+    /**
+     * Plant saplings in a grid pattern with specified spacing.
+     * Automatically detects ground level at each spot (no need for y coordinate).
+     * Automatically skips spots with existing saplings or grown trees (resumable).
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {string} saplingType, the type of sapling to plant (e.g., "oak_sapling", "birch_sapling").
+     * @param {number} x1, the x coordinate of the first corner.
+     * @param {number} z1, the z coordinate of the first corner.
+     * @param {number} x2, the x coordinate of the second corner.
+     * @param {number} z2, the z coordinate of the second corner.
+     * @param {number} spacing, the gap between saplings (default 4 blocks).
+     * @returns {Promise<number>} the number of saplings successfully planted.
+     * @example
+     * // Plant oak saplings in a 64x64 area with 4 block gaps
+     * await skills.plantTreeGrid(bot, "oak_sapling", 0, 0, 64, 64, 4);
+     **/
+    const minX = Math.min(Math.floor(x1), Math.floor(x2));
+    const maxX = Math.max(Math.floor(x1), Math.floor(x2));
+    const minZ = Math.min(Math.floor(z1), Math.floor(z2));
+    const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
+    const gap = Math.max(1, Math.floor(spacing));
+    const botY = Math.floor(bot.entity.position.y);
+
+    // Normalize sapling name
+    let sapling = saplingType;
+    if (!sapling.endsWith('_sapling')) {
+        sapling = sapling + '_sapling';
+    }
+
+    const plantableBlocks = ['dirt', 'grass_block', 'coarse_dirt', 'podzol', 'rooted_dirt', 'moss_block', 'mud', 'muddy_mangrove_roots'];
+    const airBlocks = ['air', 'short_grass', 'tall_grass', 'fern', 'dead_bush', 'snow'];
+
+    // Helper function to find ground level at a given x,z
+    function findGroundLevel(x, z) {
+        // Search from bot's Y level, up to 20 blocks up or down
+        for (let yOffset = 0; yOffset <= 20; yOffset++) {
+            // Check above bot first
+            for (const dir of [1, -1]) {
+                const checkY = botY + (yOffset * dir);
+                if (checkY < -64 || checkY > 320) continue;
+
+                const blockAt = bot.blockAt(new Vec3(x, checkY, z));
+                const blockBelow = bot.blockAt(new Vec3(x, checkY - 1, z));
+
+                if (blockAt && blockBelow) {
+                    // Found ground: air above plantable block
+                    if (airBlocks.includes(blockAt.name) && plantableBlocks.includes(blockBelow.name)) {
+                        return { y: checkY, ground: blockBelow.name };
+                    }
+                    // Found existing sapling
+                    if (blockAt.name.includes('sapling')) {
+                        return { y: checkY, existing: 'sapling' };
+                    }
+                    // Found tree trunk
+                    if (blockAt.name.includes('_log')) {
+                        return { y: checkY, existing: 'tree' };
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    // Scan the grid first
+    let alreadyPlanted = 0;
+    let grownTrees = 0;
+    let needsPlanting = [];
+    let unplantable = 0;
+
+    log(bot, `Scanning grid from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) with ${gap} block spacing...`);
+
+    for (let x = minX; x <= maxX; x += gap + 1) {
+        for (let z = minZ; z <= maxZ; z += gap + 1) {
+            const ground = findGroundLevel(x, z);
+
+            if (!ground) {
+                unplantable++;
+            } else if (ground.existing === 'sapling') {
+                alreadyPlanted++;
+            } else if (ground.existing === 'tree') {
+                grownTrees++;
+            } else {
+                needsPlanting.push({ x, z, y: ground.y });
+            }
+        }
+    }
+
+    const totalSpots = alreadyPlanted + grownTrees + needsPlanting.length + unplantable;
+
+    log(bot, `Scan complete: ${alreadyPlanted} saplings, ${grownTrees} grown trees, ${needsPlanting.length} plantable spots, ${unplantable} unplantable.`);
+
+    if (needsPlanting.length === 0) {
+        log(bot, `Tree grid from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) is already fully planted/grown!`);
+        return 0;
+    }
+
+    log(bot, `Planting ${sapling} at ${needsPlanting.length} spots...`);
+
+    let plantedCount = 0;
+    for (const pos of needsPlanting) {
+        if (bot.interrupt_code) {
+            log(bot, `Tree planting interrupted at (${pos.x}, ${pos.z}). Planted ${plantedCount}/${needsPlanting.length}. Run same command to resume.`);
+            return plantedCount;
+        }
+
+        const success = await placeBlock(bot, sapling, pos.x, pos.y, pos.z, 'bottom');
+        if (success) {
+            plantedCount++;
+        }
+
+        // Progress update every 5 saplings
+        if (plantedCount % 5 === 0 && plantedCount > 0) {
+            log(bot, `Progress: ${plantedCount}/${needsPlanting.length} saplings planted.`);
+        }
+    }
+
+    log(bot, `Finished planting. Placed ${plantedCount} ${sapling}. Total in grid: ${alreadyPlanted + grownTrees + plantedCount} trees/saplings.`);
+    return plantedCount;
+}
+
+export function scanArea(bot, x1, z1, x2, z2, y = null) {
+    /**
+     * Scan a rectangular area and report what blocks are present.
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {number} x1, the x coordinate of the first corner.
+     * @param {number} z1, the z coordinate of the first corner.
+     * @param {number} x2, the x coordinate of the second corner.
+     * @param {number} z2, the z coordinate of the second corner.
+     * @param {number} y, optional y coordinate. If null, scans at bot's height.
+     * @returns {object} summary of blocks found in the area.
+     **/
+    const minX = Math.min(Math.floor(x1), Math.floor(x2));
+    const maxX = Math.max(Math.floor(x1), Math.floor(x2));
+    const minZ = Math.min(Math.floor(z1), Math.floor(z2));
+    const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
+    const scanY = y !== null ? Math.floor(y) : Math.floor(bot.entity.position.y);
+
+    const blockCounts = {};
+    let totalBlocks = 0;
+
+    for (let x = minX; x <= maxX; x++) {
+        for (let z = minZ; z <= maxZ; z++) {
+            const block = bot.blockAt(new Vec3(x, scanY, z));
+            if (block) {
+                blockCounts[block.name] = (blockCounts[block.name] || 0) + 1;
+                totalBlocks++;
+            }
+        }
+    }
+
+    // Sort by count descending
+    const sorted = Object.entries(blockCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 10); // Top 10 blocks
+
+    return {
+        area: { minX, maxX, minZ, maxZ, y: scanY },
+        size: { width: maxX - minX + 1, length: maxZ - minZ + 1 },
+        totalBlocks,
+        blockCounts: Object.fromEntries(sorted),
+        topBlocks: sorted
+    };
+}
+
 export async function equip(bot, itemName) {
     /**
      * Equip the given item to the proper body part, like tools or armor.
@@ -1079,10 +1439,30 @@ export async function putInChest(bot, itemName, num=-1) {
     let to_put = num === -1 ? item.count : Math.min(num, item.count);
     await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
     const openedContainer = await bot.openContainer(container);
-    await openedContainer.deposit(item.type, null, to_put);
-    await openedContainer.close();
-    log(bot, `Successfully put ${to_put} ${itemName} in the ${container.name}.`);
-    return true;
+
+    // Check container capacity
+    const containerSlots = openedContainer.containerItems();
+    const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
+    const usedSlots = containerSlots.length;
+    const emptySlots = totalSlots - usedSlots;
+    const isDoubleChest = totalSlots === 54;
+    const chestType = isDoubleChest ? 'double chest' : container.name;
+
+    try {
+        await openedContainer.deposit(item.type, null, to_put);
+        await openedContainer.close();
+        log(bot, `Successfully put ${to_put} ${itemName} in the ${chestType}. (${usedSlots + 1}/${totalSlots} slots used)`);
+        return true;
+    } catch (err) {
+        await openedContainer.close();
+        // Try to provide helpful info about why deposit failed
+        if (emptySlots === 0) {
+            log(bot, `The ${chestType} is completely FULL (${totalSlots}/${totalSlots} slots). Cannot deposit ${itemName}.`);
+        } else {
+            log(bot, `Could not deposit ${to_put} ${itemName} in ${chestType}. Space: ${emptySlots} empty slots. Try depositing a smaller amount or stacking items first.`);
+        }
+        return false;
+    }
 }
 
 export async function takeFromChest(bot, itemName, num=-1) {
@@ -1152,12 +1532,21 @@ export async function viewChest(bot) {
     }
     await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
     const openedContainer = await bot.openContainer(container);
+
+    // Determine container type and capacity
+    const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
+    const isDoubleChest = totalSlots === 54;
+    const chestType = isDoubleChest ? 'double chest' : container.name;
+
     let items = openedContainer.containerItems();
+    const usedSlots = items.length;
+    const emptySlots = totalSlots - usedSlots;
+
     if (items.length === 0) {
-        log(bot, `The ${container.name} is empty.`);
+        log(bot, `The ${chestType} is empty. (0/${totalSlots} slots used)`);
     }
     else {
-        log(bot, `The ${container.name} contains:`);
+        log(bot, `The ${chestType} contains (${usedSlots}/${totalSlots} slots used, ${emptySlots} empty):`);
         for (let item of items) {
             log(bot, `${item.count} ${item.name}`);
         }
@@ -1188,36 +1577,41 @@ export async function depositAllItems(bot, excludeItems = []) {
     
     await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
     const openedContainer = await bot.openContainer(container);
-    
+
+    // Determine container type
+    const totalSlots = openedContainer.slots.length - 36;
+    const isDoubleChest = totalSlots === 54;
+    const chestType = isDoubleChest ? 'double chest' : container.name;
+
     let deposited = 0;
     let depositedTypes = [];
-    
+
     for (const item of bot.inventory.items()) {
         // Skip items we want to keep
         if (keepItems.has(item.name)) continue;
         // Skip equipped armor
-        if (item.name.includes('helmet') || item.name.includes('chestplate') || 
+        if (item.name.includes('helmet') || item.name.includes('chestplate') ||
             item.name.includes('leggings') || item.name.includes('boots')) continue;
-        
+
         try {
             await openedContainer.deposit(item.type, null, item.count);
             deposited += item.count;
             depositedTypes.push(item.name);
         } catch (e) {
-            log(bot, `Container is full, stopped depositing.`);
+            log(bot, `The ${chestType} is full, stopped depositing.`);
             break;
         }
     }
-    
+
     await openedContainer.close();
-    
+
     if (deposited === 0) {
         log(bot, `No items to deposit (or all items are in the keep list).`);
         return false;
     }
-    
+
     const uniqueTypes = [...new Set(depositedTypes)];
-    log(bot, `Deposited ${deposited} items (${uniqueTypes.length} types) into ${container.name}.`);
+    log(bot, `Deposited ${deposited} items (${uniqueTypes.length} types) into ${chestType}.`);
     return true;
 }
 
@@ -1308,6 +1702,14 @@ export async function giveToPlayer(bot, itemType, username, num=1) {
      * @example
      * await skills.giveToPlayer(bot, "oak_log", "player1");
      **/
+    // Resolve player name with fuzzy matching
+    const resolvedName = resolvePlayerName(bot, username);
+    if (!resolvedName) {
+        log(bot, `Could not find player "${username}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`);
+        return false;
+    }
+    username = resolvedName;
+    
     if (bot.username === username) {
         log(bot, `You cannot give items to yourself.`);
         return false;
@@ -1432,10 +1834,17 @@ function createSafeMovements(bot, options = {}) {
     
     // Don't break important blocks
     const dontBreakBlocks = [
-        'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door', 
-        'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door', 
+        'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door',
+        'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door',
         'bamboo_door', 'crimson_door', 'warped_door', 'iron_door',
-        'glass', 'glass_pane', 'stone_bricks', 'cobblestone',
+        ...BLOCK_TYPES.glass,  // All glass and stained glass variants
+        'glass_pane', 'white_stained_glass_pane', 'orange_stained_glass_pane',
+        'magenta_stained_glass_pane', 'light_blue_stained_glass_pane',
+        'yellow_stained_glass_pane', 'lime_stained_glass_pane', 'pink_stained_glass_pane',
+        'gray_stained_glass_pane', 'light_gray_stained_glass_pane', 'cyan_stained_glass_pane',
+        'purple_stained_glass_pane', 'blue_stained_glass_pane', 'brown_stained_glass_pane',
+        'green_stained_glass_pane', 'red_stained_glass_pane', 'black_stained_glass_pane',
+        'stone_bricks', 'cobblestone',
         'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks',
         'acacia_planks', 'dark_oak_planks', 'fence_gate', 'oak_fence_gate',
         'spruce_fence_gate', 'birch_fence_gate', 'jungle_fence_gate',
@@ -1660,6 +2069,14 @@ export async function goToPlayer(bot, username, distance=3) {
      * @example
      * await skills.goToPlayer(bot, "player");
      **/
+    // Resolve player name with fuzzy matching
+    const resolvedName = resolvePlayerName(bot, username);
+    if (!resolvedName) {
+        log(bot, `Could not find player "${username}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`);
+        return false;
+    }
+    username = resolvedName;
+    
     if (bot.username === username) {
         log(bot, `You are already at ${username}.`);
         return true;
@@ -1696,6 +2113,14 @@ export async function followPlayer(bot, username, distance=4) {
      * @example
      * await skills.followPlayer(bot, "player");
      **/
+    // Resolve player name with fuzzy matching
+    const resolvedName = resolvePlayerName(bot, username);
+    if (!resolvedName) {
+        log(bot, `Could not find player "${username}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`);
+        return false;
+    }
+    username = resolvedName;
+    
     let playerObj = bot.players[username];
     if (!playerObj || !playerObj.entity) {
         console.log(`Player ${username} not found or has no entity`);
@@ -2008,6 +2433,87 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
         log(bot, `Planted ${seedType} at x:${x.toFixed(1)}, y:${y.toFixed(1)}, z:${z.toFixed(1)}.`);
     }
     return true;
+}
+
+export async function fillBucket(bot, liquidType = 'water') {
+    /**
+     * Fill an empty bucket with water or lava from the nearest source.
+     * @param {MinecraftBot} bot, reference to the minecraft bot.
+     * @param {string} liquidType, the type of liquid to collect ('water' or 'lava'). Defaults to 'water'.
+     * @returns {Promise<boolean>} true if the bucket was filled, false otherwise.
+     * @example
+     * await skills.fillBucket(bot, 'water');
+     * await skills.fillBucket(bot, 'lava');
+     **/
+    // Validate liquid type
+    if (liquidType !== 'water' && liquidType !== 'lava') {
+        log(bot, `Invalid liquid type: ${liquidType}. Use 'water' or 'lava'.`);
+        return false;
+    }
+    
+    // Check for empty bucket
+    const bucket = bot.inventory.items().find(item => item.name === 'bucket');
+    if (!bucket) {
+        log(bot, `You don't have an empty bucket to fill.`);
+        return false;
+    }
+    
+    // Find all liquid source blocks within range
+    const liquidBlocks = bot.findBlocks({
+        matching: block => block.name === liquidType && block.metadata === 0, // metadata 0 = source block
+        maxDistance: 32,
+        count: 100 // Get multiple candidates
+    });
+    
+    if (!liquidBlocks || liquidBlocks.length === 0) {
+        log(bot, `No ${liquidType} source found within 32 blocks.`);
+        return false;
+    }
+    
+    // Priority: closest Y level first, then horizontal distance
+    const botY = bot.entity.position.y;
+    const botPos = bot.entity.position;
+    
+    liquidBlocks.sort((a, b) => {
+        const yDiffA = Math.abs(a.y - botY);
+        const yDiffB = Math.abs(b.y - botY);
+        
+        // If Y difference is significantly different (more than 2 blocks), prioritize by Y
+        if (Math.abs(yDiffA - yDiffB) > 2) {
+            return yDiffA - yDiffB;
+        }
+        
+        // Otherwise, sort by horizontal distance
+        const horizDistA = Math.sqrt(Math.pow(a.x - botPos.x, 2) + Math.pow(a.z - botPos.z, 2));
+        const horizDistB = Math.sqrt(Math.pow(b.x - botPos.x, 2) + Math.pow(b.z - botPos.z, 2));
+        return horizDistA - horizDistB;
+    });
+    
+    const liquidBlock = bot.blockAt(liquidBlocks[0]);
+    
+    if (!liquidBlock) {
+        log(bot, `No ${liquidType} source found within 32 blocks.`);
+        return false;
+    }
+    
+    // Move closer if needed
+    if (bot.entity.position.distanceTo(liquidBlock.position) > 4.5) {
+        bot.pathfinder.setMovements(new pf.Movements(bot));
+        await goToGoal(bot, new pf.goals.GoalNear(liquidBlock.position.x, liquidBlock.position.y, liquidBlock.position.z, 3));
+    }
+    
+    // Equip the bucket
+    await equip(bot, 'bucket');
+    
+    // Use bucket on liquid
+    try {
+        await bot.activateBlock(liquidBlock);
+        log(bot, `Filled bucket with ${liquidType}. You now have ${liquidType}_bucket.`);
+        return true;
+    } catch (err) {
+        log(bot, `Failed to fill bucket: ${err.message}`);
+        return false;
+    }
 }
 
 export async function activateNearestBlock(bot, type) {

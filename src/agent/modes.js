@@ -146,6 +146,13 @@ const modes_list = [
         update: async function (agent) {
             const enemy = world.getNearestEntityWhere(agent.bot, entity => mc.isHostile(entity), 16);
             if (enemy && await world.isClearPath(agent.bot, enemy)) {
+                // Safety check: Don't run from villagers or friendly entities
+                const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot'];
+                if (friendlyEntities.some(name => enemy.name.includes(name))) {
+                    console.log(`[COWARDICE] Skipping ${enemy.name} - marked as friendly`);
+                    return;
+                }
+
                 say(agent, `Aaa! A ${enemy.name.replace("_", " ")}!`);
                 execute(this, agent, async () => {
                     await skills.avoidEnemies(agent.bot, 24);
@@ -162,6 +169,19 @@ const modes_list = [
         update: async function (agent) {
             const enemy = world.getNearestEntityWhere(agent.bot, entity => mc.isHostile(entity), 8);
             if (enemy && await world.isClearPath(agent.bot, enemy)) {
+                // Enhanced logging to debug attacks
+                const entityType = enemy.type || 'unknown';
+                const entityName = enemy.name || 'unknown';
+                const isActuallyHostile = mc.isHostile(enemy);
+                console.log(`[SELF_DEFENSE] Detected entity: name="${entityName}", type="${entityType}", isHostile=${isActuallyHostile}`);
+
+                // Safety check: Don't attack villagers, players, or other friendly entities
+                const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot', 'horse', 'donkey', 'mule', 'llama'];
+                if (friendlyEntities.some(name => entityName.includes(name))) {
+                    console.log(`[SELF_DEFENSE] Skipping ${entityName} - marked as friendly`);
+                    return;
+                }
+
                 say(agent, `Fighting ${enemy.name}!`);
                 execute(this, agent, async () => {
                     await skills.defendSelf(agent.bot, 8);
@@ -187,26 +207,66 @@ const modes_list = [
     },
     {
         name: 'item_collecting',
-        description: 'Collect nearby items when idle.',
-        interrupts: ['action:followPlayer'],
+        description: 'Collect nearby items when idle or when items are dropped.',
+        interrupts: ['action:followPlayer', 'action:!stop', 'action:!stayHere'],
         on: true,
         active: false,
 
-        wait: 2, // number of seconds to wait after noticing an item to pick it up
+        wait: 1.5, // reduced from 2 to 1.5 seconds for faster response
         prev_item: null,
         noticed_at: -1,
+        last_inventory_snapshot: null,
         update: async function (agent) {
             let item = world.getNearestEntityWhere(agent.bot, entity => entity.name === 'item', 8);
             let empty_inv_slots = agent.bot.inventory.emptySlotCount();
-            if (item && item !== this.prev_item && await world.isClearPath(agent.bot, item) && empty_inv_slots > 1) {
+
+            // More aggressive item collection - interrupt more actions when items are very close
+            const distance = item ? agent.bot.entity.position.distanceTo(item.position) : 999;
+            const is_very_close = distance < 3; // items within 3 blocks are considered "given" items
+            const can_interrupt = agent.isIdle() || is_very_close;
+
+            if (item && item !== this.prev_item && await world.isClearPath(agent.bot, item) && empty_inv_slots > 1 && can_interrupt) {
                 if (this.noticed_at === -1) {
                     this.noticed_at = Date.now();
+                    // Reduce wait time for very close items (likely given by player)
+                    if (is_very_close) {
+                        say(agent, `I see items nearby!`);
+                    }
                 }
-                if (Date.now() - this.noticed_at > this.wait * 1000) {
-                    say(agent, `Picking up item!`);
+                const wait_time = is_very_close ? 0.5 : this.wait; // 0.5s for close items, 1.5s for others
+                if (Date.now() - this.noticed_at > wait_time * 1000) {
+                    // Take inventory snapshot before pickup
+                    const before_items = agent.bot.inventory.items().map(i => ({name: i.name, count: i.count}));
+
+                    say(agent, `Picking up items!`);
                     this.prev_item = item;
                     execute(this, agent, async () => {
                         await skills.pickupNearbyItems(agent.bot);
+
+                        // Check what was picked up
+                        const after_items = agent.bot.inventory.items();
+                        const new_items = [];
+
+                        for (const item of after_items) {
+                            const before_item = before_items.find(b => b.name === item.name);
+                            if (!before_item) {
+                                new_items.push(`${item.count} ${item.name}`);
+                            } else if (item.count > before_item.count) {
+                                new_items.push(`${item.count - before_item.count} ${item.name}`);
+                            }
+                        }
+
+                        // Notify agent about picked up items if currently executing an action
+                        if (new_items.length > 0 && !agent.isIdle()) {
+                            const items_list = new_items.join(', ');
+                            say(agent, `Picked up: ${items_list}`);
+                            // Auto-message to inform LLM about new resources if working on a task
+                            setTimeout(() => {
+                                if (!agent.isIdle() && agent.actions.currentActionLabel) {
+                                    agent.handleMessage('system', `(AUTO) You just picked up ${items_list}. You now have these materials available. Check your inventory and continue with your current task if you have what you need.`);
+                                }
+                            }, 500);
+                        }
                     });
                     this.noticed_at = -1;
                 }

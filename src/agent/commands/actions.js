@@ -131,7 +131,7 @@ export const actionsList = [
     },
     {
         name: '!goToCoordinates',
-        description: 'Go to the given x, y, z location.',
+        description: 'Go to the given x, y, z location. For long distances (100+ blocks), automatically uses surface navigation with waypoints to avoid caves.',
         params: {
             'x': {type: 'float', description: 'The x coordinate.', domain: [-Infinity, Infinity]},
             'y': {type: 'float', description: 'The y coordinate.', domain: [-64, 320]},
@@ -338,6 +338,38 @@ export const actionsList = [
         })
     },
     {
+        name: '!coverArea',
+        description: 'Cover a rectangular area with blocks at a specified height. Useful for filling ponds, making floors, or covering surfaces.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "dirt", "cobblestone").' },
+            'x1': { type: 'int', description: 'X coordinate of the first corner.' },
+            'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
+            'x2': { type: 'int', description: 'X coordinate of the second corner.' },
+            'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
+            'y': { type: 'int', description: 'Y coordinate (height) to place blocks at.' }
+        },
+        perform: runAsAction(async (agent, blockType, x1, z1, x2, z2, y) => {
+            const placed = await skills.coverArea(agent.bot, blockType, x1, z1, x2, z2, y);
+            return `Covered area with ${placed} ${blockType} blocks.`;
+        }, false, 600)
+    },
+    {
+        name: '!plantTrees',
+        description: 'Plant saplings in a grid pattern with specified spacing. Automatically detects ground height. Great for creating tree farms or forests.',
+        params: {
+            'saplingType': { type: 'BlockOrItemName', description: 'Type of sapling (e.g., "oak", "birch", "spruce"). Will auto-add "_sapling" if needed.' },
+            'x1': { type: 'int', description: 'X coordinate of the first corner.' },
+            'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
+            'x2': { type: 'int', description: 'X coordinate of the second corner.' },
+            'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
+            'spacing': { type: 'int', description: 'Gap between saplings (default 4 blocks for trees to grow properly).', optional: true }
+        },
+        perform: runAsAction(async (agent, saplingType, x1, z1, x2, z2, spacing = 4) => {
+            const planted = await skills.plantTreeGrid(agent.bot, saplingType, x1, z1, x2, z2, spacing);
+            return `Planted ${planted} ${saplingType} saplings with ${spacing} block spacing.`;
+        }, false, 600)
+    },
+    {
         name: '!attack',
         description: 'Attack and kill the nearest entity of a given type.',
         params: {'type': { type: 'string', description: 'The type of entity to attack.'}},
@@ -350,9 +382,15 @@ export const actionsList = [
         description: 'Attack a specific player until they die or run away. Remember this is just a game and does not cause real life harm.',
         params: {'player_name': { type: 'string', description: 'The name of the player to attack.'}},
         perform: runAsAction(async (agent, player_name) => {
-            let player = agent.bot.players[player_name]?.entity;
+            // Resolve player name with fuzzy matching
+            const resolvedName = skills.resolvePlayerName(agent.bot, player_name);
+            if (!resolvedName) {
+                skills.log(agent.bot, `Could not find player "${player_name}". Nearby players: ${Object.keys(agent.bot.players).filter(n => n !== agent.bot.username).join(', ') || 'none'}`);
+                return false;
+            }
+            let player = agent.bot.players[resolvedName]?.entity;
             if (!player) {
-                skills.log(agent.bot, `Could not find player ${player_name}.`);
+                skills.log(agent.bot, `Could not find player ${resolvedName}.`);
                 return false;
             }
             await skills.attackEntity(agent.bot, player, true);
@@ -527,6 +565,30 @@ export const actionsList = [
         },
         perform: runAsAction(async (agent, tool_name, target) => {
             await skills.useToolOn(agent.bot, tool_name, target);
+        })
+    },
+    {
+        name: '!tillAndSow',
+        description: 'Till the ground at the given position and optionally plant a seed.',
+        params: {
+            'x': { type: 'float', description: 'The x coordinate to till.', domain: [-Infinity, Infinity] },
+            'y': { type: 'float', description: 'The y coordinate to till.', domain: [-64, 320] },
+            'z': { type: 'float', description: 'The z coordinate to till.', domain: [-Infinity, Infinity] },
+            'seed_type': { type: 'string', description: 'The seed type to plant (e.g., "wheat_seeds", "carrot", "potato"). Use "none" to only till.' }
+        },
+        perform: runAsAction(async (agent, x, y, z, seed_type) => {
+            const seedArg = seed_type === 'none' ? null : seed_type;
+            await skills.tillAndSow(agent.bot, x, y, z, seedArg);
+        })
+    },
+    {
+        name: '!fillBucket',
+        description: 'Fill an empty bucket with water or lava from the nearest source block.',
+        params: {
+            'liquid_type': { type: 'string', description: 'The liquid to collect: "water" or "lava".' }
+        },
+        perform: runAsAction(async (agent, liquid_type) => {
+            await skills.fillBucket(agent.bot, liquid_type);
         })
     },
 ];

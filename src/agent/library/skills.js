@@ -528,15 +528,11 @@ export async function defendSelf(bot, range=9) {
     let enemy = world.getNearestEntityWhere(bot, entity => {
         // Double-check hostile status and exclude friendly entities
         if (!mc.isHostile(entity)) return false;
-
-        // Safety filter: never attack these friendly entities
-        const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot', 'horse', 'donkey', 'mule', 'llama'];
-        const entityName = entity.name || '';
-        if (friendlyEntities.some(name => entityName.includes(name))) {
-            console.log(`[DEFEND_SELF] Skipping ${entityName} - marked as friendly`);
+        // Safety filter: never attack friendly entities
+        if (mc.isFriendly(entity)) {
+            console.log(`[DEFEND_SELF] Skipping ${entity.name} - marked as friendly`);
             return false;
         }
-
         return true;
     }, range);
     while (enemy) {
@@ -559,9 +555,7 @@ export async function defendSelf(bot, range=9) {
         await new Promise(resolve => setTimeout(resolve, 500));
         enemy = world.getNearestEntityWhere(bot, entity => {
             if (!mc.isHostile(entity)) return false;
-            const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot', 'horse', 'donkey', 'mule', 'llama'];
-            const entityName = entity.name || '';
-            return !friendlyEntities.some(name => entityName.includes(name));
+            return !mc.isFriendly(entity);
         }, range);
         if (bot.interrupt_code) {
             bot.pvp.stop();
@@ -1416,16 +1410,17 @@ export async function putInChest(bot, itemName, num=-1) {
         log(bot, `Could not find any storage container within ${CONSTANTS.DEFAULT_SEARCH_RANGE} blocks. Place a chest, barrel, or shulker box nearby.`);
         return false;
     }
-    let item = bot.inventory.items().find(item => item.name === itemName);
-    if (!item) {
+
+    // Get ALL matching items in inventory (may be spread across multiple slots)
+    const matchingItems = bot.inventory.items().filter(item => item.name === itemName);
+    if (matchingItems.length === 0) {
         const similarItems = bot.inventory.items().filter(i => i.name.includes(itemName.split('_')[0])).map(i => i.name);
-        // Get a summary of what the bot actually has (top 10 items by count)
         const inventorySummary = bot.inventory.items()
             .sort((a, b) => b.count - a.count)
             .slice(0, 10)
             .map(i => `${i.name}(${i.count})`)
             .join(', ');
-        
+
         let errorMsg = `You do not have any ${itemName} in inventory.`;
         if (similarItems.length > 0) {
             errorMsg += ` Similar: ${similarItems.join(', ')}.`;
@@ -1436,33 +1431,51 @@ export async function putInChest(bot, itemName, num=-1) {
         log(bot, errorMsg);
         return false;
     }
-    let to_put = num === -1 ? item.count : Math.min(num, item.count);
+
+    // Calculate total items across all slots
+    const totalInInventory = matchingItems.reduce((sum, item) => sum + item.count, 0);
+    const to_put = num === -1 ? totalInInventory : Math.min(num, totalInInventory);
+
     await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
     const openedContainer = await bot.openContainer(container);
 
-    // Check container capacity
-    const containerSlots = openedContainer.containerItems();
+    // Check container capacity before deposit
     const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
-    const usedSlots = containerSlots.length;
-    const emptySlots = totalSlots - usedSlots;
     const isDoubleChest = totalSlots === 54;
     const chestType = isDoubleChest ? 'double chest' : container.name;
 
+    // Count items BEFORE deposit
+    const countBefore = matchingItems.reduce((sum, item) => sum + item.count, 0);
+    const itemType = matchingItems[0].type;
+
     try {
-        await openedContainer.deposit(item.type, null, to_put);
-        await openedContainer.close();
-        log(bot, `Successfully put ${to_put} ${itemName} in the ${chestType}. (${usedSlots + 1}/${totalSlots} slots used)`);
-        return true;
+        // Deposit all at once - mineflayer now waits for slot updates on chest windows
+        await openedContainer.deposit(itemType, null, to_put);
     } catch (err) {
-        await openedContainer.close();
-        // Try to provide helpful info about why deposit failed
-        if (emptySlots === 0) {
-            log(bot, `The ${chestType} is completely FULL (${totalSlots}/${totalSlots} slots). Cannot deposit ${itemName}.`);
-        } else {
-            log(bot, `Could not deposit ${to_put} ${itemName} in ${chestType}. Space: ${emptySlots} empty slots. Try depositing a smaller amount or stacking items first.`);
-        }
-        return false;
+        // "destination full" = chest filled mid-deposit, some items may have been deposited already
+        // "Can't find X in slots" = item gone (shouldn't happen since we checked)
+        console.log(`[putInChest] Deposit threw: ${err.message}`);
     }
+
+    // Count items AFTER deposit - this tells us what ACTUALLY moved regardless of errors
+    const countAfter = bot.inventory.items()
+        .filter(item => item.name === itemName)
+        .reduce((sum, item) => sum + item.count, 0);
+    const actualDeposited = countBefore - countAfter;
+
+    // Get current slot usage
+    const slotsUsedAfter = openedContainer.containerItems().length;
+    await openedContainer.close();
+
+    if (actualDeposited === 0) {
+        log(bot, `Could not deposit any ${itemName}. The ${chestType} is full.`);
+        return false;
+    } else if (actualDeposited < to_put) {
+        log(bot, `Deposited ${actualDeposited}/${to_put} ${itemName} in ${chestType} (${slotsUsedAfter}/${totalSlots} slots). ${countAfter} left in inventory.`);
+    } else {
+        log(bot, `Successfully put ${actualDeposited} ${itemName} in ${chestType}. (${slotsUsedAfter}/${totalSlots} slots used)`);
+    }
+    return true;
 }
 
 export async function takeFromChest(bot, itemName, num=-1) {
@@ -1558,60 +1571,101 @@ export async function viewChest(bot) {
 export async function depositAllItems(bot, excludeItems = []) {
     /**
      * Deposit all items from inventory to nearest storage container.
+     * Will try multiple chests if the first one is full.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
      * @param {string[]} excludeItems, items to keep in inventory (e.g., tools, weapons, food).
      * @returns {Promise<boolean>} true if items were deposited, false otherwise.
      * @example
      * await skills.depositAllItems(bot, ["diamond_pickaxe", "diamond_sword", "cooked_beef"]);
      **/
-    let container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-    if (!container) {
-        log(bot, `Could not find any storage container nearby.`);
-        return false;
-    }
-    
+
     // Default items to always keep
     const defaultKeep = ['netherite_pickaxe', 'netherite_sword', 'netherite_axe', 'netherite_shovel',
                          'diamond_pickaxe', 'diamond_sword', 'diamond_axe', 'diamond_shovel'];
     const keepItems = new Set([...excludeItems, ...defaultKeep]);
-    
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
 
-    // Determine container type
-    const totalSlots = openedContainer.slots.length - 36;
-    const isDoubleChest = totalSlots === 54;
-    const chestType = isDoubleChest ? 'double chest' : container.name;
+    let totalDeposited = 0;
+    let allDepositedTypes = [];
+    const usedContainers = new Set();
+    const maxChests = 5; // Try up to 5 chests
 
-    let deposited = 0;
-    let depositedTypes = [];
+    for (let chestAttempt = 0; chestAttempt < maxChests; chestAttempt++) {
+        // Check if we still have items to deposit
+        const itemsToDeposit = bot.inventory.items().filter(item => {
+            if (keepItems.has(item.name)) return false;
+            if (item.name.includes('helmet') || item.name.includes('chestplate') ||
+                item.name.includes('leggings') || item.name.includes('boots')) return false;
+            return true;
+        });
 
-    for (const item of bot.inventory.items()) {
-        // Skip items we want to keep
-        if (keepItems.has(item.name)) continue;
-        // Skip equipped armor
-        if (item.name.includes('helmet') || item.name.includes('chestplate') ||
-            item.name.includes('leggings') || item.name.includes('boots')) continue;
+        if (itemsToDeposit.length === 0) {
+            break; // Nothing left to deposit
+        }
 
-        try {
-            await openedContainer.deposit(item.type, null, item.count);
-            deposited += item.count;
-            depositedTypes.push(item.name);
-        } catch (e) {
-            log(bot, `The ${chestType} is full, stopped depositing.`);
-            break;
+        // Find nearest container we haven't used yet
+        let container = null;
+        const nearbyContainers = world.getNearestBlocks(bot, ['chest', 'barrel', 'trapped_chest'], CONSTANTS.DEFAULT_SEARCH_RANGE, 10);
+        for (const c of nearbyContainers) {
+            const posKey = `${c.position.x},${c.position.y},${c.position.z}`;
+            if (!usedContainers.has(posKey)) {
+                container = c;
+                usedContainers.add(posKey);
+                break;
+            }
+        }
+
+        if (!container) {
+            if (chestAttempt === 0) {
+                log(bot, `Could not find any storage container nearby.`);
+                return false;
+            }
+            break; // No more unused chests
+        }
+
+        await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
+        const openedContainer = await bot.openContainer(container);
+
+        // Determine container type
+        const totalSlots = openedContainer.slots.length - 36;
+        const isDoubleChest = totalSlots === 54;
+        const chestType = isDoubleChest ? 'double chest' : container.name;
+
+        let deposited = 0;
+        let chestFull = false;
+
+        for (const item of bot.inventory.items()) {
+            // Skip items we want to keep
+            if (keepItems.has(item.name)) continue;
+            // Skip equipped armor
+            if (item.name.includes('helmet') || item.name.includes('chestplate') ||
+                item.name.includes('leggings') || item.name.includes('boots')) continue;
+
+            try {
+                await openedContainer.deposit(item.type, null, item.count);
+                deposited += item.count;
+                allDepositedTypes.push(item.name);
+            } catch (e) {
+                log(bot, `${chestType} at (${container.position.x}, ${container.position.y}, ${container.position.z}) is full, trying next chest...`);
+                chestFull = true;
+                break;
+            }
+        }
+
+        await openedContainer.close();
+        totalDeposited += deposited;
+
+        if (!chestFull) {
+            break; // Successfully deposited everything
         }
     }
 
-    await openedContainer.close();
-
-    if (deposited === 0) {
+    if (totalDeposited === 0) {
         log(bot, `No items to deposit (or all items are in the keep list).`);
         return false;
     }
 
-    const uniqueTypes = [...new Set(depositedTypes)];
-    log(bot, `Deposited ${deposited} items (${uniqueTypes.length} types) into ${chestType}.`);
+    const uniqueTypes = [...new Set(allDepositedTypes)];
+    log(bot, `Deposited ${totalDeposited} items (${uniqueTypes.length} types) total.`);
     return true;
 }
 
@@ -1779,7 +1833,20 @@ export async function goToGoal(bot, goal) {
      **/
 
     const nonDestructiveMovements = new pf.Movements(bot);
-    const dontBreakBlocks = ['glass', 'glass_pane', 'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door', 'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door', 'bamboo_door', 'crimson_door', 'warped_door', 'iron_door'];
+    const dontBreakBlocks = [
+        'glass', 'glass_pane', 'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door',
+        'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door', 'bamboo_door',
+        'crimson_door', 'warped_door', 'iron_door',
+        // Fence gates - can be opened/closed
+        'fence_gate', 'oak_fence_gate', 'spruce_fence_gate', 'birch_fence_gate',
+        'jungle_fence_gate', 'acacia_fence_gate', 'dark_oak_fence_gate',
+        'mangrove_fence_gate', 'cherry_fence_gate', 'bamboo_fence_gate',
+        'crimson_fence_gate', 'warped_fence_gate',
+        // Fence blocks - don't break
+        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
+        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
+        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
+    ];
     for (let block of dontBreakBlocks) {
         const blockId = mc.getBlockId(block);
         if (blockId) nonDestructiveMovements.blocksCantBreak.add(blockId);
@@ -1819,6 +1886,32 @@ export async function goToGoal(bot, goal) {
 
 let _doorInterval = null;
 
+/**
+ * Create surface-only movements for long distance travel to avoid caves
+ * @param {MinecraftBot} bot - reference to the minecraft bot
+ * @returns {pf.Movements} configured movements that prefer surface travel
+ */
+function createSurfaceMovements(bot) {
+    const movements = new pf.Movements(bot);
+
+    // Disable digging to stay on surface
+    movements.canDig = false;
+
+    // Limit vertical drops to avoid falling into caves
+    movements.maxDropDown = 3;
+
+    // Don't build towers (stay on natural terrain)
+    movements.allow1by1towers = false;
+
+    // High cost for going down to discourage cave entry
+    movements.digCost = 1000;
+
+    // Avoid water/lava
+    movements.canOpenDoors = true;
+
+    return movements;
+}
+
 function createSafeMovements(bot, options = {}) {
     /**
      * Create pathfinding movements that prioritize using doors over breaking blocks
@@ -1848,7 +1941,12 @@ function createSafeMovements(bot, options = {}) {
         'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks',
         'acacia_planks', 'dark_oak_planks', 'fence_gate', 'oak_fence_gate',
         'spruce_fence_gate', 'birch_fence_gate', 'jungle_fence_gate',
-        'acacia_fence_gate', 'dark_oak_fence_gate'
+        'acacia_fence_gate', 'dark_oak_fence_gate', 'mangrove_fence_gate',
+        'cherry_fence_gate', 'bamboo_fence_gate', 'crimson_fence_gate', 'warped_fence_gate',
+        // All fence blocks - don't break player-built fences
+        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
+        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
+        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
     ];
     
     for (let block of dontBreakBlocks) {
@@ -1864,6 +1962,99 @@ function createSafeMovements(bot, options = {}) {
     if (options.dontCreateFlow !== undefined) movements.dontCreateFlow = options.dontCreateFlow;
     
     return movements;
+}
+
+/**
+ * Find carpet blocks placed on top of fences nearby (within 4 blocks)
+ * @param {MinecraftBot} bot - reference to the minecraft bot
+ * @returns {Object|null} - {carpet: Block, fence: Block, jumpPos: Vec3} or null if not found
+ */
+function findCarpetOnFence(bot) {
+    const searchRadius = 4;
+    const botPos = bot.entity.position;
+
+    // List of fence block names
+    const fenceNames = [
+        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
+        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
+        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
+    ];
+
+    // Search nearby blocks for fence + carpet combo
+    for (let dx = -searchRadius; dx <= searchRadius; dx++) {
+        for (let dz = -searchRadius; dz <= searchRadius; dz++) {
+            for (let dy = -1; dy <= 2; dy++) {
+                const checkPos = botPos.offset(dx, dy, dz);
+                const block = bot.blockAt(checkPos);
+
+                if (block && fenceNames.includes(block.name)) {
+                    // Found a fence, check if there's carpet on top
+                    const abovePos = checkPos.offset(0, 1, 0);
+                    const aboveBlock = bot.blockAt(abovePos);
+
+                    if (aboveBlock && aboveBlock.name.includes('carpet')) {
+                        // Found carpet on fence! Calculate approach position
+                        const dist = botPos.distanceTo(checkPos);
+                        if (dist < searchRadius) {
+                            console.log(`[FENCE_HELPER] Found carpet (${aboveBlock.name}) on fence at ${checkPos}`);
+                            return {
+                                carpet: aboveBlock,
+                                fence: block,
+                                fencePos: checkPos,
+                                carpetPos: abovePos
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Attempt to jump over a fence using carpet placed on top
+ * @param {MinecraftBot} bot - reference to the minecraft bot
+ * @param {Object} carpetInfo - {carpet, fence, fencePos, carpetPos} from findCarpetOnFence
+ */
+async function attemptCarpetFenceJump(bot, carpetInfo) {
+    const { fencePos, carpetPos } = carpetInfo;
+    const botPos = bot.entity.position;
+
+    // Calculate direction to fence
+    const dx = fencePos.x - botPos.x;
+    const dz = fencePos.z - botPos.z;
+    const dist = Math.sqrt(dx * dx + dz * dz);
+
+    if (dist > 3) {
+        // Too far, need to get closer first - let pathfinder handle approach
+        console.log(`[FENCE_HELPER] Carpet-fence too far (${dist.toFixed(1)} blocks), waiting for approach`);
+        return;
+    }
+
+    console.log(`[FENCE_HELPER] Attempting carpet-fence jump at ${fencePos}`);
+
+    // Look at the carpet position
+    await bot.lookAt(carpetPos.offset(0.5, 0.5, 0.5));
+
+    // Move towards the fence
+    const dirX = dx / dist;
+    const dirZ = dz / dist;
+
+    bot.setControlState('forward', true);
+    bot.setControlState('sprint', false);
+
+    // Wait a bit then jump
+    setTimeout(() => {
+        bot.setControlState('jump', true);
+        console.log(`[FENCE_HELPER] Jumping onto carpet at ${carpetPos}`);
+
+        // Release controls after jump
+        setTimeout(() => {
+            bot.setControlState('jump', false);
+            bot.setControlState('forward', false);
+        }, 400);
+    }, 200);
 }
 
 function startDoorInterval(bot) {
@@ -1910,16 +2101,26 @@ function startDoorInterval(bot) {
                 positions[randomIndex], positions[currentIndex]];
             }
             
+            let foundGateOrDoor = false;
             for (let position of positions) {
                 let block = bot.blockAt(position);
                 if (block && block.name &&
                     !block.name.includes('iron') &&
                     (block.name.includes('door') ||
                      block.name.includes('fence_gate') ||
-                     block.name.includes('trapdoor'))) 
+                     block.name.includes('trapdoor')))
                 {
                     bot.activateBlock(block);
+                    foundGateOrDoor = true;
                     break;
+                }
+            }
+
+            // If no gate/door found, try carpet-on-fence jump as fallback
+            if (!foundGateOrDoor) {
+                const carpetOnFence = findCarpetOnFence(bot);
+                if (carpetOnFence) {
+                    attemptCarpetFenceJump(bot, carpetOnFence);
                 }
             }
             stuck_time = 0;
@@ -1929,6 +2130,44 @@ function startDoorInterval(bot) {
     }, 200);
     _doorInterval = doorCheckInterval;
     return doorCheckInterval;
+}
+
+/**
+ * Get surface Y coordinate at given X, Z position
+ * @param {MinecraftBot} bot - reference to the minecraft bot
+ * @param {number} x - x coordinate
+ * @param {number} z - z coordinate
+ * @returns {number} surface Y level
+ */
+function getSurfaceY(bot, x, z) {
+    // Start from high and find first solid block
+    for (let y = 100; y > 0; y--) {
+        const block = bot.blockAt(new Vec3(x, y, z));
+        if (block && block.name !== 'air' && block.name !== 'water' && block.name !== 'lava' &&
+            !block.name.includes('leaves') && !block.name.includes('log')) {
+            return y + 1;
+        }
+    }
+    return 64; // Default to sea level
+}
+
+/**
+ * Check if bot is currently underground (in a cave)
+ * @param {MinecraftBot} bot - reference to the minecraft bot
+ * @returns {boolean} true if underground
+ */
+function isUnderground(bot) {
+    const pos = bot.entity.position;
+    // Check if there's solid blocks above the bot (cave ceiling)
+    let solidAbove = 0;
+    for (let y = Math.floor(pos.y) + 2; y < Math.floor(pos.y) + 10; y++) {
+        const block = bot.blockAt(new Vec3(pos.x, y, pos.z));
+        if (block && block.name !== 'air' && block.name !== 'water' && !block.name.includes('leaves')) {
+            solidAbove++;
+        }
+    }
+    // If more than 3 solid blocks above within 10 blocks, likely in a cave
+    return solidAbove >= 3;
 }
 
 export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
@@ -1954,12 +2193,72 @@ export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
         log(bot, `Teleported to ${x}, ${y}, ${z}.`);
         return true;
     }
-    
+
+    // Calculate horizontal distance
+    const botPos = bot.entity.position;
+    const horizontalDistance = Math.sqrt(Math.pow(x - botPos.x, 2) + Math.pow(z - botPos.z, 2));
+    const LONG_DISTANCE_THRESHOLD = 100;
+    const WAYPOINT_INTERVAL = 50;
+
+    // For long distances, use surface-aware waypoint navigation
+    if (horizontalDistance > LONG_DISTANCE_THRESHOLD) {
+        log(bot, `Long distance travel (${Math.round(horizontalDistance)} blocks), using surface navigation...`);
+
+        // Calculate direction vector
+        const dx = x - botPos.x;
+        const dz = z - botPos.z;
+        const dist = Math.sqrt(dx * dx + dz * dz);
+        const dirX = dx / dist;
+        const dirZ = dz / dist;
+
+        // Create waypoints along the path
+        const numWaypoints = Math.floor(horizontalDistance / WAYPOINT_INTERVAL);
+
+        // Use surface movements for long distance
+        const surfaceMovements = createSurfaceMovements(bot);
+
+        for (let i = 1; i <= numWaypoints; i++) {
+            if (bot.interrupt_code) {
+                log(bot, `Navigation interrupted.`);
+                return false;
+            }
+
+            const waypointX = Math.floor(botPos.x + dirX * WAYPOINT_INTERVAL * i);
+            const waypointZ = Math.floor(botPos.z + dirZ * WAYPOINT_INTERVAL * i);
+
+            // Check if we're getting close to destination
+            const remainingDist = Math.sqrt(Math.pow(x - bot.entity.position.x, 2) + Math.pow(z - bot.entity.position.z, 2));
+            if (remainingDist < WAYPOINT_INTERVAL) {
+                break; // Close enough, do final approach
+            }
+
+            // Check if underground and try to get to surface
+            if (isUnderground(bot)) {
+                log(bot, `Detected underground, attempting to stay on surface...`);
+                // Try to find a surface path instead
+                const surfaceY = getSurfaceY(bot, bot.entity.position.x, bot.entity.position.z);
+                if (surfaceY > bot.entity.position.y + 5) {
+                    // Too deep underground, abort this waypoint and try next one
+                    continue;
+                }
+            }
+
+            try {
+                bot.pathfinder.setMovements(surfaceMovements);
+                await goToGoal(bot, new pf.goals.GoalNear(waypointX, bot.entity.position.y, waypointZ, 5));
+                log(bot, `Waypoint ${i}/${numWaypoints} reached, ${Math.round(remainingDist)} blocks remaining...`);
+            } catch (err) {
+                // If surface path fails, try with normal movements
+                log(bot, `Surface path blocked, trying alternate route...`);
+            }
+        }
+    }
+
     // Enable sprinting if requested
     if (sprint) {
         bot.setControlState('sprint', true);
     }
-    
+
     const checkDigProgress = () => {
         if (bot.targetDigBlock) {
             const targetBlock = bot.targetDigBlock;
@@ -1975,10 +2274,11 @@ export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
             log(bot, `Warning: ${bot.heldItem.name} is about to break!`);
         }
     };
-    
+
     const progressInterval = setInterval(checkDigProgress, 1000);
-    
+
     try {
+        // Final approach to exact destination
         await goToGoal(bot, new pf.goals.GoalNear(x, y, z, min_distance));
         clearInterval(progressInterval);
         if (sprint) {

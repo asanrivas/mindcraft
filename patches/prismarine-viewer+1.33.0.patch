@@ -1,8 +1,22 @@
 diff --git a/node_modules/prismarine-viewer/viewer/lib/entity/Entity.js b/node_modules/prismarine-viewer/viewer/lib/entity/Entity.js
-index 8945452..dab25be 100644
+index 8945452..5fb01d6 100644
 --- a/node_modules/prismarine-viewer/viewer/lib/entity/Entity.js
 +++ b/node_modules/prismarine-viewer/viewer/lib/entity/Entity.js
-@@ -203,7 +203,7 @@ function getMesh (texture, jsonModel) {
+@@ -168,8 +168,11 @@ function getMesh (texture, jsonModel) {
+ 
+   const rootBones = []
+   for (const jsonBone of jsonModel.bones) {
+-    if (jsonBone.parent) bones[jsonBone.parent].add(bones[jsonBone.name])
+-    else rootBones.push(bones[jsonBone.name])
++    if (jsonBone.parent && bones[jsonBone.parent] && bones[jsonBone.name]) {
++      bones[jsonBone.parent].add(bones[jsonBone.name])
++    } else if (!jsonBone.parent && bones[jsonBone.name]) {
++      rootBones.push(bones[jsonBone.name])
++    }
+   }
+ 
+   const skeleton = new THREE.Skeleton(Object.values(bones))
+@@ -203,7 +206,7 @@ function getMesh (texture, jsonModel) {
  class Entity {
    constructor (version, type, scene) {
      const e = entities[type]

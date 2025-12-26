@@ -79,12 +79,22 @@ export class Mem0Local {
         }
 
         // Initialize embeddings
-        if (!this.embedder) {
-            console.log(`[Mem0] Loading embedding model ${this.embeddingModel}...`);
-            const startTime = Date.now();
-            this.embedder = await pipeline('feature-extraction', this.embeddingModel);
-            const loadTime = ((Date.now() - startTime) / 1000).toFixed(1);
-            console.log(`[Mem0] Embedding model loaded in ${loadTime}s`);
+        if (!this.embedder && this.embeddingModel !== 'disabled') {
+            try {
+                console.log(`[Mem0] Loading embedding model ${this.embeddingModel}...`);
+                const startTime = Date.now();
+                this.embedder = await pipeline('feature-extraction', this.embeddingModel, {
+                    quantized: true,  // Use quantized model (int8) for lower memory
+                    progress_callback: null,  // Disable progress logging
+                    dtype: 'q8',  // 8-bit quantization
+                });
+                const loadTime = ((Date.now() - startTime) / 1000).toFixed(1);
+                console.log(`[Mem0] Embedding model loaded in ${loadTime}s (quantized)`);
+            } catch (err) {
+                console.warn(`[Mem0] Failed to load embeddings, disabling semantic search:`, err.message);
+                this.embeddingModel = 'disabled';
+                this.embedder = null;
+            }
         }
     }
 
@@ -93,6 +103,10 @@ export class Mem0Local {
      */
     async embed(text) {
         await this.init();
+
+        if (!this.embedder || this.embeddingModel === 'disabled') {
+            return null;  // No embeddings available
+        }
 
         const prefixedText = text.startsWith('query:') || text.startsWith('passage:')
             ? text
@@ -118,7 +132,7 @@ export class Mem0Local {
         const memoryId = `mem_${crypto.randomBytes(8).toString('hex')}`;
         const timestamp = Date.now();
 
-        // Generate embedding
+        // Generate embedding (if available)
         const embedding = await this.embed(content);
 
         const memory = {
@@ -126,7 +140,7 @@ export class Mem0Local {
             agent_id: this.agent_id,
             user_id: options.user_id || 'default',
             content,
-            embedding,
+            embedding: embedding || [],  // Empty array if embeddings disabled
             category: options.category || 'general',
             metadata: options.metadata || {},
             timestamp,
@@ -149,7 +163,7 @@ export class Mem0Local {
     }
 
     /**
-     * Search memories by semantic similarity
+     * Search memories by semantic similarity (or recent if embeddings disabled)
      * @param {string} query - Search query
      * @param {Object} options - {user_id, category, limit}
      * @returns {Promise<Array>} Matching memories with similarity scores
@@ -157,7 +171,6 @@ export class Mem0Local {
     async searchMemories(query, options = {}) {
         await this.init();
 
-        const queryEmbedding = await this.embed(`query: ${query}`);
         const limit = options.limit || 5;
         const userId = options.user_id || 'default';
 
@@ -182,7 +195,27 @@ export class Mem0Local {
             filteredMemories = filteredMemories.filter((m) => m.category === options.category);
         }
 
-        // Calculate similarities
+        // If embeddings disabled, return recent memories
+        if (!this.embedder || this.embeddingModel === 'disabled') {
+            console.log('[Mem0] Embeddings disabled, returning recent memories');
+            filteredMemories.sort((a, b) => b.timestamp - a.timestamp);
+            return filteredMemories.slice(0, limit).map((m) => ({
+                ...m,
+                similarity: 1.0,  // All equally "relevant" without semantic search
+            }));
+        }
+
+        // Otherwise, calculate semantic similarities
+        const queryEmbedding = await this.embed(`query: ${query}`);
+        if (!queryEmbedding) {
+            // Fallback if embedding fails
+            filteredMemories.sort((a, b) => b.timestamp - a.timestamp);
+            return filteredMemories.slice(0, limit).map((m) => ({
+                ...m,
+                similarity: 1.0,
+            }));
+        }
+
         const results = filteredMemories.map((memory) => ({
             ...memory,
             similarity: cosineSimilarity(queryEmbedding, memory.embedding),

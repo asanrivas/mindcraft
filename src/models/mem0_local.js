@@ -9,6 +9,8 @@ import { pipeline } from '@huggingface/transformers';
 import { cosineSimilarity } from '../utils/math.js';
 import crypto from 'crypto';
 import { strictFormat } from '../utils/text.js';
+import AnthropicFoundry from '@anthropic-ai/foundry-sdk';
+import { getKey } from '../utils/keys.js';
 
 export class Mem0Local {
     static prefix = 'mem0';
@@ -30,6 +32,37 @@ export class Mem0Local {
 
         // Memory namespace
         this.memoryPrefix = `mem0:${this.agent_id}:`;
+
+        // Azure Foundry client
+        this.foundryClient = null;
+        this.initFoundry(url);
+    }
+
+    /**
+     * Initialize Azure Foundry client
+     */
+    initFoundry(url) {
+        let config = {};
+
+        // Extract resource name from URL
+        if (url) {
+            const match = url.match(/https:\/\/([^.]+)\.services\.ai\.azure\.com/);
+            if (match) {
+                config.resource = match[1];
+            } else {
+                config.baseURL = url;
+            }
+        }
+
+        config.apiKey = getKey('AZURE_FOUNDRY_API_KEY');
+
+        this.foundryClient = new AnthropicFoundry(config);
+
+        console.log('[Mem0] Azure Foundry client initialized');
+        if (config.resource) {
+            console.log(`  resource: ${config.resource}`);
+        }
+        console.log(`  model: ${this.model_name}`);
     }
 
     /**
@@ -308,40 +341,41 @@ export class Mem0Local {
         // Augment system message with memory
         const augmentedSystemMessage = systemMessage + memoryContext;
 
-        // Format for Azure Foundry
-        const messages = strictFormat(turns);
+        // Format for Azure Foundry and strip 'name' field (not supported by Anthropic)
+        const messages = strictFormat(turns).map((msg) => {
+            const { name, ...rest } = msg;
+            return rest;
+        });
 
         // Call Azure Foundry
         console.log(`[Mem0] Calling Azure Foundry with ${relevantMemories.length} memories...`);
 
         try {
-            const response = await fetch(this.url, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'api-key': process.env.AZURE_FOUNDRY_API_KEY,
-                },
-                body: JSON.stringify({
-                    model: this.model_name,
-                    messages: [
-                        { role: 'system', content: augmentedSystemMessage },
-                        ...messages,
-                    ],
-                    max_tokens: this.params.max_tokens || 8096,
-                    temperature: this.params.temperature || 0.7,
-                }),
+            // Set default max_tokens if not provided
+            let max_tokens = this.params.max_tokens || 4096;
+
+            // Filter out unwanted params
+            const requestParams = { ...this.params };
+            delete requestParams.agent_name;
+            delete requestParams.embedding_model;
+            requestParams.max_tokens = max_tokens;
+
+            const resp = await this.foundryClient.messages.create({
+                model: this.model_name,
+                system: augmentedSystemMessage,
+                messages: messages,
+                ...requestParams,
             });
 
-            if (!response.ok) {
-                const error = await response.text();
-                throw new Error(`Azure Foundry error: ${error}`);
-            }
-
-            const data = await response.json();
-            const content = data.choices[0].message.content;
-
             console.log('[Mem0] Received response from Azure Foundry');
-            return content;
+
+            const textContent = resp.content.find((content) => content.type === 'text');
+            if (textContent) {
+                return textContent.text;
+            } else {
+                console.warn('[Mem0] No text content found in response');
+                return 'No response from Foundry.';
+            }
         } catch (err) {
             console.error('[Mem0] Error:', err);
             return 'My brain disconnected, try again.';

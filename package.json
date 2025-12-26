@@ -2,18 +2,20 @@
     "name": "mindcraft",
     "type": "module",
     "dependencies": {
+        "@anthropic-ai/foundry-sdk": "^0.2.0",
         "@anthropic-ai/sdk": "^0.17.1",
         "@cerebras/cerebras_cloud_sdk": "^1.46.0",
         "@google/genai": "^1.15.0",
-    "@huggingface/inference": "^2.8.1",
-    "@huggingface/transformers": "^3.0.0",
-    "@mistralai/mistralai": "^1.1.0",
+        "@huggingface/inference": "^2.8.1",
+        "@huggingface/transformers": "^3.0.0",
+        "@mistralai/mistralai": "^1.1.0",
         "canvas": "^3.1.0",
         "cheerio": "^1.0.0",
         "express": "^4.18.2",
         "google-translate-api-x": "^10.7.1",
         "groq-sdk": "^0.15.0",
         "minecraft-data": "^3.97.0",
+        "minecraft-protocol": "^1.62.0",
         "mineflayer": "^4.33.0",
         "mineflayer-armor-manager": "^2.0.1",
         "mineflayer-auto-eat": "^3.3.6",
@@ -25,6 +27,8 @@
         "openai": "^4.4.0",
         "prismarine-item": "^1.15.0",
         "prismarine-viewer": "^1.32.0",
+        "protodef": "^1.19.0",
+        "redis": "^4.7.1",
         "replicate": "^0.29.4",
         "ses": "^1.9.1",
         "socket.io": "^4.7.2",
@@ -34,8 +38,8 @@
         "yargs": "^17.7.2"
     },
     "overrides": {
-      "canvas": "^3.1.0",
-      "gl": "^8.1.6"
+        "canvas": "^3.1.0",
+        "gl": "^8.1.6"
     },
     "scripts": {
         "postinstall": "patch-package",

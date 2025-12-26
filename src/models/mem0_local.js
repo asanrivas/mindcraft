@@ -382,6 +382,7 @@ export class Mem0Local {
 
         // Call Azure Foundry
         console.log(`[Mem0] Calling Azure Foundry with ${relevantMemories.length} memories...`);
+        const startTime = Date.now();
 
         try {
             // Set default max_tokens if not provided
@@ -400,7 +401,8 @@ export class Mem0Local {
                 ...requestParams,
             });
 
-            console.log('[Mem0] Received response from Azure Foundry');
+            const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
+            console.log(`[Mem0] Received response from Azure Foundry (${elapsed}s)`);
 
             const textContent = resp.content.find((content) => content.type === 'text');
             if (textContent) {
@@ -413,6 +415,34 @@ export class Mem0Local {
             console.error('[Mem0] Error:', err);
             return 'My brain disconnected, try again.';
         }
+    }
+
+    /**
+     * Vision request with image for Mindcraft
+     */
+    async sendVisionRequest(turns, systemMessage, imageBuffer) {
+        await this.init();
+
+        const imageMessages = [...turns];
+        imageMessages.push({
+            role: "user",
+            content: [
+                {
+                    type: "text",
+                    text: systemMessage
+                },
+                {
+                    type: "image",
+                    source: {
+                        type: "base64",
+                        media_type: "image/jpeg",
+                        data: imageBuffer.toString('base64')
+                    }
+                }
+            ]
+        });
+
+        return this.sendRequest(imageMessages, systemMessage);
     }
 
     /**

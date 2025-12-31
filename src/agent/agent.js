@@ -16,14 +16,14 @@ import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
-import { LocalClassifier } from './local_classifier.js';
-import { LocalEmbedding } from '../models/local_embedding.js';
+import { loadNamedChestsFromFile, setNamedChestsSaveCallback } from './library/skills.js';
+import { IdleBehavior } from './idle_behavior.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
         this.last_sender = null;
         this.count_id = count_id;
-        
+
         // Initialize components with more detailed error handling
         this.actions = new ActionManager(this);
         this.prompter = new Prompter(this, settings.profile);
@@ -34,32 +34,22 @@ export class Agent {
         this.npc = new NPCContoller(this);
         this.memory_bank = new MemoryBank();
         this.self_prompter = new SelfPrompter(this);
+        this.idle_behavior = new IdleBehavior(this);
         convoManager.initAgent(this);
         await this.prompter.initExamples();
-        
-        // Initialize local classifier if enabled
-        if (settings.use_local_embeddings) {
-            try {
-                const embeddingModel = new LocalEmbedding(settings.local_embedding_model);
-                this.localClassifier = new LocalClassifier(embeddingModel);
-                // Initialize in background (don't block startup)
-                this.localClassifier.init().catch(err => {
-                    console.warn(`[Agent] Failed to initialize local classifier: ${err.message}`);
-                    this.localClassifier = null;
-                });
-            } catch (error) {
-                console.warn(`[Agent] Local classifier disabled: ${error.message}`);
-                this.localClassifier = null;
-            }
-        } else {
-            this.localClassifier = null;
-        }
 
         // load mem first before doing task
         let save_data = null;
         if (load_mem) {
             save_data = this.history.load();
         }
+
+        // Always load named chests (they persist independently of conversation memory)
+        const memoryFilePath = `./bots/${this.name}/memory.json`;
+        loadNamedChestsFromFile(memoryFilePath);
+        // Set up save callback so named chest changes persist
+        setNamedChestsSaveCallback(() => this.history.save());
+
         let taskStart = null;
         if (save_data) {
             taskStart = save_data.taskStart;
@@ -77,25 +67,22 @@ export class Agent {
 
         // Handle protocol errors more gracefully
         this.bot.on('error', (err) => {
-            if (err.message && err.message.includes('PartialReadError')) {
-                console.error(`${this.name}: Protocol error detected. This typically means:`);
-                console.error('  1. Version mismatch between client and server');
-                console.error('  2. Server is sending malformed packets');
-                console.error('  3. Network connection issue');
-                console.error(`Current version setting: ${settings.minecraft_version}`);
-                console.error(`Server version: ${this.bot.version}`);
-                console.error('\nTrying to recover by reconnecting in 5 seconds...');
-                setTimeout(() => {
-                    this.bot.quit();
-                    process.exit(1);
-                }, 5000);
+            const errMsg = err.message || err.toString();
+            if (errMsg.includes('PartialReadError') || errMsg.includes('buffer end')) {
+                console.error(`${this.name}: Protocol error detected: ${errMsg}`);
+                console.error('This typically means network instability or server lag.');
+                console.error('Forcing restart in 3 seconds...');
+                this._forceRestart(3000);
             }
         });
+
+        // Connection watchdog - detects stuck disconnects
+        this._startConnectionWatchdog();
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
             serverProxy.login();
-            
+
             // Set skin for profile, requires Fabric Tailor. (https://modrinth.com/mod/fabrictailor)
             if (this.prompter.profile.skin)
                 this.bot.chat(`/skin set URL ${this.prompter.profile.skin.model} ${this.prompter.profile.skin.path}`);
@@ -116,13 +103,13 @@ export class Agent {
 
                 // wait for a bit so stats are not undefined
                 await new Promise((resolve) => setTimeout(resolve, 1000));
-                
+
                 console.log(`${this.name} spawned.`);
                 this.clearBotLogs();
-              
+
                 this._setupEventHandlers(save_data, init_message);
                 this.startEvents();
-              
+
                 if (!load_mem) {
                     if (settings.task) {
                         this.task.initBotTask();
@@ -154,7 +141,7 @@ export class Agent {
             "Set the weather to",
             "Gamerule "
         ];
-        
+
         const respondFunc = async (username, message) => {
             if (message === "") return;
             if (username === this.name) return;
@@ -181,10 +168,43 @@ export class Agent {
 		this.respondFunc = respondFunc;
 
         this.bot.on('whisper', respondFunc);
-        
+
         this.bot.on('chat', (username, message) => {
-            if (serverProxy.getNumOtherAgents() > 0) return;
-            // only respond to open chat messages when there are no other agents
+            // With multiple agents, use smart filtering instead of blocking all public chat
+            if (serverProxy.getNumOtherAgents() > 0) {
+                const lowerMsg = message.toLowerCase();
+                const lowerName = this.name.toLowerCase();
+
+                // 1. Respond if message mentions this bot's name
+                if (lowerMsg.includes(lowerName)) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // 2. Respond to broadcast keywords (all bots should respond)
+                const broadcastKeywords = ['everyone', 'all bots', 'all of you', 'both of you', 'you all'];
+                if (broadcastKeywords.some(kw => lowerMsg.includes(kw))) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // 3. Respond to important shared commands (all bots should act)
+                const sharedCommands = ['go to bed', 'sleep', 'gotobed'];
+                if (sharedCommands.some(cmd => lowerMsg.includes(cmd))) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // 4. Respond to direct commands starting with !
+                if (message.trim().startsWith('!')) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // Otherwise, ignore public chat when multiple agents present
+                return;
+            }
+            // Single agent mode - respond to all public chat
             respondFunc(username, message);
         });
 
@@ -284,7 +304,7 @@ export class Agent {
                     this.history.add(source, message);
                 }
                 let execute_res = await executeCommand(this, message);
-                if (execute_res) 
+                if (execute_res)
                     this.routeResponse(source, execute_res);
                 return true;
             }
@@ -304,11 +324,12 @@ export class Agent {
             try {
                 const classification = await this.localClassifier.classify(message, source);
                 if (classification) {
-                    if (classification.type === 'command' && classification.confidence >= (settings.local_intent_threshold || 0.75)) {
-                        // High confidence command match - execute directly
+                    const threshold = settings.local_intent_threshold || 0.75;
+
+                    if (classification.type === 'command' && classification.confidence >= threshold) {
+                        // High confidence command match - try to execute directly
                         console.log(`[LocalClassifier] Matched command: ${classification.command} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`);
-                        this.history.add(source, message);
-                        
+
                         // Build command string with extracted args
                         let commandStr = classification.command;
                         if (classification.args && classification.args.length > 0) {
@@ -322,31 +343,67 @@ export class Agent {
                             }).join(', ');
                             commandStr = `${classification.command}(${argsStr})`;
                         }
-                        
-                        // Check if command requires args but we didn't extract any
+
+                        // Check if command requires args but we didn't extract enough
                         const { getCommand } = await import('./commands/index.js');
                         const cmd = getCommand(classification.command);
                         const requiredArgs = cmd && cmd.params ? Object.keys(cmd.params).length : 0;
                         const extractedArgs = classification.args ? classification.args.length : 0;
-                        
+
                         if (requiredArgs > 0 && extractedArgs === 0) {
                             console.log(`[LocalClassifier] Command ${classification.command} requires ${requiredArgs} args but none extracted, falling back to LLM`);
-                            // Fall through to LLM - don't execute incomplete command
+                            // Fall through to LLM - don't add to history, don't execute
+                        } else if (requiredArgs > 0 && extractedArgs < requiredArgs) {
+                            console.log(`[LocalClassifier] Command ${classification.command} requires ${requiredArgs} args but only got ${extractedArgs}, falling back to LLM`);
+                            // Fall through to LLM - don't add to history, don't execute
                         } else {
                             // Execute the command
-                            this.history.add(this.name, commandStr);
                             const execute_res = await executeCommand(this, commandStr);
-                            if (execute_res) {
+
+                            // Check if execution failed or needs follow-up action
+                            const needsFollowUp = execute_res && (
+                                // Errors
+                                execute_res.includes('Invalid') ||
+                                execute_res.includes('not found') ||
+                                execute_res.includes('does not exist') ||
+                                execute_res.includes('Cannot') ||
+                                execute_res.includes('Error') ||
+                                execute_res.includes('exception') ||
+                                // Incomplete actions that need follow-up
+                                execute_res.includes('requires a') ||  // "requires a crafting table"
+                                execute_res.includes('need a') ||      // "need a furnace"
+                                execute_res.includes('don\'t have') || // "don't have enough"
+                                execute_res.includes('do not have') ||
+                                execute_res.includes('no ') ||         // "no crafting table nearby"
+                                execute_res.includes('couldn\'t find') ||
+                                execute_res.includes('could not find') ||
+                                execute_res.includes('not enough')     // "not enough materials"
+                            );
+
+                            if (needsFollowUp) {
+                                // Command needs follow-up - let LLM handle it
+                                console.log(`[LocalClassifier] Command needs follow-up: "${execute_res}", falling back to LLM`);
+                                // Add the message and result to history so LLM has context
+                                this.history.add(source, message);
+                                this.history.add(this.name, commandStr);
                                 this.history.add('system', execute_res);
-                                this.routeResponse(source, execute_res);
+                                // Don't return - fall through to LLM to continue the task
+                            } else {
+                                // Success! Now add to history
+                                this.history.add(source, message);
+                                this.history.add(this.name, commandStr);
+                                if (execute_res) {
+                                    this.history.add('system', execute_res);
+                                    this.routeResponse(source, execute_res);
+                                }
+                                this.history.save();
+                                return true;
                             }
-                            this.history.save();
-                            return true;
                         }
                     } else if (classification.type === 'simple' && classification.confidence >= (settings.local_intent_threshold * 0.9 || 0.68)) {
                         // Simple intent match - handle directly
                         console.log(`[LocalClassifier] Matched simple intent: ${classification.intent} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`);
-                        
+
                         if (classification.intent === 'yes') {
                             this.history.add(source, message);
                             this.history.add(this.name, 'Yes, I understand.');
@@ -373,15 +430,22 @@ export class Agent {
                             this.history.save();
                             return true;
                         }
+                    } else if (classification.type === 'command') {
+                        // Command matched but confidence too low
+                        console.log(`[LocalClassifier] Low confidence match: ${classification.command} (${(classification.confidence * 100).toFixed(0)}% < ${(threshold * 100).toFixed(0)}%), falling back to LLM`);
                     }
+                } else {
+                    // No classification match at all
+                    console.log(`[LocalClassifier] No match found, falling back to LLM`);
                 }
             } catch (error) {
-                console.warn(`[Agent] Local classification failed: ${error.message}, falling back to LLM`);
+                console.warn(`[Agent] Local classification error: ${error.message}, falling back to LLM`);
             }
         }
 
+        // LLM fallback - handles all cases where local classification didn't succeed
         const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up || convoManager.responseScheduledFor(source);
-        
+
         let behavior_log = this.bot.modes.flushBehaviorLog().trim();
         if (behavior_log.length > 0) {
             const MAX_LOG = 500;
@@ -415,7 +479,7 @@ export class Agent {
             if (command_name) { // contains query or command
                 res = truncCommandMessage(res); // everything after the command is ignored
                 this.history.add(this.name, res);
-                
+
                 if (!commandExists(command_name)) {
                     this.history.add('system', `Command ${command_name} does not exist.`);
                     console.warn('Agent hallucinated command:', command_name)
@@ -458,7 +522,7 @@ export class Agent {
                 this.routeResponse(source, res);
                 break;
             }
-            
+
             this.history.save();
         }
 
@@ -538,10 +602,25 @@ export class Agent {
         // Logging callbacks
         this.bot.on('error' , (err) => {
             console.error('Error event!', err);
+            // Check for connection-related errors
+            const errMsg = err.message || err.toString();
+            if (errMsg.includes('ECONNRESET') ||
+                errMsg.includes('ETIMEDOUT') ||
+                errMsg.includes('ENOTCONN') ||
+                errMsg.includes('socket hang up')) {
+                console.error('[Connection] Network error detected, forcing restart...');
+                this._forceRestart(2000);
+            }
         });
         this.bot.on('end', (reason) => {
-            console.warn('Bot disconnected! Killing agent process.', reason)
-            this.cleanKill('Bot disconnected! Killing agent process.');
+            console.warn('Bot disconnected!', reason);
+            // Clear watchdog interval
+            if (this._watchdogInterval) {
+                clearInterval(this._watchdogInterval);
+            }
+            // Use force restart for cleaner reconnection
+            console.log('[Connection] Triggering auto-restart...');
+            this._forceRestart(2000);
         });
         this.bot.on('death', () => {
             this.actions.cancelResume();
@@ -549,7 +628,13 @@ export class Agent {
         });
         this.bot.on('kicked', (reason) => {
             console.warn('Bot kicked!', reason);
-            this.cleanKill('Bot kicked! Killing agent process.');
+            // Clear watchdog interval
+            if (this._watchdogInterval) {
+                clearInterval(this._watchdogInterval);
+            }
+            // Still restart on kick - server may have just restarted
+            console.log('[Connection] Kicked, triggering auto-restart...');
+            this._forceRestart(5000); // Wait 5 seconds before reconnecting after kick
         });
         this.bot.on('messagestr', async (message, _, jsonMsg) => {
             if (jsonMsg.translate && jsonMsg.translate.startsWith('death') && message.startsWith(this.name)) {
@@ -561,7 +646,32 @@ export class Agent {
                     death_pos_text = `x: ${death_pos.x.toFixed(2)}, y: ${death_pos.y.toFixed(2)}, z: ${death_pos.x.toFixed(2)}`;
                 }
                 let dimention = this.bot.game.dimension;
+
+                // Store death in Mem0 if available
+                if (this.prompter.chat_model?.recordDeath) {
+                    this.prompter.chat_model.recordDeath(death_pos, message);
+                }
+
                 this.handleMessage('system', `You died at position ${death_pos_text || "unknown"} in the ${dimention} dimension with the final message: '${message}'. Your place of death is saved as 'last_death_position' if you want to return. Previous actions were stopped and you have respawned.`);
+            }
+        });
+
+        // Player join/leave events for Mem0
+        this.bot.on('playerJoined', (player) => {
+            if (player.username !== this.name) {
+                console.log(`[Event] ${player.username} joined the game`);
+                if (this.prompter.chat_model?.recordPlayerJoin) {
+                    this.prompter.chat_model.recordPlayerJoin(player.username);
+                }
+            }
+        });
+
+        this.bot.on('playerLeft', (player) => {
+            if (player.username !== this.name) {
+                console.log(`[Event] ${player.username} left the game`);
+                if (this.prompter.chat_model?.recordPlayerLeave) {
+                    this.prompter.chat_model.recordPlayerLeave(player.username);
+                }
             }
         });
         this.bot.on('idle', () => {
@@ -599,19 +709,157 @@ export class Agent {
     async update(delta) {
         await this.bot.modes.update();
         this.self_prompter.update(delta);
+        await this.idle_behavior.update(delta);
         await this.checkTaskDone();
     }
 
     isIdle() {
         return !this.actions.executing;
     }
-    
+
 
     cleanKill(msg='Killing agent process...', code=1) {
         this.history.add('system', msg);
-        this.bot.chat(code > 1 ? 'Restarting.': 'Exiting.');
+        try {
+            this.bot.chat(code > 1 ? 'Restarting.': 'Exiting.');
+        } catch (e) {
+            // Bot may already be disconnected
+        }
         this.history.save();
         process.exit(code);
+    }
+
+    _forceRestart(delay = 0) {
+        if (this._isRestarting) return; // Prevent multiple restart attempts
+        this._isRestarting = true;
+
+        console.log(`[Watchdog] Force restart scheduled in ${delay}ms`);
+
+        setTimeout(() => {
+            console.log('[Watchdog] Executing force restart...');
+            try {
+                this.bot.quit();
+            } catch (e) {
+                // Bot may already be disconnected
+            }
+            process.exit(1); // Exit with code 1 triggers auto-restart
+        }, delay);
+    }
+
+    _startConnectionWatchdog() {
+        this._lastActivity = Date.now();
+        this._lastPlayerInteraction = Date.now();
+        this._isRestarting = false;
+        this._watchdogInterval = null;
+
+        // Update activity timestamp on any bot event
+        const updateActivity = () => {
+            this._lastActivity = Date.now();
+        };
+
+        // Update player interaction timestamp on chat/whisper
+        const updatePlayerInteraction = () => {
+            this._lastPlayerInteraction = Date.now();
+        };
+
+        this.bot.on('move', updateActivity);
+        this.bot.on('health', updateActivity);
+        this.bot.on('time', updateActivity);
+        this.bot.on('physicsTick', updateActivity);
+
+        // Track player interactions separately
+        this.bot.on('chat', (username) => {
+            updateActivity();
+            if (username !== this.name) {
+                updatePlayerInteraction();
+            }
+        });
+        this.bot.on('whisper', (username) => {
+            updateActivity();
+            if (username !== this.name) {
+                updatePlayerInteraction();
+            }
+        });
+
+        // Start watchdog after spawn
+        this.bot.once('spawn', () => {
+            const WATCHDOG_INTERVAL = 30000; // Check every 30 seconds
+            const MAX_INACTIVE_TIME = 120000; // 2 minutes without activity = stuck
+            const IDLE_DISCONNECT_TIMEOUT = (settings.idle_disconnect_timeout || 0) * 60 * 1000;
+
+            this._watchdogInterval = setInterval(() => {
+                const timeSinceActivity = Date.now() - this._lastActivity;
+                const timeSincePlayerInteraction = Date.now() - this._lastPlayerInteraction;
+
+                // Check if bot client is still connected
+                const isConnected = this.bot._client &&
+                                   this.bot._client.socket &&
+                                   !this.bot._client.ended;
+
+                if (!isConnected) {
+                    console.warn('[Watchdog] Bot client disconnected but process still running!');
+                    this._forceRestart(1000);
+                    return;
+                }
+
+                if (timeSinceActivity > MAX_INACTIVE_TIME) {
+                    console.warn(`[Watchdog] No activity for ${Math.round(timeSinceActivity/1000)}s - possible stuck state`);
+                    console.warn('[Watchdog] Forcing restart...');
+                    this._forceRestart(1000);
+                    return;
+                }
+
+                // Idle disconnect check: no player interaction + no active goal
+                if (IDLE_DISCONNECT_TIMEOUT > 0) {
+                    const hasActiveGoal = this.self_prompter && this.self_prompter.isActive();
+                    const isExecutingAction = this.actions && this.actions.executing;
+
+                    if (!hasActiveGoal && !isExecutingAction && timeSincePlayerInteraction > IDLE_DISCONNECT_TIMEOUT) {
+                        const idleMinutes = Math.round(timeSincePlayerInteraction / 60000);
+                        console.log(`[Watchdog] Idle for ${idleMinutes} minutes with no goals. Disconnecting to save resources.`);
+                        this._idleDisconnect();
+                        return;
+                    }
+                }
+            }, WATCHDOG_INTERVAL);
+
+            console.log('[Watchdog] Connection watchdog started');
+            if (IDLE_DISCONNECT_TIMEOUT > 0) {
+                console.log(`[Watchdog] Idle disconnect enabled: ${settings.idle_disconnect_timeout} minutes`);
+            }
+        });
+    }
+
+    _idleDisconnect() {
+        if (this._isRestarting) return;
+        this._isRestarting = true;
+
+        console.log('[Watchdog] Performing idle disconnect...');
+
+        // Clear watchdog interval
+        if (this._watchdogInterval) {
+            clearInterval(this._watchdogInterval);
+        }
+
+        // Save state before disconnecting
+        this.history.add('system', 'Disconnecting due to idle timeout. Will reconnect when players are online.');
+        this.history.save();
+
+        try {
+            this.bot.chat('Going idle. I\'ll be back when someone needs me!');
+        } catch (e) {
+            // Bot may already be disconnected
+        }
+
+        setTimeout(() => {
+            try {
+                this.bot.quit();
+            } catch (e) {
+                // Ignore
+            }
+            // Exit with code 0 - this tells agent_process NOT to auto-restart
+            process.exit(0);
+        }, 1000);
     }
     async checkTaskDone() {
         if (this.task.data) {
@@ -619,7 +867,6 @@ export class Agent {
             if (res) {
                 await this.history.add('system', `Task ended with score : ${res.score}`);
                 await this.history.save();
-                // await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 second for save to complete
                 console.log('Task finished:', res.message);
                 this.killAll();
             }

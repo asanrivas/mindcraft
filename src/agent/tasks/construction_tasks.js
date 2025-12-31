@@ -45,7 +45,10 @@ export function resetConstructionWorld(bot, blueprint) {
 }
 
 export function checkLevelBlueprint(agent, levelNum) {
-    const blueprint = agent.task.blueprint;
+    const blueprint = agent.task?.blueprint;
+    if (!blueprint) {
+        return "No blueprint is currently set. Use a construction task to set a blueprint first.";
+    }
     const bot = agent.bot;
     const result = blueprint.checkLevel(bot, levelNum);
     if (result.mismatches.length === 0) {
@@ -57,9 +60,10 @@ export function checkLevelBlueprint(agent, levelNum) {
 }
 
 export function checkBlueprint(agent) {
-    console.log('Checking blueprint...');
-    console.log(agent);
-    const blueprint = agent.task.blueprint;
+    const blueprint = agent.task?.blueprint;
+    if (!blueprint) {
+        return "No blueprint is currently set. Use a construction task to set a blueprint first.";
+    }
     const bot = agent.bot;
     const result = blueprint.check(bot);
     if (result.mismatches.length === 0) {

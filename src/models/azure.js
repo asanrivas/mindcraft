@@ -21,11 +21,17 @@ export class AzureGPT extends GPT {
 
         if (this.params.apiVersion) {
             config.apiVersion = this.params.apiVersion;
-            delete this.params.apiVersion; // remove from params for later use in requests
+            delete this.params.apiVersion;
         }
         else {
             throw new Error('apiVersion is required in params for azure!');
         }
+
+        console.log('[Azure Config Debug]');
+        console.log('  endpoint:', config.endpoint);
+        console.log('  deployment:', config.deployment);
+        console.log('  apiVersion:', config.apiVersion);
+        console.log('  apiKey:', config.apiKey ? `${config.apiKey.substring(0, 8)}...` : 'NOT SET');
 
         this.openai = new AzureOpenAI(config)
     }

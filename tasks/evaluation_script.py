@@ -15,6 +15,15 @@ import socket
 
 import boto3
 
+def get_runtime():
+    """Return 'bun' if available, otherwise 'node'."""
+    return "bun" if shutil.which("bun") else "node"
+
+def get_runtime_cmd():
+    """Return the runtime command for running main.js."""
+    runtime = get_runtime()
+    return f"{runtime} run" if runtime == "bun" else "node"
+
 BLOCKED_ACTIONS_COOKING = [
     '!activate', '!attackPlayer', '!checkBlueprint', '!checkBlueprintLevel',
     '!clearChat', '!clearFurnace', '!consume', '!craftable', '!discard',
@@ -474,7 +483,7 @@ def run_script(task_path,
         assert os.path.exists(task_folder), f"Directory {task_folder} was not created"
         print(f"Created directory: {task_folder}")
         
-        cmd = f"node main.js --task_path \'{task_path}\' --task_id {task_id}"
+        cmd = f"{get_runtime_cmd()} main.js --task_path \'{task_path}\' --task_id {task_id}"
         cp_cmd = f"cp {agent_names[0]}.json {server_path}bots/{agent_names[0]}/profile.json"
         for _ in range(num_exp):
             script_content += f"{cmd}\n"
@@ -506,7 +515,7 @@ def make_ops(agent_names, session_name):
     """Make the agents operators in the Minecraft world."""
     print('Making agents operators...')
 
-    cmd = f"node main.js --task_path tasks/example_tasks.json --task_id debug_{len(agent_names)}_agent_timeout"
+    cmd = f"{get_runtime_cmd()} main.js --task_path tasks/example_tasks.json --task_id debug_{len(agent_names)}_agent_timeout"
 
     subprocess.run(["tmux", "send-keys", "-t", session_name, cmd, "C-m"])
 

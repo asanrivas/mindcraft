@@ -12,7 +12,8 @@ const settings = {
     base_profile: "assistant", // survival, assistant, creative, or god_mode
     profiles: [
         "./andy.json",
-        // "./profiles/gpt.json",
+        // "./rosetta.json", // Letta-powered agent with persistent memory (requires ~/letta running)
+        // "./profiles/andy-4-reasoning.json",
         // "./profiles/claude.json",
         // "./profiles/gemini.json",
         // "./profiles/llama.json",
@@ -67,11 +68,11 @@ const settings = {
     log_all_prompts: true, // log ALL prompts to file
 
     // Auto-login settings
-    auto_login: false, // wait for players before logging in (or use --auto_login flag)
+    auto_login: true, // wait for players before logging in (or use --auto_login flag)
     auto_login_interval: 5, // minutes between server checks for players
 
     // Idle disconnect settings
-    idle_disconnect_timeout: 10, // minutes of idle time before disconnecting (0 = disabled)
+    idle_disconnect_timeout: 30, // minutes of idle time before disconnecting (0 = disabled)
 };
 
 export default settings;

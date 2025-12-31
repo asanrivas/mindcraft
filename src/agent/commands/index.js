@@ -14,11 +14,21 @@ for (let command of commandList) {
 // ============= COMMAND ALIASES =============
 // Short aliases map to full command names (saves tokens in prompts)
 const COMMAND_ALIASES = {
-    // Storage commands
-    'pic': 'putInChest',
-    'tfc': 'takeFromChest',
-    'vc': 'viewChest',
-    'da': 'depositAll',
+    // Chest commands (all start with 'c' prefix)
+    'cp': 'chestPut',
+    'ct': 'chestTake',
+    'cv': 'chestView',
+    'cda': 'chestDepositAll',
+    'cl': 'chestList',
+    'cn': 'chestName',
+    'cln': 'chestListNamed',
+    'cf': 'chestForget',
+    'cpn': 'chestPutNamed',
+    'ctn': 'chestTakeNamed',
+    'cvn': 'chestViewNamed',
+    'cds': 'chestDepositSorted',
+    'cfi': 'chestFind',
+    'ctr': 'chestTransfer',
     'dis': 'discard',
     
     // Movement commands
@@ -38,6 +48,8 @@ const COMMAND_ALIASES = {
     'eat': 'consume',
     'ph': 'placeHere',
     'gtb': 'goToBed',
+    'ca': 'fill',
+    'pt': 'plantTrees',
     
     // Info commands
     'inv': 'inventory',
@@ -47,6 +59,7 @@ const COMMAND_ALIASES = {
     'ent': 'entities',
     'cft': 'craftable',
     'gcp': 'getCraftingPlan',
+    'sa': 'scanArea',
     
     // Memory/Control commands
     'clr': 'clearChat',
@@ -110,17 +123,49 @@ const argRegex = /-?\d+(?:\.\d+)?|true|false|"[^"]*"/g;
 const spaceSeparatedRegex = /^!(\w+)\s+(.+)$/;
 
 /**
+ * Normalize various quote characters to standard ASCII double quotes
+ * Handles: curly quotes, smart quotes, guillemets, etc.
+ * @param {string} text
+ * @returns {string}
+ */
+function normalizeQuotes(text) {
+    return text
+        // Curly double quotes (U+201C, U+201D)
+        .replace(/[\u201C\u201D]/g, '"')
+        // Curly single quotes (U+2018, U+2019)
+        .replace(/[\u2018\u2019]/g, "'")
+        // Guillemets (U+00AB, U+00BB)
+        .replace(/[\u00AB\u00BB]/g, '"')
+        // Prime marks (U+2032, U+2033)
+        .replace(/\u2032/g, "'")
+        .replace(/\u2033/g, '"')
+        // Fullwidth quotes (U+FF02)
+        .replace(/\uFF02/g, '"');
+}
+
+/**
  * Normalizes command format from space-separated to parenthesis format
+ * Also fixes unquoted strings inside parentheses
  * e.g. !getCraftingPlan "torch" 1 -> !getCraftingPlan("torch", 1)
+ * e.g. !goal(build a house) -> !goal("build a house")
  * @param {string} message
  * @returns {string}
  */
 function normalizeCommandFormat(message) {
-    // If already has parentheses, return as-is
-    if (message.match(/!\w+\(/)) {
-        return message;
+    // Check if command has parentheses with unquoted content
+    const parenMatch = message.match(/^(!(\w+)\()(.+)\)(.*)$/);
+    if (parenMatch) {
+        const prefix = parenMatch[1]; // "!goal("
+        const commandName = parenMatch[2]; // "goal"
+        const argsContent = parenMatch[3]; // "build 20x20 fence..."
+        const suffix = parenMatch[4]; // anything after ")"
+        
+        // Parse arguments inside parentheses
+        const normalizedArgs = parseAndQuoteArgs(argsContent);
+        return `${prefix}${normalizedArgs})${suffix}`;
     }
     
+    // Handle space-separated format: !command arg1 arg2
     const match = message.match(spaceSeparatedRegex);
     if (!match) {
         return message;
@@ -129,7 +174,20 @@ function normalizeCommandFormat(message) {
     const commandName = match[1];
     const argsString = match[2].trim();
     
-    // Parse space-separated arguments (handles quoted strings and numbers)
+    const normalizedArgs = parseAndQuoteArgs(argsString);
+    if (!normalizedArgs) {
+        return message;
+    }
+    
+    return `!${commandName}(${normalizedArgs})`;
+}
+
+/**
+ * Parse arguments and ensure strings are properly quoted
+ * @param {string} argsString - Raw arguments string
+ * @returns {string} Normalized arguments with proper quoting
+ */
+function parseAndQuoteArgs(argsString) {
     const args = [];
     let current = '';
     let inQuotes = false;
@@ -148,16 +206,16 @@ function normalizeCommandFormat(message) {
             args.push(current);
             current = '';
             quoteChar = '';
-        } else if (char === ' ' && !inQuotes) {
+        } else if (char === ',' && !inQuotes) {
+            // Handle comma-separated args
             if (current.trim()) {
-                // If not quoted, check if it's a number or boolean
-                const trimmed = current.trim();
-                if (/^-?\d+(\.\d+)?$/.test(trimmed) || trimmed === 'true' || trimmed === 'false') {
-                    args.push(trimmed);
-                } else {
-                    // Wrap unquoted strings in quotes
-                    args.push(`"${trimmed}"`);
-                }
+                args.push(quoteArgIfNeeded(current.trim()));
+                current = '';
+            }
+        } else if (char === ' ' && !inQuotes && !argsString.includes(',')) {
+            // Handle space-separated args (only if no commas present)
+            if (current.trim()) {
+                args.push(quoteArgIfNeeded(current.trim()));
                 current = '';
             }
         } else {
@@ -167,21 +225,41 @@ function normalizeCommandFormat(message) {
     
     // Handle last argument
     if (current.trim()) {
-        const trimmed = current.trim();
-        if (/^-?\d+(\.\d+)?$/.test(trimmed) || trimmed === 'true' || trimmed === 'false') {
-            args.push(trimmed);
-        } else if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
-            args.push(trimmed);
-        } else {
-            args.push(`"${trimmed}"`);
-        }
+        args.push(quoteArgIfNeeded(current.trim()));
     }
     
     if (args.length === 0) {
-        return message;
+        return null;
     }
     
-    return `!${commandName}(${args.join(', ')})`;
+    return args.join(', ');
+}
+
+/**
+ * Quote an argument if it's a string (not a number or boolean)
+ * @param {string} arg
+ * @returns {string}
+ */
+function quoteArgIfNeeded(arg) {
+    // Already quoted
+    if ((arg.startsWith('"') && arg.endsWith('"')) || 
+        (arg.startsWith("'") && arg.endsWith("'"))) {
+        // Normalize to double quotes
+        return `"${arg.slice(1, -1)}"`;
+    }
+    
+    // Number
+    if (/^-?\d+(\.\d+)?$/.test(arg)) {
+        return arg;
+    }
+    
+    // Boolean
+    if (arg === 'true' || arg === 'false') {
+        return arg;
+    }
+    
+    // String - needs quotes
+    return `"${arg}"`;
 }
 
 export function containsCommand(message) {
@@ -250,9 +328,12 @@ function checkInInterval(number, lowerBound, upperBound, endpointType) {
  * @returns {string | Object}
  */
 export function parseCommandMessage(message) {
+    // Normalize curly/smart quotes to ASCII quotes (LLMs often output Unicode quotes)
+    message = normalizeQuotes(message);
+
     // Expand command aliases first (e.g., !pic -> !putInChest)
     message = expandCommandAlias(message);
-    
+
     // Normalize space-separated format to parenthesis format
     message = normalizeCommandFormat(message);
     
@@ -270,11 +351,16 @@ export function parseCommandMessage(message) {
 
     const params = commandParams(command);
     const paramNames = commandParamNames(command);
-    
-    if (args.length !== params.length)
-        return `Command ${command.name} was given ${args.length} args, but requires ${params.length} args.`;
+    const requiredParams = params.filter(p => !p.optional);
 
-    
+    if (args.length < requiredParams.length || args.length > params.length) {
+        if (requiredParams.length === params.length)
+            return `Command ${command.name} was given ${args.length} args, but requires ${params.length} args.`;
+        else
+            return `Command ${command.name} was given ${args.length} args, but requires ${requiredParams.length}-${params.length} args.`;
+    }
+
+
     for (let i = 0; i < args.length; i++) {
         const param = params[i];
         //Remove any extra characters
@@ -372,6 +458,11 @@ function numParams(command) {
     return commandParams(command).length;
 }
 
+function numRequiredParams(command) {
+    const params = commandParams(command);
+    return params.filter(p => !p.optional).length;
+}
+
 export async function executeCommand(agent, message) {
     let parsed = parseCommandMessage(message);
     if (typeof parsed === 'string')
@@ -383,8 +474,14 @@ export async function executeCommand(agent, message) {
         if (parsed.args) {
             numArgs = parsed.args.length;
         }
-        if (numArgs !== numParams(command))
-            return `Command ${command.name} was given ${numArgs} args, but requires ${numParams(command)} args.`;
+        const minParams = numRequiredParams(command);
+        const maxParams = numParams(command);
+        if (numArgs < minParams || numArgs > maxParams) {
+            if (minParams === maxParams)
+                return `Command ${command.name} was given ${numArgs} args, but requires ${maxParams} args.`;
+            else
+                return `Command ${command.name} was given ${numArgs} args, but requires ${minParams}-${maxParams} args.`;
+        }
         else {
             const result = await command.perform(agent, ...parsed.args);
             return result;

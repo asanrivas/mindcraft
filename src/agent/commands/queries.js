@@ -1,9 +1,11 @@
 import * as world from '../library/world.js';
+import * as skills from '../library/skills.js';
 import * as mc from '../../utils/mcdata.js';
 import { getCommandDocs } from './index.js';
 import convoManager from '../conversation.js';
 import { checkLevelBlueprint, checkBlueprint } from '../tasks/construction_tasks.js';
 import { load } from 'cheerio';
+import Vec3 from 'vec3';
 
 const pad = (str) => {
     return '\n' + str + '\n';
@@ -287,6 +289,9 @@ export const queryList = [
         name: '!getBlueprint',
         description: 'Get the blueprint for the building',
         perform: function (agent) {
+            if (!agent.task?.blueprint) {
+                return pad("No blueprint is currently set. Use a construction task to set a blueprint first.");
+            }
             let res = agent.task.blueprint.explain();
             return pad(res);
         }
@@ -298,6 +303,9 @@ export const queryList = [
             'levelNum': { type: 'int', description: 'The level number to check.', domain: [0, Number.MAX_SAFE_INTEGER] }
         },
         perform: function (agent, levelNum) {
+            if (!agent.task?.blueprint) {
+                return pad("No blueprint is currently set. Use a construction task to set a blueprint first.");
+            }
             let res = agent.task.blueprint.explainLevel(levelNum);
             console.log(res);
             return pad(res);
@@ -372,6 +380,93 @@ export const queryList = [
                 console.error("Error fetching or parsing HTML:", error);
                 return `The following error occurred: ${error}`
               }
+        }
+    },
+    {
+        name: '!scanArea',
+        description: 'Scan a rectangular area and report what blocks are present. Useful for understanding surroundings before building or planting.',
+        params: {
+            'x1': { type: 'int', description: 'X coordinate of the first corner.' },
+            'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
+            'x2': { type: 'int', description: 'X coordinate of the second corner.' },
+            'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
+            'y': { type: 'int', description: 'Y coordinate to scan at (optional, defaults to bot height).', optional: true }
+        },
+        perform: function (agent, x1, z1, x2, z2, y = null) {
+            const result = skills.scanArea(agent.bot, x1, z1, x2, z2, y);
+            let res = `AREA SCAN (${result.size.width}x${result.size.length} at y=${result.area.y})`;
+            res += `\nFrom (${result.area.minX}, ${result.area.minZ}) to (${result.area.maxX}, ${result.area.maxZ})`;
+            res += `\nTotal blocks: ${result.totalBlocks}`;
+            res += `\nBlock composition:`;
+            for (const [block, count] of result.topBlocks) {
+                const percent = ((count / result.totalBlocks) * 100).toFixed(1);
+                res += `\n- ${block}: ${count} (${percent}%)`;
+            }
+            return pad(res);
+        }
+    },
+    {
+        name: '!gridView',
+        description: 'Generate an ASCII grid view of blocks in an area. Perfect for verifying builds - shows exact block positions as characters.',
+        params: {
+            'x1': { type: 'int', description: 'X coordinate of the first corner.' },
+            'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
+            'x2': { type: 'int', description: 'X coordinate of the second corner.' },
+            'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
+            'y': { type: 'int', description: 'Y coordinate to scan at (optional, defaults to bot height).', optional: true }
+        },
+        perform: function (agent, x1, z1, x2, z2, y = null) {
+            const bot = agent.bot;
+            const minX = Math.min(Math.floor(x1), Math.floor(x2));
+            const maxX = Math.max(Math.floor(x1), Math.floor(x2));
+            const minZ = Math.min(Math.floor(z1), Math.floor(z2));
+            const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
+            const scanY = y !== null ? Math.floor(y) : Math.floor(bot.entity.position.y);
+
+            // Block to character mapping
+            const blockChars = {
+                'air': ' ', 'cobblestone': '#', 'stone': 'S', 'dirt': 'd',
+                'grass_block': 'g', 'water': '~', 'lava': 'L', 'sand': '.',
+                'torch': '*', 'oak_log': 'O', 'spruce_log': 'T', 'oak_planks': '=',
+                'glass': 'G', 'chest': 'C', 'podzol': 'p', 'fern': 'f',
+                'short_grass': ',', 'tall_grass': '|', 'mossy_cobblestone': 'M',
+                'stone_bricks': 'B', 'oak_door': 'D', 'spruce_door': 'D'
+            };
+
+            const getChar = (name) => blockChars[name] || (name ? name[0].toUpperCase() : '?');
+
+            let res = `GRID VIEW (${maxX - minX + 1}x${maxZ - minZ + 1} at y=${scanY})`;
+            res += `\nArea: (${minX}, ${minZ}) to (${maxX}, ${maxZ})`;
+            res += `\nLegend: #=cobblestone ~=water *=torch T=log g=grass d=dirt p=podzol ' '=air`;
+            res += `\n`;
+
+            // X-axis labels (last 2 digits)
+            res += `\n    `;
+            for (let x = minX; x <= maxX; x++) {
+                res += (Math.abs(x) % 10).toString();
+            }
+
+            // Grid rows (Z axis)
+            const blockCounts = {};
+            for (let z = minZ; z <= maxZ; z++) {
+                res += `\n${z.toString().padStart(4)} `;
+                for (let x = minX; x <= maxX; x++) {
+                    const block = bot.blockAt(new Vec3(x, scanY, z));
+                    const name = block ? block.name : 'air';
+                    const char = getChar(name);
+                    res += char;
+                    blockCounts[name] = (blockCounts[name] || 0) + 1;
+                }
+            }
+
+            // Summary
+            res += `\n\nTop blocks:`;
+            const sorted = Object.entries(blockCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+            for (const [name, count] of sorted) {
+                res += ` ${getChar(name)}=${name}(${count})`;
+            }
+
+            return pad(res);
         }
     },
     {

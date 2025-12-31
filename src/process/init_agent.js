@@ -2,6 +2,19 @@ import { Agent } from '../agent/agent.js';
 import { serverProxy } from '../agent/mindserver_proxy.js';
 import yargs from 'yargs';
 
+// Add timestamps to all console output
+const originalLog = console.log;
+const originalError = console.error;
+const originalWarn = console.warn;
+
+function getTimestamp() {
+    return new Date().toISOString().replace('T', ' ').substring(0, 19);
+}
+
+console.log = (...a) => originalLog(`[${getTimestamp()}]`, ...a);
+console.error = (...a) => originalError(`[${getTimestamp()}] ERROR:`, ...a);
+console.warn = (...a) => originalWarn(`[${getTimestamp()}] WARN:`, ...a);
+
 const args = process.argv.slice(2);
 if (args.length < 1) {
     console.log('Usage: node init_agent.js -n <agent_name> -p <port> -l <load_memory> -m <init_message> -c <count_id>');

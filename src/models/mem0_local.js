@@ -1,16 +1,28 @@
 /**
- * Lightweight Mem0-inspired memory layer for Mindcraft
- * Uses Redis + local embeddings for fast semantic memory search
- * Compatible with Azure Foundry Claude
+ * Mem0 integration for Mindcraft using the official Node.js SDK
+ * Uses Mem0 Platform (hosted) API - see https://docs.mem0.ai/cookbooks/companions/nodejs-companion
  */
 
-import { createClient } from 'redis';
-import { pipeline } from '@huggingface/transformers';
-import { cosineSimilarity } from '../utils/math.js';
-import crypto from 'crypto';
-import { strictFormat } from '../utils/text.js';
+import { MemoryClient } from 'mem0ai';
 import AnthropicFoundry from '@anthropic-ai/foundry-sdk';
-import { getKey } from '../utils/keys.js';
+import { getKey, hasKey } from '../utils/keys.js';
+import { strictFormat } from '../utils/text.js';
+
+/*
+ * Minecraft-specific memory categories for auto-tagging
+ * Configure these in Mem0 Dashboard > Project Settings > Custom Categories:
+ *
+ * building   - Construction tasks, structures, blocks to place, building projects
+ * mining     - Mining resources, ores, caves, digging, collecting materials
+ * crafting   - Crafting recipes, items to make, workbench tasks, smelting
+ * combat     - Fighting mobs, PvP, weapons, armor, defense
+ * farming    - Crops, animals, breeding, food production
+ * exploration- Travel, coordinates, locations, biomes, bases, waypoints
+ * trading    - Villager trades, emeralds, bartering
+ * rules      - Player rules, restrictions, things NOT to do
+ * goals      - Long-term objectives, missions, player requests
+ * inventory  - Item storage, chest contents, resource management
+ */
 
 export class Mem0Local {
     static prefix = 'mem0';
@@ -21,19 +33,18 @@ export class Mem0Local {
         this.params = params || {};
         this.agent_id = params.agent_name || 'andy';
 
-        // Redis configuration
-        this.redis = null;
-        this.redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
+        // Mem0 Platform Client Configuration
+        const mem0Key = process.env.MEM0_API_KEY || (hasKey('MEM0_API_KEY') ? getKey('MEM0_API_KEY') : null);
 
-        // Embedding configuration
-        this.embeddingModel = params.embedding_model || 'Xenova/multilingual-e5-small';
-        this.embedder = null;
-        this.embeddingDim = 384;
+        if (!mem0Key) {
+            console.warn('[Mem0] Warning: MEM0_API_KEY not found. Memory features will be disabled.');
+            this.memory = null;
+        } else {
+            console.log('[Mem0] Initializing Mem0 Platform client');
+            this.memory = new MemoryClient({ apiKey: mem0Key });
+        }
 
-        // Memory namespace
-        this.memoryPrefix = `mem0:${this.agent_id}:`;
-
-        // Azure Foundry client
+        // Azure Foundry client for LLM
         this.foundryClient = null;
         this.initFoundry(url);
     }
@@ -44,7 +55,6 @@ export class Mem0Local {
     initFoundry(url) {
         let config = {};
 
-        // Extract resource name from URL
         if (url) {
             const match = url.match(/https:\/\/([^.]+)\.services\.ai\.azure\.com/);
             if (match) {
@@ -55,362 +65,105 @@ export class Mem0Local {
         }
 
         config.apiKey = getKey('AZURE_FOUNDRY_API_KEY');
-
         this.foundryClient = new AnthropicFoundry(config);
-
         console.log('[Mem0] Azure Foundry client initialized');
-        if (config.resource) {
-            console.log(`  resource: ${config.resource}`);
-        }
-        console.log(`  model: ${this.model_name}`);
-    }
-
-    /**
-     * Initialize Redis and embeddings
-     */
-    async init() {
-        // Connect to Redis
-        if (!this.redis) {
-            console.log(`[Mem0] Connecting to Redis at ${this.redisUrl}...`);
-            this.redis = createClient({ url: this.redisUrl });
-            this.redis.on('error', (err) => console.error('[Mem0] Redis error:', err));
-            await this.redis.connect();
-            console.log('[Mem0] Redis connected');
-        }
-
-        // Initialize embeddings
-        if (!this.embedder && this.embeddingModel !== 'disabled') {
-            try {
-                console.log(`[Mem0] Loading embedding model ${this.embeddingModel}...`);
-                const startTime = Date.now();
-                this.embedder = await pipeline('feature-extraction', this.embeddingModel, {
-                    quantized: true,  // Use quantized model (int8) for lower memory
-                    progress_callback: null,  // Disable progress logging
-                    dtype: 'q8',  // 8-bit quantization
-                });
-                const loadTime = ((Date.now() - startTime) / 1000).toFixed(1);
-                console.log(`[Mem0] Embedding model loaded in ${loadTime}s (quantized)`);
-            } catch (err) {
-                console.warn(`[Mem0] Failed to load embeddings, disabling semantic search:`, err.message);
-                this.embeddingModel = 'disabled';
-                this.embedder = null;
-            }
-        }
-    }
-
-    /**
-     * Generate embedding for text
-     */
-    async embed(text) {
-        await this.init();
-
-        if (!this.embedder || this.embeddingModel === 'disabled') {
-            return null;  // No embeddings available
-        }
-
-        const prefixedText = text.startsWith('query:') || text.startsWith('passage:')
-            ? text
-            : `passage: ${text}`;
-
-        const output = await this.embedder(prefixedText, {
-            pooling: 'mean',
-            normalize: true,
-        });
-
-        return Array.from(output.data);
-    }
-
-    /**
-     * Add a memory
-     * @param {string} content - Memory content
-     * @param {Object} options - {user_id, category, metadata, ttl}
-     * @returns {Promise<string>} Memory ID
-     */
-    async addMemory(content, options = {}) {
-        await this.init();
-
-        const memoryId = `mem_${crypto.randomBytes(8).toString('hex')}`;
-        const timestamp = Date.now();
-
-        // Generate embedding (if available)
-        const embedding = await this.embed(content);
-
-        const memory = {
-            id: memoryId,
-            agent_id: this.agent_id,
-            user_id: options.user_id || 'default',
-            content,
-            embedding: embedding || [],  // Empty array if embeddings disabled
-            category: options.category || 'general',
-            metadata: options.metadata || {},
-            timestamp,
-        };
-
-        // Store in Redis
-        const key = this.memoryPrefix + memoryId;
-        await this.redis.set(key, JSON.stringify(memory));
-
-        // Set TTL if provided (in seconds)
-        if (options.ttl) {
-            await this.redis.expire(key, options.ttl);
-        }
-
-        // Add to user index
-        await this.redis.sAdd(`${this.memoryPrefix}users:${memory.user_id}`, memoryId);
-
-        console.log(`[Mem0] Added memory: ${memoryId} for user ${memory.user_id}`);
-        return memoryId;
-    }
-
-    /**
-     * Search memories by semantic similarity (or recent if embeddings disabled)
-     * @param {string} query - Search query
-     * @param {Object} options - {user_id, category, limit}
-     * @returns {Promise<Array>} Matching memories with similarity scores
-     */
-    async searchMemories(query, options = {}) {
-        await this.init();
-
-        const limit = options.limit || 5;
-        const userId = options.user_id || 'default';
-
-        // Get all memory keys for user
-        const memoryIds = await this.redis.sMembers(`${this.memoryPrefix}users:${userId}`);
-
-        if (memoryIds.length === 0) {
-            return [];
-        }
-
-        // Fetch all memories
-        const memories = await Promise.all(
-            memoryIds.map(async (id) => {
-                const data = await this.redis.get(this.memoryPrefix + id);
-                return data ? JSON.parse(data) : null;
-            })
-        );
-
-        // Filter by category if specified
-        let filteredMemories = memories.filter((m) => m !== null);
-        if (options.category) {
-            filteredMemories = filteredMemories.filter((m) => m.category === options.category);
-        }
-
-        // If embeddings disabled, return recent memories
-        if (!this.embedder || this.embeddingModel === 'disabled') {
-            console.log('[Mem0] Embeddings disabled, returning recent memories');
-            filteredMemories.sort((a, b) => b.timestamp - a.timestamp);
-            return filteredMemories.slice(0, limit).map((m) => ({
-                ...m,
-                similarity: 1.0,  // All equally "relevant" without semantic search
-            }));
-        }
-
-        // Otherwise, calculate semantic similarities
-        const queryEmbedding = await this.embed(`query: ${query}`);
-        if (!queryEmbedding) {
-            // Fallback if embedding fails
-            filteredMemories.sort((a, b) => b.timestamp - a.timestamp);
-            return filteredMemories.slice(0, limit).map((m) => ({
-                ...m,
-                similarity: 1.0,
-            }));
-        }
-
-        const results = filteredMemories.map((memory) => ({
-            ...memory,
-            similarity: cosineSimilarity(queryEmbedding, memory.embedding),
-        }));
-
-        // Sort by similarity and limit
-        results.sort((a, b) => b.similarity - a.similarity);
-        return results.slice(0, limit);
-    }
-
-    /**
-     * List all memories for a user
-     * @param {string} user_id - User ID
-     * @param {Object} options - {category, limit}
-     * @returns {Promise<Array>} Memories
-     */
-    async listMemories(user_id = 'default', options = {}) {
-        await this.init();
-
-        const memoryIds = await this.redis.sMembers(`${this.memoryPrefix}users:${user_id}`);
-
-        if (memoryIds.length === 0) {
-            return [];
-        }
-
-        const memories = await Promise.all(
-            memoryIds.map(async (id) => {
-                const data = await this.redis.get(this.memoryPrefix + id);
-                return data ? JSON.parse(data) : null;
-            })
-        );
-
-        let filteredMemories = memories.filter((m) => m !== null);
-
-        if (options.category) {
-            filteredMemories = filteredMemories.filter((m) => m.category === options.category);
-        }
-
-        // Sort by timestamp descending
-        filteredMemories.sort((a, b) => b.timestamp - a.timestamp);
-
-        if (options.limit) {
-            return filteredMemories.slice(0, options.limit);
-        }
-
-        return filteredMemories;
-    }
-
-    /**
-     * Update a memory
-     * @param {string} memoryId - Memory ID
-     * @param {Object} updates - {content, category, metadata}
-     * @returns {Promise<boolean>} Success
-     */
-    async updateMemory(memoryId, updates) {
-        await this.init();
-
-        const key = this.memoryPrefix + memoryId;
-        const data = await this.redis.get(key);
-
-        if (!data) {
-            console.warn(`[Mem0] Memory ${memoryId} not found`);
-            return false;
-        }
-
-        const memory = JSON.parse(data);
-
-        // Update content and re-embed if changed
-        if (updates.content && updates.content !== memory.content) {
-            memory.content = updates.content;
-            memory.embedding = await this.embed(updates.content);
-        }
-
-        if (updates.category) memory.category = updates.category;
-        if (updates.metadata) memory.metadata = { ...memory.metadata, ...updates.metadata };
-
-        await this.redis.set(key, JSON.stringify(memory));
-        console.log(`[Mem0] Updated memory: ${memoryId}`);
-        return true;
-    }
-
-    /**
-     * Delete a memory
-     * @param {string} memoryId - Memory ID
-     * @returns {Promise<boolean>} Success
-     */
-    async deleteMemory(memoryId) {
-        await this.init();
-
-        const key = this.memoryPrefix + memoryId;
-        const data = await this.redis.get(key);
-
-        if (!data) {
-            return false;
-        }
-
-        const memory = JSON.parse(data);
-
-        // Remove from Redis
-        await this.redis.del(key);
-
-        // Remove from user index
-        await this.redis.sRem(`${this.memoryPrefix}users:${memory.user_id}`, memoryId);
-
-        console.log(`[Mem0] Deleted memory: ${memoryId}`);
-        return true;
-    }
-
-    /**
-     * Clear all memories for a user
-     * @param {string} user_id - User ID
-     * @returns {Promise<number>} Number of memories deleted
-     */
-    async clearMemories(user_id = 'default') {
-        await this.init();
-
-        const memoryIds = await this.redis.sMembers(`${this.memoryPrefix}users:${user_id}`);
-
-        for (const id of memoryIds) {
-            await this.redis.del(this.memoryPrefix + id);
-        }
-
-        await this.redis.del(`${this.memoryPrefix}users:${user_id}`);
-
-        console.log(`[Mem0] Cleared ${memoryIds.length} memories for user ${user_id}`);
-        return memoryIds.length;
     }
 
     /**
      * Main LLM interface for Mindcraft - sendRequest
-     * Includes memory context automatically
      */
     async sendRequest(turns, systemMessage) {
-        await this.init();
+        // Extract user ID from message (format: "username: message")
+        const lastUserMessage = turns.filter(t => t.role === 'user').pop();
+        let userId = 'default';
+        let userContent = lastUserMessage?.content || '';
 
-        // Extract user context from turns
-        const lastUserMessage = turns.filter((t) => t.role === 'user').pop();
-        const userId = lastUserMessage?.name || 'default';
-
-        // Search for relevant memories
-        const query = lastUserMessage?.content || '';
-        const relevantMemories = await this.searchMemories(query, {
-            user_id: userId,
-            limit: 3,
-        });
-
-        // Build memory context
-        let memoryContext = '';
-        if (relevantMemories.length > 0) {
-            memoryContext = '\n\n[Relevant Memories]\n';
-            relevantMemories.forEach((mem, idx) => {
-                memoryContext += `${idx + 1}. ${mem.content} (${mem.category}, ${(mem.similarity * 100).toFixed(0)}% relevant)\n`;
-            });
+        if (userContent) {
+            const match = userContent.match(/^([^:]+):/);
+            if (match) {
+                userId = match[1].trim();
+            }
         }
 
-        // Augment system message with memory
-        const augmentedSystemMessage = systemMessage + memoryContext;
+        // For full conversation context, format all turns
+        const formattedTurns = strictFormat(turns).map(({ name, ...rest }) => rest);
 
-        // Format for Azure Foundry and strip 'name' field (not supported by Anthropic)
-        const messages = strictFormat(turns).map((msg) => {
-            const { name, ...rest } = msg;
-            return rest;
-        });
+        // Search memories based on recent context (if Mem0 is configured and query not empty)
+        let memoriesStr = '';
+        if (this.memory && userContent.trim()) {
+            try {
+                // Search user's memories AND shared system memories (for idle scans, etc.)
+                const [userMemories, systemMemories] = await Promise.all([
+                    this.memory.search(userContent, { user_id: userId }),
+                    userId !== 'system' ? this.memory.search(userContent, { user_id: 'system' }) : Promise.resolve([])
+                ]);
 
-        // Call Azure Foundry
-        console.log(`[Mem0] Calling Azure Foundry with ${relevantMemories.length} memories...`);
+                const userResults = userMemories.results || userMemories || [];
+                const systemResults = systemMemories.results || systemMemories || [];
+
+                // Combine and deduplicate memories
+                const allMemories = [...userResults, ...systemResults];
+                const seenMemories = new Set();
+                const memories = allMemories.filter(m => {
+                    if (seenMemories.has(m.memory)) return false;
+                    seenMemories.add(m.memory);
+                    return true;
+                });
+
+                if (memories.length > 0) {
+                    // Include category tags in memory context
+                    memoriesStr = '\n\nUser Memories:\n' + memories.map(m => {
+                        const category = m.categories?.[0] || 'general';
+                        return `- [${category}] ${m.memory}`;
+                    }).join('\n');
+                    console.log(`[Mem0] Found ${memories.length} memories for ${userId} (including shared)`);
+                }
+            } catch (err) {
+                console.warn(`[Mem0] Memory search failed: ${err.message}`);
+            }
+        }
+
+        const augmentedSystem = systemMessage + memoriesStr;
         const startTime = Date.now();
 
         try {
-            // Set default max_tokens if not provided
-            let max_tokens = this.params.max_tokens || 4096;
-
-            // Filter out unwanted params
             const requestParams = { ...this.params };
             delete requestParams.agent_name;
             delete requestParams.embedding_model;
-            requestParams.max_tokens = max_tokens;
+            requestParams.max_tokens = requestParams.max_tokens || 4096;
 
             const resp = await this.foundryClient.messages.create({
                 model: this.model_name,
-                system: augmentedSystemMessage,
-                messages: messages,
+                system: augmentedSystem,
+                messages: formattedTurns,
                 ...requestParams,
             });
 
+            const assistantResponse = resp.content.find(c => c.type === 'text')?.text || '';
             const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
-            console.log(`[Mem0] Received response from Azure Foundry (${elapsed}s)`);
+            console.log(`[Mem0] Response received (${elapsed}s)`);
 
-            const textContent = resp.content.find((content) => content.type === 'text');
-            if (textContent) {
-                return textContent.text;
-            } else {
-                console.warn('[Mem0] No text content found in response');
-                return 'No response from Foundry.';
+            // Store the conversation for memory extraction (if Mem0 is configured and content exists)
+            if (this.memory && userContent.trim() && assistantResponse.trim()) {
+                try {
+                    const toStore = [
+                        { role: 'user', content: userContent },
+                        { role: 'assistant', content: assistantResponse }
+                    ];
+                    const result = await this.memory.add(toStore, { user_id: userId });
+
+                    // Log stored memories with their auto-assigned categories
+                    const stored = Array.isArray(result) ? result : (result?.results || []);
+                    if (stored.length > 0) {
+                        const categories = stored.map(m => m.categories?.[0] || 'general').join(', ');
+                        console.log(`[Mem0] Stored ${stored.length} memory(s) for ${userId} [${categories}]`);
+                    }
+                } catch (err) {
+                    console.warn(`[Mem0] Memory store failed: ${err.message}`);
+                }
             }
+
+            return assistantResponse;
         } catch (err) {
             console.error('[Mem0] Error:', err);
             return 'My brain disconnected, try again.';
@@ -418,19 +171,14 @@ export class Mem0Local {
     }
 
     /**
-     * Vision request with image for Mindcraft
+     * Vision request with image
      */
     async sendVisionRequest(turns, systemMessage, imageBuffer) {
-        await this.init();
-
         const imageMessages = [...turns];
         imageMessages.push({
             role: "user",
             content: [
-                {
-                    type: "text",
-                    text: systemMessage
-                },
+                { type: "text", text: systemMessage },
                 {
                     type: "image",
                     source: {
@@ -446,12 +194,112 @@ export class Mem0Local {
     }
 
     /**
-     * Cleanup resources
+     * Store an event memory (death, player join/leave, inventory changes, etc.)
+     * @param {string} eventType - Type of event (death, player_join, player_leave, inventory, system)
+     * @param {string} description - Human-readable description of the event
+     * @param {Object} data - Additional event data (location, items, etc.)
+     * @param {string} userId - User ID to associate with (default: 'system')
      */
-    async close() {
-        if (this.redis) {
-            await this.redis.quit();
-            this.redis = null;
+    async storeEventMemory(eventType, description, data = {}, userId = 'system') {
+        if (!this.memory) return;
+
+        try {
+            const timestamp = new Date().toISOString();
+            const memoryContent = `[${eventType.toUpperCase()}] ${description}`;
+
+            // Use 'user' role so Mem0 extracts the memory properly
+            const toStore = [
+                { role: 'user', content: memoryContent },
+                { role: 'assistant', content: `Noted. I will remember this.` }
+            ];
+
+            const result = await this.memory.add(toStore, {
+                user_id: userId,
+                metadata: {
+                    event_type: eventType,
+                    timestamp: timestamp,
+                    ...data
+                }
+            });
+
+            const stored = Array.isArray(result) ? result : (result?.results || []);
+            if (stored.length > 0) {
+                console.log(`[Mem0] Event stored: ${eventType} - ${description}`);
+            }
+        } catch (err) {
+            console.warn(`[Mem0] Event memory failed: ${err.message}`);
         }
+    }
+
+    /**
+     * Convenience methods for common events
+     */
+    async recordDeath(location, cause = 'unknown') {
+        const { x, y, z } = location;
+        await this.storeEventMemory(
+            'death',
+            `Bot died at x:${Math.round(x)} y:${Math.round(y)} z:${Math.round(z)}. Cause: ${cause}`,
+            { location: { x, y, z }, cause }
+        );
+    }
+
+    async recordPlayerJoin(playerName) {
+        await this.storeEventMemory(
+            'player_join',
+            `${playerName} joined the game`,
+            { player: playerName },
+            playerName
+        );
+    }
+
+    async recordPlayerLeave(playerName) {
+        await this.storeEventMemory(
+            'player_leave',
+            `${playerName} left the game`,
+            { player: playerName },
+            playerName
+        );
+    }
+
+    async recordInventoryChange(action, items) {
+        const itemStr = items.map(i => `${i.count}x ${i.name}`).join(', ');
+        await this.storeEventMemory(
+            'inventory',
+            `${action}: ${itemStr}`,
+            { action, items }
+        );
+    }
+
+    async recordImportantLocation(name, location, description = '') {
+        const { x, y, z } = location;
+        await this.storeEventMemory(
+            'location',
+            `Important location "${name}" at x:${Math.round(x)} y:${Math.round(y)} z:${Math.round(z)}. ${description}`,
+            { name, location: { x, y, z }, description }
+        );
+    }
+
+    /**
+     * Record items deposited into a chest for semantic recall
+     * @param {string} chestName - Name of the chest (or "unnamed" if not named)
+     * @param {Object} location - {x, y, z} coordinates
+     * @param {Array} items - Array of {name, count} items deposited
+     */
+    async recordChestDeposit(chestName, location, items) {
+        if (!this.memory || items.length === 0) return;
+
+        const { x, y, z } = location;
+        const itemStr = items.map(i => `${i.count}x ${i.name}`).join(', ');
+        const chestDesc = chestName ? `"${chestName}" chest` : `chest at (${x}, ${y}, ${z})`;
+
+        await this.storeEventMemory(
+            'inventory',
+            `Deposited into ${chestDesc} at x:${Math.round(x)} y:${Math.round(y)} z:${Math.round(z)}: ${itemStr}`,
+            { chest_name: chestName, location: { x, y, z }, items }
+        );
+    }
+
+    async close() {
+        // Nothing to close
     }
 }

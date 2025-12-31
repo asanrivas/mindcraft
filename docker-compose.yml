@@ -1,36 +1,81 @@
-version: '3.8'
-
 services:
-  app:
-    build: .
-    working_dir: /app
-    ports:
-      - "3000:8080"
-    volumes:
-      - .:/app
-      - /app/node_modules
-      - /tmp/.X11-unix:/tmp/.X11-unix
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    devices:
-      - /dev/dri:/dev/dri
-    environment:
-      - DISPLAY=:99
-      - GALLIUM_DRIVER=softpipe
-      - LIBGL_ALWAYS_SOFTWARE=1
-      - MESA_GL_VERSION_OVERRIDE=3.3
-    command: >
-      sh -c "pkill -f 'Xvfb :99' || true &&
-             rm -f /tmp/.X99-lock &&
-             Xvfb :99 -screen 0 1024x768x24 -ac +extension GLX +render -noreset & 
-             sleep 2 && 
-             node --max-old-space-size=4096 --no-warnings --trace-uncaught main.js"
+    redis:
+        image: redis:7-alpine
+        container_name: redis-mem0
+        restart: unless-stopped
+        ports:
+            - "6379:6379"
+        volumes:
+            - redis-data:/data
+        command: redis-server --appendonly yes
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 10s
+            timeout: 3s
+            retries: 3
+        networks:
+            - mindcraft-network
 
-  # viaproxy: #use this service to connect to an unsupported minecraft server versions. more info: ./services/viaproxy/README.md
-  #   image: ghcr.io/viaversion/viaproxy:latest
-  #   volumes:
-  #     - ./services/viaproxy:/app/run
-  #   ports:
-  #     - "25568:25568"
-  #   profiles:
-  #     - viaproxy
+    text-embeddings:
+        image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+        container_name: gte-small-tei
+        restart: unless-stopped
+        platform: linux/amd64
+        ports:
+            - "31234:80"
+        volumes:
+            - huggingface-data:/data
+        command: --model-id Xenova/gte-small
+        healthcheck:
+            test: ["CMD", "curl", "-f", "http://localhost:80/health"]
+            interval: 30s
+            timeout: 10s
+            retries: 3
+            start_period: 60s
+        networks:
+            - mindcraft-network
+        depends_on:
+            redis:
+                condition: service_healthy
+
+    mindcraft:
+        build: .
+        container_name: mindcraft
+        restart: unless-stopped
+        ports:
+            - "8080:8080"
+            - "3000-3005:3000-3005"
+        environment:
+            - REDIS_URL=redis://redis:6379
+            - MEM0_API_URL=http://mem0:8000
+            - MINDSERVER_PORT=8080
+            - MINDSERVER_HOST_PUBLIC=true
+        depends_on:
+            redis:
+                condition: service_healthy
+            text-embeddings:
+                condition: service_healthy
+            mem0:
+                condition: service_started
+        volumes:
+            - .:/app
+            - /app/node_modules
+        networks:
+            - mindcraft-network
+        tty: true
+        stdin_open: true
+
+    # NOTE: Letta runs separately at ~/letta (docker compose up -d)
+    # - Letta server: http://localhost:8283
+    # - LiteLLM proxy: http://localhost:4000
+
+volumes:
+    redis-data:
+        name: redis-mem0-data
+    huggingface-data:
+        name: huggingfacetei
+
+networks:
+    mindcraft-network:
+        name: mindcraft-network
+        driver: bridge

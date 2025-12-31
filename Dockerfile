@@ -32,13 +32,16 @@ ENV GALLIUM_DRIVER=llvmpipe
 
 WORKDIR /app
 
+# Install Bun
+RUN npm install -g bun
+
 # Copy package files
-COPY package.json package-lock.json* ./
+COPY package.json bun.lock ./
 
 # Install dependencies
-RUN npm install
+RUN bun install
 
 # Copy the rest of the application
 COPY . .
 
-CMD ["node", "main.js"]
+CMD ["bun", "run", "main.js"]

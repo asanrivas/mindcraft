@@ -49,7 +49,8 @@ export class SkillLibrary {
                 similarity_score: 0
             }));
         }
-        else if (!this.embedding_model) {
+        else if (!this.embedding_model || typeof this.embedding_model.embed !== 'function') {
+            // Fallback to word overlap if embedding model unavailable or doesn't have embed method
             skill_doc_similarities = Object.keys(this.skill_docs_embeddings)
                 .map(doc_key => ({
                     doc_key,

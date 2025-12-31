@@ -1,6 +1,7 @@
 import { Vec3 } from 'vec3';
 import { Camera } from "./camera.js";
 import fs from 'fs';
+import { resolvePlayerName } from '../library/skills.js';
 
 export class VisionInterpreter {
     constructor(agent, allow_vision) {
@@ -28,6 +29,14 @@ export class VisionInterpreter {
         }
         let result = "";
         const bot = this.agent.bot;
+        
+        // Resolve player name with fuzzy matching
+        const resolvedName = resolvePlayerName(bot, player_name);
+        if (!resolvedName) {
+            return `Could not find player "${player_name}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`;
+        }
+        player_name = resolvedName;
+        
         const player = bot.players[player_name]?.entity;
         if (!player) {
             return `Could not find player ${player_name}`;

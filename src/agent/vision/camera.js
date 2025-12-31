@@ -3,10 +3,19 @@ import { WorldView } from 'prismarine-viewer/viewer/lib/worldView.js';
 import { getBufferFromStream } from 'prismarine-viewer/viewer/lib/simpleUtils.js';
 
 import THREE from 'three';
-import { createCanvas } from 'node-canvas-webgl/lib/index.js';
 import fs from 'fs/promises';
 import { Vec3 } from 'vec3';
 import { EventEmitter } from 'events';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+let createCanvas;
+try {
+    const canvasModule = require('node-canvas-webgl/lib/index.js');
+    createCanvas = canvasModule.createCanvas;
+} catch (e) {
+    console.warn('Failed to load node-canvas-webgl:', e.message);
+}
 
 import worker_threads from 'worker_threads';
 global.Worker = worker_threads.Worker;

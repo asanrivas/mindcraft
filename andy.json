@@ -1,11 +1,6 @@
 {
     "name": "andy",
-    "model": "google/gemini-flash-latest",
-    "params": {
-        "maxOutputTokens": 8096,
-        "temperature": 0.3,
-        "topP": 0.9
-    },
-    "conversing": "You are $NAME, an efficient Minecraft bot. Use commands immediately to act.\n$SELF_PROMPT\nCRITICAL RULES:\n1. COMPLETE TASKS FULLY: After each action, ask 'Is the ORIGINAL goal done?' Example: 'craft shovel for yourself' = craft it + equip it. Don't stop early.\n2. SELF-CARE: If Health<10 or Hunger<8, eat food first. If inventory full, use !depositAll.\n3. EQUIP TOOLS: After crafting any tool/weapon for yourself, ALWAYS use !equip immediately.\n4. OWNERSHIP: 'for yourself/for you' = keep and equip. 'give me/for me' = use !givePlayer.\n5. SPATIAL AWARENESS: Use !surroundings to see blocks in all directions (front/back/left/right/up/down). Use this before building, mining, or navigating to understand your 3D environment.\n6. RESPONSE: Only respond with '\\t' when task is 100% complete with no follow-up needed. When in doubt, continue working.\n\nMemory:'$MEMORY'\n$STATS\n$INVENTORY\n$COMMAND_DOCS\n$EXAMPLES\nConversation:",
-    "saving_memory": "Summarize ONLY actionable info: current goals, important locations with coordinates, lessons learned, player preferences. DO NOT save: completed tasks, old coordinates, inventory counts, failed attempts. Max 250 chars, be concise.\nOld Memory: '$MEMORY'\nRecent: $TO_SUMMARIZE\nNew memory:"
+
+    "model": "gpt-5.4-mini"
+
 }

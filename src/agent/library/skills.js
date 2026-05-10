@@ -7,72 +7,8 @@ import settings from "../../../settings.js";
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
 
-// ============= CONSTANTS =============
-const CONSTANTS = {
-    MAX_REACH_DISTANCE: 4.5,
-    DEFAULT_SEARCH_RANGE: 32,
-    MAX_SEARCH_RANGE: 512,
-    STUCK_TIMEOUT_MS: 800,
-    PATHFIND_TIMEOUT_MS: 1000,
-    INTERACT_DISTANCE: 2,
-    LOW_DURABILITY_THRESHOLD: 10,
-    HUNGER_THRESHOLD: 14,
-};
-
-// Block type groups for flexible collection
-const BLOCK_TYPES = {
-    logs: ['oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', 'dark_oak_log', 'mangrove_log', 'cherry_log', 'crimson_stem', 'warped_stem'],
-    planks: ['oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks', 'acacia_planks', 'dark_oak_planks', 'mangrove_planks', 'cherry_planks', 'bamboo_planks', 'crimson_planks', 'warped_planks'],
-    stone: ['stone', 'andesite', 'granite', 'diorite', 'deepslate', 'tuff', 'calcite', 'dripstone_block', 'cobblestone', 'cobbled_deepslate'],
-    saplings: ['oak_sapling', 'spruce_sapling', 'birch_sapling', 'jungle_sapling', 'acacia_sapling', 'dark_oak_sapling', 'cherry_sapling', 'mangrove_propagule'],
-    wool: ['white_wool', 'orange_wool', 'magenta_wool', 'light_blue_wool', 'yellow_wool', 'lime_wool', 'pink_wool', 'gray_wool', 'light_gray_wool', 'cyan_wool', 'purple_wool', 'blue_wool', 'brown_wool', 'green_wool', 'red_wool', 'black_wool'],
-    glass: ['glass', 'white_stained_glass', 'orange_stained_glass', 'magenta_stained_glass', 'light_blue_stained_glass', 'yellow_stained_glass', 'lime_stained_glass', 'pink_stained_glass', 'gray_stained_glass', 'light_gray_stained_glass', 'cyan_stained_glass', 'purple_stained_glass', 'blue_stained_glass', 'brown_stained_glass', 'green_stained_glass', 'red_stained_glass', 'black_stained_glass'],
-};
-
 export function log(bot, message) {
     bot.output += message + '\n';
-}
-
-/**
- * Resolve a player name with fuzzy/case-insensitive matching
- * @param {Bot} bot - The minecraft bot
- * @param {string} username - The username to search for (can be partial/case-insensitive)
- * @returns {string|null} - The exact player name if found, null otherwise
- */
-export function resolvePlayerName(bot, username) {
-    if (!username) return null;
-    
-    // Direct exact match first
-    if (bot.players[username]) {
-        return username;
-    }
-    
-    const searchName = username.toLowerCase();
-    const playerNames = Object.keys(bot.players);
-    
-    // Try case-insensitive exact match
-    let match = playerNames.find(name => name.toLowerCase() === searchName);
-    if (match) return match;
-    
-    // Try matching without leading special characters (like dots)
-    match = playerNames.find(name => {
-        const cleanName = name.replace(/^[^a-zA-Z0-9]+/, '').toLowerCase();
-        return cleanName === searchName;
-    });
-    if (match) return match;
-    
-    // Try partial match (input is contained in player name, case-insensitive)
-    match = playerNames.find(name => name.toLowerCase().includes(searchName));
-    if (match) return match;
-    
-    // Try partial match with cleaned name
-    match = playerNames.find(name => {
-        const cleanName = name.replace(/^[^a-zA-Z0-9]+/, '').toLowerCase();
-        return cleanName.includes(searchName) || searchName.includes(cleanName);
-    });
-    if (match) return match;
-    
-    return null;
 }
 
 async function autoLight(bot) {
@@ -91,23 +27,10 @@ async function equipHighestAttack(bot) {
         weapons = bot.inventory.items().filter(item => item.name.includes('pickaxe') || item.name.includes('shovel'));
     if (weapons.length === 0)
         return;
-    // Sort by attack damage descending (fixed comparison)
-    weapons.sort((a, b) => (b.attackDamage || 0) - (a.attackDamage || 0));
+    weapons.sort((a, b) => b.attackDamage - a.attackDamage);
     let weapon = weapons[0];
     if (weapon)
         await bot.equip(weapon, 'hand');
-}
-
-/**
- * Check if a tool has low durability
- * @param {Object} item - the item to check
- * @param {number} threshold - durability threshold (default 10)
- * @returns {boolean} true if tool is about to break
- */
-function isToolLowDurability(item, threshold = CONSTANTS.LOW_DURABILITY_THRESHOLD) {
-    if (!item || item.durabilityUsed === undefined) return false;
-    const maxDurability = item.maxDurability || 100;
-    return (maxDurability - item.durabilityUsed) <= threshold;
 }
 
 export async function craftRecipe(bot, itemName, num=1) {
@@ -120,16 +43,9 @@ export async function craftRecipe(bot, itemName, num=1) {
      * await skills.craftRecipe(bot, "stick");
      **/
     let placedTable = false;
-    
-    // Check if bot already has enough of this item
-    const currentCount = world.getInventoryCounts(bot)[itemName] || 0;
-    if (currentCount >= num * 10) { // If we have 10x what we're trying to craft, probably don't need more
-        log(bot, `You already have ${currentCount} ${itemName} in inventory. Do you really need to craft more?`);
-    }
 
-    const itemRecipes = mc.getItemCraftingRecipes(itemName);
-    if (!itemRecipes || itemRecipes.length === 0) {
-        log(bot, `${itemName} is either not an item, or it does not have a crafting recipe! You cannot craft ${itemName}.`);
+    if (mc.getItemCraftingRecipes(itemName).length == 0) {
+        log(bot, `${itemName} is either not an item, or it does not have a crafting recipe!`);
         return false;
     }
 
@@ -166,26 +82,7 @@ export async function craftRecipe(bot, itemName, num=1) {
         }
     }
     if (!recipes || recipes.length === 0) {
-        // Build a helpful error message showing what's needed AND what the bot has
-        const recipeReqs = mc.getItemCraftingRecipes(itemName)[0][0];
-        const inventory = world.getInventoryCounts(bot);
-        
-        // Check for generic ingredient alternatives (e.g., any planks work for sticks)
-        let reqStr = Object.entries(recipeReqs).map(([key, value]) => {
-            const have = inventory[key] || 0;
-            // Check for alternatives (planks can be any wood type)
-            if (key.includes('_planks')) {
-                const allPlanks = Object.entries(inventory)
-                    .filter(([k, v]) => k.includes('_planks') && v > 0)
-                    .map(([k, v]) => `${k}(${v})`);
-                if (allPlanks.length > 0) {
-                    return `${key}: ${value} (have ${have}, but you have: ${allPlanks.join(', ')})`;
-                }
-            }
-            return `${key}: ${value} (have ${have})`;
-        }).join(', ');
-        
-        log(bot, `Cannot craft ${itemName}. Requires: ${reqStr}`);
+        log(bot, `You do not have the resources to craft a ${itemName}. It requires: ${Object.entries(mc.getItemCraftingRecipes(itemName)[0][0]).map(([key, value]) => `${key}: ${value}`).join(', ')}.`);
         if (placedTable) {
             await collectBlock(bot, 'crafting_table', 1);
         }
@@ -203,52 +100,9 @@ export async function craftRecipe(bot, itemName, num=1) {
     const requiredIngredients = mc.ingredientsFromPrismarineRecipe(recipe); //Items required to use the recipe once.
     const craftLimit = mc.calculateLimitingResource(inventory, requiredIngredients);
     
-    // Don't attempt to craft if we can't craft even once
-    if (craftLimit.num <= 0) {
-        log(bot, `Cannot craft ${itemName}: missing ${craftLimit.limitingResource}. You have: ${inventory[craftLimit.limitingResource] || 0}, need at least 1.`);
-        if (placedTable) {
-            await collectBlock(bot, 'crafting_table', 1);
-        }
-        return false;
-    }
-    
-    try {
-        const countBefore = world.getInventoryCounts(bot)[itemName] || 0;
-        await bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable);
-        
-        // Wait for inventory to sync from server (race condition fix)
-        let newCount = world.getInventoryCounts(bot)[itemName] || 0;
-        const expectedCount = countBefore + Math.min(craftLimit.num, num);
-        
-        // Retry up to 10 times (500ms total) waiting for inventory update
-        for (let i = 0; i < 10 && newCount < expectedCount; i++) {
-            await new Promise(resolve => setTimeout(resolve, 50));
-            newCount = world.getInventoryCounts(bot)[itemName] || 0;
-        }
-        
-        // Check if this is a tool/weapon that should be equipped
-        const isEquipable = itemName.includes('_sword') || itemName.includes('_pickaxe') || 
-                           itemName.includes('_axe') || itemName.includes('_shovel') || 
-                           itemName.includes('_hoe') || itemName.includes('bow') ||
-                           itemName.includes('shield') || itemName.includes('fishing_rod');
-        const equipHint = isEquipable ? ' Use !equip to use it.' : '';
-        
-        if(craftLimit.num<num) log(bot, `Not enough ${craftLimit.limitingResource} to craft ${num}, crafted ${craftLimit.num}. You now have ${newCount} ${itemName}.${equipHint}`);
-        else log(bot, `Successfully crafted ${itemName}, you now have ${newCount} ${itemName}.${equipHint}`);
-    } catch (err) {
-        // Handle mineflayer craft errors gracefully
-        const errMsg = err.message || String(err);
-        if (errMsg.includes('missing ingredient')) {
-            log(bot, `Crafting ${itemName} failed: ingredients changed during crafting. Try collecting more materials.`);
-        } else {
-            log(bot, `Crafting ${itemName} failed: ${errMsg}`);
-        }
-        if (placedTable) {
-            await collectBlock(bot, 'crafting_table', 1);
-        }
-        return false;
-    }
-    
+    await bot.craft(recipe, Math.min(craftLimit.num, num), craftingTable);
+    if(craftLimit.num<num) log(bot, `Not enough ${craftLimit.limitingResource} to craft ${num}, crafted ${craftLimit.num}. You now have ${world.getInventoryCounts(bot)[itemName]} ${itemName}.`);
+    else log(bot, `Successfully crafted ${itemName}, you now have ${world.getInventoryCounts(bot)[itemName]} ${itemName}.`);
     if (placedTable) {
         await collectBlock(bot, 'crafting_table', 1);
     }
@@ -525,16 +379,7 @@ export async function defendSelf(bot, range=9) {
     bot.modes.pause('self_defense');
     bot.modes.pause('cowardice');
     let attacked = false;
-    let enemy = world.getNearestEntityWhere(bot, entity => {
-        // Double-check hostile status and exclude friendly entities
-        if (!mc.isHostile(entity)) return false;
-        // Safety filter: never attack friendly entities
-        if (mc.isFriendly(entity)) {
-            console.log(`[DEFEND_SELF] Skipping ${entity.name} - marked as friendly`);
-            return false;
-        }
-        return true;
-    }, range);
+    let enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), range);
     while (enemy) {
         await equipHighestAttack(bot);
         if (bot.entity.position.distanceTo(enemy.position) >= 4 && enemy.name !== 'creeper' && enemy.name !== 'phantom') {
@@ -553,10 +398,7 @@ export async function defendSelf(bot, range=9) {
         bot.pvp.attack(enemy);
         attacked = true;
         await new Promise(resolve => setTimeout(resolve, 500));
-        enemy = world.getNearestEntityWhere(bot, entity => {
-            if (!mc.isHostile(entity)) return false;
-            return !mc.isFriendly(entity);
-        }, range);
+        enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), range);
         if (bot.interrupt_code) {
             bot.pvp.stop();
             return false;
@@ -587,20 +429,6 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         log(bot, `Invalid number of blocks to collect: ${num}.`);
         return false;
     }
-    
-    // Check if inventory is full before starting
-    const emptySlots = bot.inventory.emptySlotCount();
-    if (emptySlots === 0) {
-        const bulkItems = bot.inventory.items()
-            .filter(i => i.count >= 10)
-            .sort((a, b) => b.count - a.count)
-            .slice(0, 5)
-            .map(i => `${i.name}(${i.count})`);
-        log(bot, `Inventory is FULL (0 empty slots). Cannot collect ${blockType}. Consider storing: ${bulkItems.join(', ')}`);
-        return false;
-    } else if (emptySlots < 3 && num > 5) {
-        log(bot, `Warning: Only ${emptySlots} inventory slots free. May not collect all ${num} ${blockType}.`);
-    }
     let blocktypes = [blockType];
     if (blockType === 'coal' || blockType === 'diamond' || blockType === 'emerald' || blockType === 'iron' || blockType === 'gold' || blockType === 'lapis_lazuli' || blockType === 'redstone')
         blocktypes.push(blockType+'_ore');
@@ -610,28 +438,13 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         blocktypes.push('grass_block');
     if (blockType === 'cobblestone')
         blocktypes.push('stone');
-    
-    // Flexible block type matching - accept any variant when asking for a specific type
-    if (BLOCK_TYPES.logs.includes(blockType)) {
-        blocktypes = BLOCK_TYPES.logs;
-    } else if (BLOCK_TYPES.planks.includes(blockType)) {
-        blocktypes = BLOCK_TYPES.planks;
-    } else if (BLOCK_TYPES.stone.includes(blockType)) {
-        blocktypes = BLOCK_TYPES.stone;
-    } else if (BLOCK_TYPES.saplings.includes(blockType)) {
-        blocktypes = BLOCK_TYPES.saplings;
-    } else if (BLOCK_TYPES.wool.includes(blockType)) {
-        blocktypes = BLOCK_TYPES.wool;
-    } else if (BLOCK_TYPES.glass.includes(blockType)) {
-        blocktypes = BLOCK_TYPES.glass;
-    }
-    
     const isLiquid = blockType === 'lava' || blockType === 'water';
 
     let collected = 0;
-    let collectedTypes = new Set(); // Track what types were actually collected
 
-    const movements = createSafeMovements(bot, { dontMineUnderFallingBlock: false, dontCreateFlow: true });
+    const movements = new pf.Movements(bot);
+    movements.dontMineUnderFallingBlock = false;
+    movements.dontCreateFlow = true;
 
     // Blocks to ignore safety for, usually next to lava/water
     const unsafeBlocks = ['obsidian'];
@@ -666,7 +479,7 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         const block = blocks[0];
         await bot.tool.equipForBlock(block);
         if (isLiquid) {
-            const bucket = bot.inventory.items().find(item => item.name === 'bucket');
+            const bucket = bot.inventory.findInventoryItem('bucket');
             if (!bucket) {
                 log(bot, `Don't have bucket to harvest ${blockType}.`);
                 return false;
@@ -693,10 +506,8 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
                 await bot.collectBlock.collect(block);
                 success = true;
             }
-            if (success) {
+            if (success)
                 collected++;
-                collectedTypes.add(block.name); // Track the actual block type collected
-            }
             await autoLight(bot);
         }
         catch (err) {
@@ -713,17 +524,7 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
         if (bot.interrupt_code)
             break;  
     }
-    
-    // Report what was actually collected
-    if (collectedTypes.size > 1) {
-        const typesStr = Array.from(collectedTypes).join(', ');
-        log(bot, `Collected ${collected} logs (types: ${typesStr}).`);
-    } else if (collectedTypes.size === 1 && !collectedTypes.has(blockType)) {
-        log(bot, `Collected ${collected} ${Array.from(collectedTypes)[0]} (requested ${blockType}).`);
-    } else {
-        log(bot, `Collected ${collected} ${blockType}.`);
-    }
-    
+    log(bot, `Collected ${collected} ${blockType}.`);
     return collected > 0;
 }
 
@@ -740,7 +541,8 @@ export async function pickupNearbyItems(bot) {
     let nearestItem = getNearestItem(bot);
     let pickedUp = 0;
     while (nearestItem) {
-        let movements = createSafeMovements(bot, { canDig: false });
+        let movements = new pf.Movements(bot);
+        movements.canDig = false;
         bot.pathfinder.setMovements(movements);
         await goToGoal(bot, new pf.goals.GoalFollow(nearestItem, 1));
         await new Promise(resolve => setTimeout(resolve, 200));
@@ -781,7 +583,9 @@ export async function breakBlockAt(bot, x, y, z) {
 
         if (bot.entity.position.distanceTo(block.position) > 4.5) {
             let pos = block.position;
-            let movements = createSafeMovements(bot, { canPlaceOn: false, allow1by1towers: false });
+            let movements = new pf.Movements(bot);
+            movements.canPlaceOn = false;
+            movements.allow1by1towers = false;
             bot.pathfinder.setMovements(movements);
             await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
         }
@@ -829,7 +633,7 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
 
     if (bot.modes.isOn('cheat') && !dontCheat) {
         if (bot.restrict_to_inventory) {
-            let block = bot.inventory.items().find(item => item.name === blockType);
+            let block = bot.inventory.findInventoryItem(blockType);
             if (!block) {
                 log(bot, `Cannot place ${blockType}, you are restricted to your current inventory.`);
                 return false;
@@ -884,10 +688,10 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
     else if (item_name === 'lava') {
         item_name = 'lava_bucket';
     }
-    let block_item = bot.inventory.items().find(item => item.name === item_name);
+    let block_item = bot.inventory.findInventoryItem(item_name);
     if (!block_item && bot.game.gameMode === 'creative' && !bot.restrict_to_inventory) {
         await bot.creative.setInventorySlot(36, mc.makeItem(item_name, 1)); // 36 is first hotbar slot
-        block_item = bot.inventory.items().find(item => item.name === item_name);
+        block_item = bot.inventory.findInventoryItem(item_name);
     }
     if (!block_item) {
         log(bot, `Don't have any ${item_name} to place.`);
@@ -960,7 +764,7 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
     if (bot.entity.position.distanceTo(targetBlock.position) > 4.5) {
         // too far
         let pos = targetBlock.position;
-        let movements = createSafeMovements(bot);
+        let movements = new pf.Movements(bot);
         bot.pathfinder.setMovements(movements);
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
     }
@@ -984,296 +788,6 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
     }
 }
 
-export async function coverArea(bot, blockType, x1, z1, x2, z2, y) {
-    /**
-     * Cover a rectangular area with blocks at a specified height.
-     * Uses smart placement order - starts from positions with adjacent solid blocks.
-     * Automatically skips positions that already have the target block (resumable).
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} blockType, the type of block to place (e.g., "dirt", "cobblestone").
-     * @param {number} x1, the x coordinate of the first corner.
-     * @param {number} z1, the z coordinate of the first corner.
-     * @param {number} x2, the x coordinate of the second corner.
-     * @param {number} z2, the z coordinate of the second corner.
-     * @param {number} y, the y coordinate (height) to place blocks at.
-     * @returns {Promise<number>} the number of blocks successfully placed.
-     * @example
-     * // Cover a 10x10 area with dirt at height 64
-     * await skills.coverArea(bot, "dirt", 0, 0, 10, 10, 64);
-     **/
-    const minX = Math.min(Math.floor(x1), Math.floor(x2));
-    const maxX = Math.max(Math.floor(x1), Math.floor(x2));
-    const minZ = Math.min(Math.floor(z1), Math.floor(z2));
-    const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
-    const floorY = Math.floor(y);
-
-    const emptyBlocks = ['air', 'water', 'lava', 'grass', 'short_grass', 'tall_grass', 'snow', 'dead_bush', 'fern'];
-
-    // Helper to check if a position has an adjacent solid block to build off
-    function hasAdjacentSolid(x, z) {
-        const directions = [
-            [0, -1, 0], [0, 1, 0],  // below, above
-            [-1, 0, 0], [1, 0, 0],  // west, east
-            [0, 0, -1], [0, 0, 1]   // north, south
-        ];
-        for (const [dx, dy, dz] of directions) {
-            const block = bot.blockAt(new Vec3(x + dx, floorY + dy, z + dz));
-            if (block && !emptyBlocks.includes(block.name)) {
-                return true;
-            }
-        }
-        return false;
-    }
-
-    // First scan the area to see what's already done
-    let alreadyDone = 0;
-    let needsPlacing = new Set();
-
-    for (let x = minX; x <= maxX; x++) {
-        for (let z = minZ; z <= maxZ; z++) {
-            const existingBlock = bot.blockAt(new Vec3(x, floorY, z));
-            if (existingBlock && existingBlock.name === blockType) {
-                alreadyDone++;
-            } else if (existingBlock && !emptyBlocks.includes(existingBlock.name) && existingBlock.name !== blockType) {
-                // There's a different solid block here, count as done (don't replace)
-                alreadyDone++;
-            } else {
-                needsPlacing.add(`${x},${z}`);
-            }
-        }
-    }
-
-    const totalBlocks = (maxX - minX + 1) * (maxZ - minZ + 1);
-
-    if (alreadyDone > 0) {
-        log(bot, `Scanned area: ${alreadyDone}/${totalBlocks} already covered. ${needsPlacing.size} blocks remaining.`);
-    }
-
-    if (needsPlacing.size === 0) {
-        log(bot, `Area from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) is already fully covered!`);
-        return 0;
-    }
-
-    log(bot, `Covering area from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) at y=${floorY} with ${blockType}. Placing ${needsPlacing.size} blocks.`);
-
-    let placedCount = 0;
-    let failedCount = 0;
-    const initialSize = needsPlacing.size;
-
-    // Use multiple passes - each pass places blocks that have adjacent solids
-    // This allows building outward from edges/supports
-    let lastPlacedCount = -1;
-    while (needsPlacing.size > 0 && placedCount !== lastPlacedCount) {
-        lastPlacedCount = placedCount;
-
-        // Sort positions by whether they have adjacent solids (prioritize those that do)
-        const positionsThisPass = Array.from(needsPlacing).map(key => {
-            const [x, z] = key.split(',').map(Number);
-            return { x, z, key, hasSupport: hasAdjacentSolid(x, z) };
-        }).sort((a, b) => (b.hasSupport ? 1 : 0) - (a.hasSupport ? 1 : 0));
-
-        for (const pos of positionsThisPass) {
-            if (bot.interrupt_code) {
-                log(bot, `Area covering interrupted. Placed ${placedCount}/${initialSize} blocks. Run same command to resume.`);
-                return placedCount;
-            }
-
-            // Skip if no adjacent support (will try again next pass after more blocks placed)
-            if (!pos.hasSupport && needsPlacing.size > 1) {
-                continue;
-            }
-
-            const success = await placeBlock(bot, blockType, pos.x, floorY, pos.z, 'bottom');
-            if (success) {
-                placedCount++;
-                needsPlacing.delete(pos.key);
-
-                // Progress update every 10 blocks
-                if (placedCount % 10 === 0) {
-                    log(bot, `Progress: ${placedCount}/${initialSize} blocks placed.`);
-                }
-            } else {
-                // If placement failed even with support, mark for retry
-                failedCount++;
-            }
-        }
-    }
-
-    // Report any remaining unplaceable blocks
-    if (needsPlacing.size > 0) {
-        log(bot, `Could not place ${needsPlacing.size} blocks (no adjacent support). Placed ${placedCount}/${initialSize}.`);
-    } else {
-        log(bot, `Finished covering area. Placed ${placedCount} ${blockType} blocks. Total covered: ${alreadyDone + placedCount}/${totalBlocks}.`);
-    }
-
-    return placedCount;
-}
-
-export async function plantTreeGrid(bot, saplingType, x1, z1, x2, z2, spacing = 4) {
-    /**
-     * Plant saplings in a grid pattern with specified spacing.
-     * Automatically detects ground level at each spot (no need for y coordinate).
-     * Automatically skips spots with existing saplings or grown trees (resumable).
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} saplingType, the type of sapling to plant (e.g., "oak_sapling", "birch_sapling").
-     * @param {number} x1, the x coordinate of the first corner.
-     * @param {number} z1, the z coordinate of the first corner.
-     * @param {number} x2, the x coordinate of the second corner.
-     * @param {number} z2, the z coordinate of the second corner.
-     * @param {number} spacing, the gap between saplings (default 4 blocks).
-     * @returns {Promise<number>} the number of saplings successfully planted.
-     * @example
-     * // Plant oak saplings in a 64x64 area with 4 block gaps
-     * await skills.plantTreeGrid(bot, "oak_sapling", 0, 0, 64, 64, 4);
-     **/
-    const minX = Math.min(Math.floor(x1), Math.floor(x2));
-    const maxX = Math.max(Math.floor(x1), Math.floor(x2));
-    const minZ = Math.min(Math.floor(z1), Math.floor(z2));
-    const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
-    const gap = Math.max(1, Math.floor(spacing));
-    const botY = Math.floor(bot.entity.position.y);
-
-    // Normalize sapling name
-    let sapling = saplingType;
-    if (!sapling.endsWith('_sapling')) {
-        sapling = sapling + '_sapling';
-    }
-
-    const plantableBlocks = ['dirt', 'grass_block', 'coarse_dirt', 'podzol', 'rooted_dirt', 'moss_block', 'mud', 'muddy_mangrove_roots'];
-    const airBlocks = ['air', 'short_grass', 'tall_grass', 'fern', 'dead_bush', 'snow'];
-
-    // Helper function to find ground level at a given x,z
-    function findGroundLevel(x, z) {
-        // Search from bot's Y level, up to 20 blocks up or down
-        for (let yOffset = 0; yOffset <= 20; yOffset++) {
-            // Check above bot first
-            for (const dir of [1, -1]) {
-                const checkY = botY + (yOffset * dir);
-                if (checkY < -64 || checkY > 320) continue;
-
-                const blockAt = bot.blockAt(new Vec3(x, checkY, z));
-                const blockBelow = bot.blockAt(new Vec3(x, checkY - 1, z));
-
-                if (blockAt && blockBelow) {
-                    // Found ground: air above plantable block
-                    if (airBlocks.includes(blockAt.name) && plantableBlocks.includes(blockBelow.name)) {
-                        return { y: checkY, ground: blockBelow.name };
-                    }
-                    // Found existing sapling
-                    if (blockAt.name.includes('sapling')) {
-                        return { y: checkY, existing: 'sapling' };
-                    }
-                    // Found tree trunk
-                    if (blockAt.name.includes('_log')) {
-                        return { y: checkY, existing: 'tree' };
-                    }
-                }
-            }
-        }
-        return null;
-    }
-
-    // Scan the grid first
-    let alreadyPlanted = 0;
-    let grownTrees = 0;
-    let needsPlanting = [];
-    let unplantable = 0;
-
-    log(bot, `Scanning grid from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) with ${gap} block spacing...`);
-
-    for (let x = minX; x <= maxX; x += gap + 1) {
-        for (let z = minZ; z <= maxZ; z += gap + 1) {
-            const ground = findGroundLevel(x, z);
-
-            if (!ground) {
-                unplantable++;
-            } else if (ground.existing === 'sapling') {
-                alreadyPlanted++;
-            } else if (ground.existing === 'tree') {
-                grownTrees++;
-            } else {
-                needsPlanting.push({ x, z, y: ground.y });
-            }
-        }
-    }
-
-    const totalSpots = alreadyPlanted + grownTrees + needsPlanting.length + unplantable;
-
-    log(bot, `Scan complete: ${alreadyPlanted} saplings, ${grownTrees} grown trees, ${needsPlanting.length} plantable spots, ${unplantable} unplantable.`);
-
-    if (needsPlanting.length === 0) {
-        log(bot, `Tree grid from (${minX}, ${minZ}) to (${maxX}, ${maxZ}) is already fully planted/grown!`);
-        return 0;
-    }
-
-    log(bot, `Planting ${sapling} at ${needsPlanting.length} spots...`);
-
-    let plantedCount = 0;
-    for (const pos of needsPlanting) {
-        if (bot.interrupt_code) {
-            log(bot, `Tree planting interrupted at (${pos.x}, ${pos.z}). Planted ${plantedCount}/${needsPlanting.length}. Run same command to resume.`);
-            return plantedCount;
-        }
-
-        const success = await placeBlock(bot, sapling, pos.x, pos.y, pos.z, 'bottom');
-        if (success) {
-            plantedCount++;
-        }
-
-        // Progress update every 5 saplings
-        if (plantedCount % 5 === 0 && plantedCount > 0) {
-            log(bot, `Progress: ${plantedCount}/${needsPlanting.length} saplings planted.`);
-        }
-    }
-
-    log(bot, `Finished planting. Placed ${plantedCount} ${sapling}. Total in grid: ${alreadyPlanted + grownTrees + plantedCount} trees/saplings.`);
-    return plantedCount;
-}
-
-export function scanArea(bot, x1, z1, x2, z2, y = null) {
-    /**
-     * Scan a rectangular area and report what blocks are present.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {number} x1, the x coordinate of the first corner.
-     * @param {number} z1, the z coordinate of the first corner.
-     * @param {number} x2, the x coordinate of the second corner.
-     * @param {number} z2, the z coordinate of the second corner.
-     * @param {number} y, optional y coordinate. If null, scans at bot's height.
-     * @returns {object} summary of blocks found in the area.
-     **/
-    const minX = Math.min(Math.floor(x1), Math.floor(x2));
-    const maxX = Math.max(Math.floor(x1), Math.floor(x2));
-    const minZ = Math.min(Math.floor(z1), Math.floor(z2));
-    const maxZ = Math.max(Math.floor(z1), Math.floor(z2));
-    const scanY = y !== null ? Math.floor(y) : Math.floor(bot.entity.position.y);
-
-    const blockCounts = {};
-    let totalBlocks = 0;
-
-    for (let x = minX; x <= maxX; x++) {
-        for (let z = minZ; z <= maxZ; z++) {
-            const block = bot.blockAt(new Vec3(x, scanY, z));
-            if (block) {
-                blockCounts[block.name] = (blockCounts[block.name] || 0) + 1;
-                totalBlocks++;
-            }
-        }
-    }
-
-    // Sort by count descending
-    const sorted = Object.entries(blockCounts)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 10); // Top 10 blocks
-
-    return {
-        area: { minX, maxX, minZ, maxZ, y: scanY },
-        size: { width: maxX - minX + 1, length: maxZ - minZ + 1 },
-        totalBlocks,
-        blockCounts: Object.fromEntries(sorted),
-        topBlocks: sorted
-    };
-}
-
 export async function equip(bot, itemName) {
     /**
      * Equip the given item to the proper body part, like tools or armor.
@@ -1292,7 +806,7 @@ export async function equip(bot, itemName) {
     if (!item) {
         if (bot.game.gameMode === "creative") {
             await bot.creative.setInventorySlot(36, mc.makeItem(itemName, 1));
-            item = bot.inventory.items().find(item => item.name === itemName);
+            item = bot.inventory.findInventoryItem(itemName);
         }
         else {
             log(bot, `You do not have any ${itemName} to equip.`);
@@ -1333,7 +847,7 @@ export async function discard(bot, itemName, num=-1) {
      **/
     let discarded = 0;
     while (true) {
-        let item = bot.inventory.items().find(item => item.name === itemName);
+        let item = bot.inventory.findInventoryItem(itemName);
         if (!item) {
             break;
         }
@@ -1352,161 +866,58 @@ export async function discard(bot, itemName, num=-1) {
     return true;
 }
 
-// All storage container types in Minecraft
-const STORAGE_CONTAINERS = [
-    'chest', 'trapped_chest', 'ender_chest', 'barrel',
-    'shulker_box', 'white_shulker_box', 'orange_shulker_box', 'magenta_shulker_box',
-    'light_blue_shulker_box', 'yellow_shulker_box', 'lime_shulker_box', 'pink_shulker_box',
-    'gray_shulker_box', 'light_gray_shulker_box', 'cyan_shulker_box', 'purple_shulker_box',
-    'blue_shulker_box', 'brown_shulker_box', 'green_shulker_box', 'red_shulker_box', 'black_shulker_box'
-];
-
-// Create a Set for O(1) lookup
-const STORAGE_CONTAINERS_SET = new Set(STORAGE_CONTAINERS);
-
-/**
- * Find the nearest storage container (chest, ender chest, shulker box, barrel, etc.)
- * Optimized to use a single search with filter function
- */
-function getNearestStorageContainer(bot, range = CONSTANTS.DEFAULT_SEARCH_RANGE) {
-    // Use findBlock with a filter for better performance
-    const containerPositions = bot.findBlocks({
-        matching: (block) => STORAGE_CONTAINERS_SET.has(block.name),
-        maxDistance: range,
-        count: 10 // Get multiple candidates
-    });
-    
-    if (containerPositions.length === 0) return null;
-    
-    // Find the closest one
-    let nearestContainer = null;
-    let nearestDistance = range + 1;
-    
-    for (const pos of containerPositions) {
-        const block = bot.blockAt(pos);
-        if (block) {
-            const distance = bot.entity.position.distanceTo(pos);
-            if (distance < nearestDistance) {
-                nearestDistance = distance;
-                nearestContainer = block;
-            }
-        }
-    }
-    return nearestContainer;
-}
-
 export async function putInChest(bot, itemName, num=-1) {
     /**
-     * Put the given item in the nearest storage container (chest, ender chest, shulker box, barrel, etc.).
+     * Put the given item in the nearest chest.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} itemName, the item or block name to put in the container.
-     * @param {number} num, the number of items to put. Defaults to -1, which puts all items.
-     * @returns {Promise<boolean>} true if the item was put in the container, false otherwise.
+     * @param {string} itemName, the item or block name to put in the chest.
+     * @param {number} num, the number of items to put in the chest. Defaults to -1, which puts all items.
+     * @returns {Promise<boolean>} true if the item was put in the chest, false otherwise.
      * @example
      * await skills.putInChest(bot, "oak_log");
      **/
-    let container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-    if (!container) {
-        log(bot, `Could not find any storage container within ${CONSTANTS.DEFAULT_SEARCH_RANGE} blocks. Place a chest, barrel, or shulker box nearby.`);
+    let chest = world.getNearestBlock(bot, 'chest', 32);
+    if (!chest) {
+        log(bot, `Could not find a chest nearby.`);
         return false;
     }
-
-    // Get ALL matching items in inventory (may be spread across multiple slots)
-    const matchingItems = bot.inventory.items().filter(item => item.name === itemName);
-    if (matchingItems.length === 0) {
-        const similarItems = bot.inventory.items().filter(i => i.name.includes(itemName.split('_')[0])).map(i => i.name);
-        const inventorySummary = bot.inventory.items()
-            .sort((a, b) => b.count - a.count)
-            .slice(0, 10)
-            .map(i => `${i.name}(${i.count})`)
-            .join(', ');
-
-        let errorMsg = `You do not have any ${itemName} in inventory.`;
-        if (similarItems.length > 0) {
-            errorMsg += ` Similar: ${similarItems.join(', ')}.`;
-        }
-        if (inventorySummary) {
-            errorMsg += ` You have: ${inventorySummary}`;
-        }
-        log(bot, errorMsg);
+    let item = bot.inventory.findInventoryItem(itemName);
+    if (!item) {
+        log(bot, `You do not have any ${itemName} to put in the chest.`);
         return false;
     }
-
-    // Calculate total items across all slots
-    const totalInInventory = matchingItems.reduce((sum, item) => sum + item.count, 0);
-    const to_put = num === -1 ? totalInInventory : Math.min(num, totalInInventory);
-
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
-
-    // Check container capacity before deposit
-    const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
-    const isDoubleChest = totalSlots === 54;
-    const chestType = isDoubleChest ? 'double chest' : container.name;
-
-    // Count items BEFORE deposit
-    const countBefore = matchingItems.reduce((sum, item) => sum + item.count, 0);
-    const itemType = matchingItems[0].type;
-
-    try {
-        // Deposit all at once - mineflayer now waits for slot updates on chest windows
-        await openedContainer.deposit(itemType, null, to_put);
-    } catch (err) {
-        // "destination full" = chest filled mid-deposit, some items may have been deposited already
-        // "Can't find X in slots" = item gone (shouldn't happen since we checked)
-        console.log(`[putInChest] Deposit threw: ${err.message}`);
-    }
-
-    // Count items AFTER deposit - this tells us what ACTUALLY moved regardless of errors
-    const countAfter = bot.inventory.items()
-        .filter(item => item.name === itemName)
-        .reduce((sum, item) => sum + item.count, 0);
-    const actualDeposited = countBefore - countAfter;
-
-    // Get current slot usage
-    const slotsUsedAfter = openedContainer.containerItems().length;
-    await openedContainer.close();
-
-    if (actualDeposited === 0) {
-        log(bot, `Could not deposit any ${itemName}. The ${chestType} is full.`);
-        return false;
-    } else if (actualDeposited < to_put) {
-        log(bot, `Deposited ${actualDeposited}/${to_put} ${itemName} in ${chestType} (${slotsUsedAfter}/${totalSlots} slots). ${countAfter} left in inventory.`);
-    } else {
-        log(bot, `Successfully put ${actualDeposited} ${itemName} in ${chestType}. (${slotsUsedAfter}/${totalSlots} slots used)`);
-    }
+    let to_put = num === -1 ? item.count : Math.min(num, item.count);
+    await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 2);
+    const chestContainer = await bot.openContainer(chest);
+    await chestContainer.deposit(item.type, null, to_put);
+    await chestContainer.close();
+    log(bot, `Successfully put ${to_put} ${itemName} in the chest.`);
     return true;
 }
 
 export async function takeFromChest(bot, itemName, num=-1) {
     /**
-     * Take the given item from the nearest storage container, potentially from multiple slots.
+     * Take the given item from the nearest chest, potentially from multiple slots.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} itemName, the item or block name to take from the container.
-     * @param {number} num, the number of items to take. Defaults to -1, which takes all items.
-     * @returns {Promise<boolean>} true if the item was taken, false otherwise.
+     * @param {string} itemName, the item or block name to take from the chest.
+     * @param {number} num, the number of items to take from the chest. Defaults to -1, which takes all items.
+     * @returns {Promise<boolean>} true if the item was taken from the chest, false otherwise.
      * @example
      * await skills.takeFromChest(bot, "oak_log");
      * **/
-    let container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-    if (!container) {
-        log(bot, `Could not find any storage container within ${CONSTANTS.DEFAULT_SEARCH_RANGE} blocks.`);
+    let chest = world.getNearestBlock(bot, 'chest', 32);
+    if (!chest) {
+        log(bot, `Could not find a chest nearby.`);
         return false;
     }
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
+    await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 2);
+    const chestContainer = await bot.openContainer(chest);
     
-    // Find all matching items in the container
-    let matchingItems = openedContainer.containerItems().filter(item => item.name === itemName);
+    // Find all matching items in the chest
+    let matchingItems = chestContainer.containerItems().filter(item => item.name === itemName);
     if (matchingItems.length === 0) {
-        // List available items as suggestion
-        const availableItems = [...new Set(openedContainer.containerItems().map(i => i.name))];
-        if (availableItems.length > 0) {
-            log(bot, `Could not find ${itemName} in ${container.name}. Available: ${availableItems.slice(0, 5).join(', ')}${availableItems.length > 5 ? '...' : ''}`);
-        } else {
-            log(bot, `The ${container.name} is empty.`);
-        }
-        await openedContainer.close();
+        log(bot, `Could not find any ${itemName} in the chest.`);
+        await chestContainer.close();
         return false;
     }
     
@@ -1519,204 +930,43 @@ export async function takeFromChest(bot, itemName, num=-1) {
         if (remaining <= 0) break;
         
         let toTakeFromSlot = Math.min(remaining, item.count);
-        await openedContainer.withdraw(item.type, null, toTakeFromSlot);
+        await chestContainer.withdraw(item.type, null, toTakeFromSlot);
         
         totalTaken += toTakeFromSlot;
         remaining -= toTakeFromSlot;
     }
     
-    await openedContainer.close();
-    log(bot, `Successfully took ${totalTaken} ${itemName} from the ${container.name}.`);
+    await chestContainer.close();
+    log(bot, `Successfully took ${totalTaken} ${itemName} from the chest.`);
     return totalTaken > 0;
 }
 
 export async function viewChest(bot) {
     /**
-     * View the contents of the nearest storage container (chest, ender chest, shulker box, barrel, etc.).
+     * View the contents of the nearest chest.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @returns {Promise<boolean>} true if the container was viewed, false otherwise.
+     * @returns {Promise<boolean>} true if the chest was viewed, false otherwise.
      * @example
      * await skills.viewChest(bot);
      * **/
-    let container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-    if (!container) {
-        log(bot, `Could not find any storage container nearby (chest, ender chest, shulker box, barrel).`);
+    let chest = world.getNearestBlock(bot, 'chest', 32);
+    if (!chest) {
+        log(bot, `Could not find a chest nearby.`);
         return false;
     }
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
-
-    // Determine container type and capacity
-    const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
-    const isDoubleChest = totalSlots === 54;
-    const chestType = isDoubleChest ? 'double chest' : container.name;
-
-    let items = openedContainer.containerItems();
-    const usedSlots = items.length;
-    const emptySlots = totalSlots - usedSlots;
-
+    await goToPosition(bot, chest.position.x, chest.position.y, chest.position.z, 2);
+    const chestContainer = await bot.openContainer(chest);
+    let items = chestContainer.containerItems();
     if (items.length === 0) {
-        log(bot, `The ${chestType} is empty. (0/${totalSlots} slots used)`);
+        log(bot, `The chest is empty.`);
     }
     else {
-        log(bot, `The ${chestType} contains (${usedSlots}/${totalSlots} slots used, ${emptySlots} empty):`);
+        log(bot, `The chest contains:`);
         for (let item of items) {
             log(bot, `${item.count} ${item.name}`);
         }
     }
-    await openedContainer.close();
-    return true;
-}
-
-export async function depositAllItems(bot, excludeItems = []) {
-    /**
-     * Deposit all items from inventory to nearest storage container.
-     * Will try multiple chests if the first one is full.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string[]} excludeItems, items to keep in inventory (e.g., tools, weapons, food).
-     * @returns {Promise<boolean>} true if items were deposited, false otherwise.
-     * @example
-     * await skills.depositAllItems(bot, ["diamond_pickaxe", "diamond_sword", "cooked_beef"]);
-     **/
-
-    // Default items to always keep
-    const defaultKeep = ['netherite_pickaxe', 'netherite_sword', 'netherite_axe', 'netherite_shovel',
-                         'diamond_pickaxe', 'diamond_sword', 'diamond_axe', 'diamond_shovel'];
-    const keepItems = new Set([...excludeItems, ...defaultKeep]);
-
-    let totalDeposited = 0;
-    let allDepositedTypes = [];
-    const usedContainers = new Set();
-    const maxChests = 5; // Try up to 5 chests
-
-    for (let chestAttempt = 0; chestAttempt < maxChests; chestAttempt++) {
-        // Check if we still have items to deposit
-        const itemsToDeposit = bot.inventory.items().filter(item => {
-            if (keepItems.has(item.name)) return false;
-            if (item.name.includes('helmet') || item.name.includes('chestplate') ||
-                item.name.includes('leggings') || item.name.includes('boots')) return false;
-            return true;
-        });
-
-        if (itemsToDeposit.length === 0) {
-            break; // Nothing left to deposit
-        }
-
-        // Find nearest container we haven't used yet
-        let container = null;
-        const nearbyContainers = world.getNearestBlocks(bot, ['chest', 'barrel', 'trapped_chest'], CONSTANTS.DEFAULT_SEARCH_RANGE, 10);
-        for (const c of nearbyContainers) {
-            const posKey = `${c.position.x},${c.position.y},${c.position.z}`;
-            if (!usedContainers.has(posKey)) {
-                container = c;
-                usedContainers.add(posKey);
-                break;
-            }
-        }
-
-        if (!container) {
-            if (chestAttempt === 0) {
-                log(bot, `Could not find any storage container nearby.`);
-                return false;
-            }
-            break; // No more unused chests
-        }
-
-        await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-        const openedContainer = await bot.openContainer(container);
-
-        // Determine container type
-        const totalSlots = openedContainer.slots.length - 36;
-        const isDoubleChest = totalSlots === 54;
-        const chestType = isDoubleChest ? 'double chest' : container.name;
-
-        let deposited = 0;
-        let chestFull = false;
-
-        for (const item of bot.inventory.items()) {
-            // Skip items we want to keep
-            if (keepItems.has(item.name)) continue;
-            // Skip equipped armor
-            if (item.name.includes('helmet') || item.name.includes('chestplate') ||
-                item.name.includes('leggings') || item.name.includes('boots')) continue;
-
-            try {
-                await openedContainer.deposit(item.type, null, item.count);
-                deposited += item.count;
-                allDepositedTypes.push(item.name);
-            } catch (e) {
-                log(bot, `${chestType} at (${container.position.x}, ${container.position.y}, ${container.position.z}) is full, trying next chest...`);
-                chestFull = true;
-                break;
-            }
-        }
-
-        await openedContainer.close();
-        totalDeposited += deposited;
-
-        if (!chestFull) {
-            break; // Successfully deposited everything
-        }
-    }
-
-    if (totalDeposited === 0) {
-        log(bot, `No items to deposit (or all items are in the keep list).`);
-        return false;
-    }
-
-    const uniqueTypes = [...new Set(allDepositedTypes)];
-    log(bot, `Deposited ${totalDeposited} items (${uniqueTypes.length} types) total.`);
-    return true;
-}
-
-export async function eatIfHungry(bot, threshold = CONSTANTS.HUNGER_THRESHOLD) {
-    /**
-     * Eat food if hunger is below threshold.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {number} threshold, hunger level below which to eat (default 14 out of 20).
-     * @returns {Promise<boolean>} true if food was consumed, false otherwise.
-     * @example
-     * await skills.eatIfHungry(bot);
-     **/
-    if (bot.food >= threshold) {
-        return false; // Not hungry enough
-    }
-    
-    // Food items sorted roughly by saturation/hunger restoration
-    const goodFoods = ['golden_apple', 'enchanted_golden_apple', 'cooked_beef', 'cooked_porkchop', 
-                       'cooked_mutton', 'cooked_salmon', 'cooked_chicken', 'cooked_rabbit',
-                       'cooked_cod', 'bread', 'baked_potato', 'mushroom_stew', 'beetroot_soup',
-                       'rabbit_stew', 'pumpkin_pie', 'golden_carrot', 'apple', 'carrot',
-                       'melon_slice', 'sweet_berries', 'glow_berries'];
-    
-    // Find best available food
-    let foodToEat = null;
-    for (const foodName of goodFoods) {
-        const item = bot.inventory.items().find(item => item.name === foodName);
-        if (item) {
-            foodToEat = item;
-            break;
-        }
-    }
-    
-    // Fallback: any food item
-    if (!foodToEat) {
-        foodToEat = bot.inventory.items().find(item => 
-            item.name.includes('cooked') || item.name.includes('bread') || 
-            item.name.includes('apple') || item.name.includes('carrot') ||
-            item.name.includes('potato') || item.name.includes('stew') ||
-            item.name.includes('pie') || item.name.includes('berries')
-        );
-    }
-    
-    if (!foodToEat) {
-        log(bot, `Hungry (${bot.food}/20) but no food available in inventory.`);
-        return false;
-    }
-    
-    await bot.equip(foodToEat, 'hand');
-    await bot.consume();
-    log(bot, `Ate ${foodToEat.name}. Hunger now: ${bot.food}/20.`);
+    await chestContainer.close();
     return true;
 }
 
@@ -1731,7 +981,7 @@ export async function consume(bot, itemName="") {
      **/
     let item, name;
     if (itemName) {
-        item = bot.inventory.items().find(item => item.name === itemName);
+        item = bot.inventory.findInventoryItem(itemName);
         name = itemName;
     }
     if (!item) {
@@ -1756,14 +1006,6 @@ export async function giveToPlayer(bot, itemType, username, num=1) {
      * @example
      * await skills.giveToPlayer(bot, "oak_log", "player1");
      **/
-    // Resolve player name with fuzzy matching
-    const resolvedName = resolvePlayerName(bot, username);
-    if (!resolvedName) {
-        log(bot, `Could not find player "${username}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`);
-        return false;
-    }
-    username = resolvedName;
-    
     if (bot.username === username) {
         log(bot, `You cannot give items to yourself.`);
         return false;
@@ -1833,26 +1075,12 @@ export async function goToGoal(bot, goal) {
      **/
 
     const nonDestructiveMovements = new pf.Movements(bot);
-    const dontBreakBlocks = [
-        'glass', 'glass_pane', 'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door',
-        'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door', 'bamboo_door',
-        'crimson_door', 'warped_door', 'iron_door',
-        // Fence gates - can be opened/closed
-        'fence_gate', 'oak_fence_gate', 'spruce_fence_gate', 'birch_fence_gate',
-        'jungle_fence_gate', 'acacia_fence_gate', 'dark_oak_fence_gate',
-        'mangrove_fence_gate', 'cherry_fence_gate', 'bamboo_fence_gate',
-        'crimson_fence_gate', 'warped_fence_gate',
-        // Fence blocks - don't break
-        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
-        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
-        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
-    ];
+    const dontBreakBlocks = ['glass', 'glass_pane'];
     for (let block of dontBreakBlocks) {
-        const blockId = mc.getBlockId(block);
-        if (blockId) nonDestructiveMovements.blocksCantBreak.add(blockId);
+        nonDestructiveMovements.blocksCantBreak.add(mc.getBlockId(block));
     }
     nonDestructiveMovements.placeCost = 2;
-    nonDestructiveMovements.digCost = 100;
+    nonDestructiveMovements.digCost = 10;
 
     const destructiveMovements = new pf.Movements(bot);
 
@@ -1885,178 +1113,6 @@ export async function goToGoal(bot, goal) {
 }
 
 let _doorInterval = null;
-
-/**
- * Create surface-only movements for long distance travel to avoid caves
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @returns {pf.Movements} configured movements that prefer surface travel
- */
-function createSurfaceMovements(bot) {
-    const movements = new pf.Movements(bot);
-
-    // Disable digging to stay on surface
-    movements.canDig = false;
-
-    // Limit vertical drops to avoid falling into caves
-    movements.maxDropDown = 3;
-
-    // Don't build towers (stay on natural terrain)
-    movements.allow1by1towers = false;
-
-    // High cost for going down to discourage cave entry
-    movements.digCost = 1000;
-
-    // Avoid water/lava
-    movements.canOpenDoors = true;
-
-    return movements;
-}
-
-function createSafeMovements(bot, options = {}) {
-    /**
-     * Create pathfinding movements that prioritize using doors over breaking blocks
-     * @param {MinecraftBot} bot - reference to the minecraft bot
-     * @param {Object} options - configuration options
-     * @returns {pf.Movements} configured movements
-     */
-    const movements = new pf.Movements(bot);
-    
-    // High dig cost to discourage breaking blocks
-    movements.digCost = options.digCost || 100;
-    movements.placeCost = options.placeCost || 2;
-    
-    // Don't break important blocks
-    const dontBreakBlocks = [
-        'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door',
-        'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door',
-        'bamboo_door', 'crimson_door', 'warped_door', 'iron_door',
-        ...BLOCK_TYPES.glass,  // All glass and stained glass variants
-        'glass_pane', 'white_stained_glass_pane', 'orange_stained_glass_pane',
-        'magenta_stained_glass_pane', 'light_blue_stained_glass_pane',
-        'yellow_stained_glass_pane', 'lime_stained_glass_pane', 'pink_stained_glass_pane',
-        'gray_stained_glass_pane', 'light_gray_stained_glass_pane', 'cyan_stained_glass_pane',
-        'purple_stained_glass_pane', 'blue_stained_glass_pane', 'brown_stained_glass_pane',
-        'green_stained_glass_pane', 'red_stained_glass_pane', 'black_stained_glass_pane',
-        'stone_bricks', 'cobblestone',
-        'oak_planks', 'spruce_planks', 'birch_planks', 'jungle_planks',
-        'acacia_planks', 'dark_oak_planks', 'fence_gate', 'oak_fence_gate',
-        'spruce_fence_gate', 'birch_fence_gate', 'jungle_fence_gate',
-        'acacia_fence_gate', 'dark_oak_fence_gate', 'mangrove_fence_gate',
-        'cherry_fence_gate', 'bamboo_fence_gate', 'crimson_fence_gate', 'warped_fence_gate',
-        // All fence blocks - don't break player-built fences
-        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
-        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
-        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
-    ];
-    
-    for (let block of dontBreakBlocks) {
-        const blockId = mc.getBlockId(block);
-        if (blockId) movements.blocksCantBreak.add(blockId);
-    }
-    
-    // Apply any custom options
-    if (options.canDig === false) movements.canDig = false;
-    if (options.canPlaceOn === false) movements.canPlaceOn = false;
-    if (options.allow1by1towers === false) movements.allow1by1towers = false;
-    if (options.dontMineUnderFallingBlock !== undefined) movements.dontMineUnderFallingBlock = options.dontMineUnderFallingBlock;
-    if (options.dontCreateFlow !== undefined) movements.dontCreateFlow = options.dontCreateFlow;
-    
-    return movements;
-}
-
-/**
- * Find carpet blocks placed on top of fences nearby (within 4 blocks)
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @returns {Object|null} - {carpet: Block, fence: Block, jumpPos: Vec3} or null if not found
- */
-function findCarpetOnFence(bot) {
-    const searchRadius = 4;
-    const botPos = bot.entity.position;
-
-    // List of fence block names
-    const fenceNames = [
-        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
-        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
-        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
-    ];
-
-    // Search nearby blocks for fence + carpet combo
-    for (let dx = -searchRadius; dx <= searchRadius; dx++) {
-        for (let dz = -searchRadius; dz <= searchRadius; dz++) {
-            for (let dy = -1; dy <= 2; dy++) {
-                const checkPos = botPos.offset(dx, dy, dz);
-                const block = bot.blockAt(checkPos);
-
-                if (block && fenceNames.includes(block.name)) {
-                    // Found a fence, check if there's carpet on top
-                    const abovePos = checkPos.offset(0, 1, 0);
-                    const aboveBlock = bot.blockAt(abovePos);
-
-                    if (aboveBlock && aboveBlock.name.includes('carpet')) {
-                        // Found carpet on fence! Calculate approach position
-                        const dist = botPos.distanceTo(checkPos);
-                        if (dist < searchRadius) {
-                            console.log(`[FENCE_HELPER] Found carpet (${aboveBlock.name}) on fence at ${checkPos}`);
-                            return {
-                                carpet: aboveBlock,
-                                fence: block,
-                                fencePos: checkPos,
-                                carpetPos: abovePos
-                            };
-                        }
-                    }
-                }
-            }
-        }
-    }
-    return null;
-}
-
-/**
- * Attempt to jump over a fence using carpet placed on top
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {Object} carpetInfo - {carpet, fence, fencePos, carpetPos} from findCarpetOnFence
- */
-async function attemptCarpetFenceJump(bot, carpetInfo) {
-    const { fencePos, carpetPos } = carpetInfo;
-    const botPos = bot.entity.position;
-
-    // Calculate direction to fence
-    const dx = fencePos.x - botPos.x;
-    const dz = fencePos.z - botPos.z;
-    const dist = Math.sqrt(dx * dx + dz * dz);
-
-    if (dist > 3) {
-        // Too far, need to get closer first - let pathfinder handle approach
-        console.log(`[FENCE_HELPER] Carpet-fence too far (${dist.toFixed(1)} blocks), waiting for approach`);
-        return;
-    }
-
-    console.log(`[FENCE_HELPER] Attempting carpet-fence jump at ${fencePos}`);
-
-    // Look at the carpet position
-    await bot.lookAt(carpetPos.offset(0.5, 0.5, 0.5));
-
-    // Move towards the fence
-    const dirX = dx / dist;
-    const dirZ = dz / dist;
-
-    bot.setControlState('forward', true);
-    bot.setControlState('sprint', false);
-
-    // Wait a bit then jump
-    setTimeout(() => {
-        bot.setControlState('jump', true);
-        console.log(`[FENCE_HELPER] Jumping onto carpet at ${carpetPos}`);
-
-        // Release controls after jump
-        setTimeout(() => {
-            bot.setControlState('jump', false);
-            bot.setControlState('forward', false);
-        }, 400);
-    }, 200);
-}
-
 function startDoorInterval(bot) {
     /**
      * Start helper interval that opens nearby doors if the bot is stuck.
@@ -2079,7 +1135,7 @@ function startDoorInterval(bot) {
             stuck_time += now - prev_check;
         }
         
-        if (stuck_time > 800) {
+        if (stuck_time > 1200) {
             // shuffle positions so we're not always opening the same door
             const positions = [
                 bot.entity.position.clone(),
@@ -2101,26 +1157,16 @@ function startDoorInterval(bot) {
                 positions[randomIndex], positions[currentIndex]];
             }
             
-            let foundGateOrDoor = false;
             for (let position of positions) {
                 let block = bot.blockAt(position);
                 if (block && block.name &&
                     !block.name.includes('iron') &&
                     (block.name.includes('door') ||
                      block.name.includes('fence_gate') ||
-                     block.name.includes('trapdoor')))
+                     block.name.includes('trapdoor'))) 
                 {
                     bot.activateBlock(block);
-                    foundGateOrDoor = true;
                     break;
-                }
-            }
-
-            // If no gate/door found, try carpet-on-fence jump as fallback
-            if (!foundGateOrDoor) {
-                const carpetOnFence = findCarpetOnFence(bot);
-                if (carpetOnFence) {
-                    attemptCarpetFenceJump(bot, carpetOnFence);
                 }
             }
             stuck_time = 0;
@@ -2132,53 +1178,14 @@ function startDoorInterval(bot) {
     return doorCheckInterval;
 }
 
-/**
- * Get surface Y coordinate at given X, Z position
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {number} x - x coordinate
- * @param {number} z - z coordinate
- * @returns {number} surface Y level
- */
-function getSurfaceY(bot, x, z) {
-    // Start from high and find first solid block
-    for (let y = 100; y > 0; y--) {
-        const block = bot.blockAt(new Vec3(x, y, z));
-        if (block && block.name !== 'air' && block.name !== 'water' && block.name !== 'lava' &&
-            !block.name.includes('leaves') && !block.name.includes('log')) {
-            return y + 1;
-        }
-    }
-    return 64; // Default to sea level
-}
-
-/**
- * Check if bot is currently underground (in a cave)
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @returns {boolean} true if underground
- */
-function isUnderground(bot) {
-    const pos = bot.entity.position;
-    // Check if there's solid blocks above the bot (cave ceiling)
-    let solidAbove = 0;
-    for (let y = Math.floor(pos.y) + 2; y < Math.floor(pos.y) + 10; y++) {
-        const block = bot.blockAt(new Vec3(pos.x, y, pos.z));
-        if (block && block.name !== 'air' && block.name !== 'water' && !block.name.includes('leaves')) {
-            solidAbove++;
-        }
-    }
-    // If more than 3 solid blocks above within 10 blocks, likely in a cave
-    return solidAbove >= 3;
-}
-
-export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
+export async function goToPosition(bot, x, y, z, min_distance=2) {
     /**
      * Navigate to the given position.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
      * @param {number} x, the x coordinate to navigate to. If null, the bot's current x coordinate will be used.
      * @param {number} y, the y coordinate to navigate to. If null, the bot's current y coordinate will be used.
      * @param {number} z, the z coordinate to navigate to. If null, the bot's current z coordinate will be used.
-     * @param {number} min_distance, the distance to keep from the position. Defaults to 2.
-     * @param {boolean} sprint, whether to sprint while moving. Defaults to false.
+     * @param {number} distance, the distance to keep from the position. Defaults to 2.
      * @returns {Promise<boolean>} true if the position was reached, false otherwise.
      * @example
      * let position = world.world.getNearestBlock(bot, "oak_log", 64).position;
@@ -2193,97 +1200,24 @@ export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
         log(bot, `Teleported to ${x}, ${y}, ${z}.`);
         return true;
     }
-
-    // Calculate horizontal distance
-    const botPos = bot.entity.position;
-    const horizontalDistance = Math.sqrt(Math.pow(x - botPos.x, 2) + Math.pow(z - botPos.z, 2));
-    const LONG_DISTANCE_THRESHOLD = 100;
-    const WAYPOINT_INTERVAL = 50;
-
-    // For long distances, use surface-aware waypoint navigation
-    if (horizontalDistance > LONG_DISTANCE_THRESHOLD) {
-        log(bot, `Long distance travel (${Math.round(horizontalDistance)} blocks), using surface navigation...`);
-
-        // Calculate direction vector
-        const dx = x - botPos.x;
-        const dz = z - botPos.z;
-        const dist = Math.sqrt(dx * dx + dz * dz);
-        const dirX = dx / dist;
-        const dirZ = dz / dist;
-
-        // Create waypoints along the path
-        const numWaypoints = Math.floor(horizontalDistance / WAYPOINT_INTERVAL);
-
-        // Use surface movements for long distance
-        const surfaceMovements = createSurfaceMovements(bot);
-
-        for (let i = 1; i <= numWaypoints; i++) {
-            if (bot.interrupt_code) {
-                log(bot, `Navigation interrupted.`);
-                return false;
-            }
-
-            const waypointX = Math.floor(botPos.x + dirX * WAYPOINT_INTERVAL * i);
-            const waypointZ = Math.floor(botPos.z + dirZ * WAYPOINT_INTERVAL * i);
-
-            // Check if we're getting close to destination
-            const remainingDist = Math.sqrt(Math.pow(x - bot.entity.position.x, 2) + Math.pow(z - bot.entity.position.z, 2));
-            if (remainingDist < WAYPOINT_INTERVAL) {
-                break; // Close enough, do final approach
-            }
-
-            // Check if underground and try to get to surface
-            if (isUnderground(bot)) {
-                log(bot, `Detected underground, attempting to stay on surface...`);
-                // Try to find a surface path instead
-                const surfaceY = getSurfaceY(bot, bot.entity.position.x, bot.entity.position.z);
-                if (surfaceY > bot.entity.position.y + 5) {
-                    // Too deep underground, abort this waypoint and try next one
-                    continue;
-                }
-            }
-
-            try {
-                bot.pathfinder.setMovements(surfaceMovements);
-                await goToGoal(bot, new pf.goals.GoalNear(waypointX, bot.entity.position.y, waypointZ, 5));
-                log(bot, `Waypoint ${i}/${numWaypoints} reached, ${Math.round(remainingDist)} blocks remaining...`);
-            } catch (err) {
-                // If surface path fails, try with normal movements
-                log(bot, `Surface path blocked, trying alternate route...`);
-            }
-        }
-    }
-
-    // Enable sprinting if requested
-    if (sprint) {
-        bot.setControlState('sprint', true);
-    }
-
+    
     const checkDigProgress = () => {
         if (bot.targetDigBlock) {
             const targetBlock = bot.targetDigBlock;
             const itemId = bot.heldItem ? bot.heldItem.type : null;
             if (!targetBlock.canHarvest(itemId)) {
-                log(bot, `Pathfinding stopped: Cannot break ${targetBlock.name} with current tools. Need appropriate tool.`);
+                log(bot, `Pathfinding stopped: Cannot break ${targetBlock.name} with current tools.`);
                 bot.pathfinder.stop();
                 bot.stopDigging();
             }
         }
-        // Check tool durability while pathfinding
-        if (bot.heldItem && isToolLowDurability(bot.heldItem)) {
-            log(bot, `Warning: ${bot.heldItem.name} is about to break!`);
-        }
     };
-
+    
     const progressInterval = setInterval(checkDigProgress, 1000);
-
+    
     try {
-        // Final approach to exact destination
         await goToGoal(bot, new pf.goals.GoalNear(x, y, z, min_distance));
         clearInterval(progressInterval);
-        if (sprint) {
-            bot.setControlState('sprint', false);
-        }
         const distance = bot.entity.position.distanceTo(new Vec3(x, y, z));
         if (distance <= min_distance+1) {
             log(bot, `You have reached at ${x}, ${y}, ${z}.`);
@@ -2296,9 +1230,6 @@ export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
     } catch (err) {
         log(bot, `Pathfinding stopped: ${err.message}.`);
         clearInterval(progressInterval);
-        if (sprint) {
-            bot.setControlState('sprint', false);
-        }
         return false;
     }
 }
@@ -2314,9 +1245,10 @@ export async function goToNearestBlock(bot, blockType,  min_distance=2, range=64
      * @example
      * await skills.goToNearestBlock(bot, "oak_log", 64, 2);
      * **/
-    if (range > CONSTANTS.MAX_SEARCH_RANGE) {
-        log(bot, `Maximum search range capped at ${CONSTANTS.MAX_SEARCH_RANGE}.`);
-        range = CONSTANTS.MAX_SEARCH_RANGE;
+    const MAX_RANGE = 512;
+    if (range > MAX_RANGE) {
+        log(bot, `Maximum search range capped at ${MAX_RANGE}. `);
+        range = MAX_RANGE;
     }
     let block = null;
     if (blockType === 'water' || blockType === 'lava') {
@@ -2369,14 +1301,6 @@ export async function goToPlayer(bot, username, distance=3) {
      * @example
      * await skills.goToPlayer(bot, "player");
      **/
-    // Resolve player name with fuzzy matching
-    const resolvedName = resolvePlayerName(bot, username);
-    if (!resolvedName) {
-        log(bot, `Could not find player "${username}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`);
-        return false;
-    }
-    username = resolvedName;
-    
     if (bot.username === username) {
         log(bot, `You are already at ${username}.`);
         return true;
@@ -2413,22 +1337,12 @@ export async function followPlayer(bot, username, distance=4) {
      * @example
      * await skills.followPlayer(bot, "player");
      **/
-    // Resolve player name with fuzzy matching
-    const resolvedName = resolvePlayerName(bot, username);
-    if (!resolvedName) {
-        log(bot, `Could not find player "${username}". Nearby players: ${Object.keys(bot.players).filter(n => n !== bot.username).join(', ') || 'none'}`);
+    let player = bot.players[username].entity
+    if (!player)
         return false;
-    }
-    username = resolvedName;
-    
-    let playerObj = bot.players[username];
-    if (!playerObj || !playerObj.entity) {
-        console.log(`Player ${username} not found or has no entity`);
-        return false;
-    }
-    let player = playerObj.entity;
 
-    const move = createSafeMovements(bot);
+    const move = new pf.Movements(bot);
+    move.digCost = 10;
     bot.pathfinder.setMovements(move);
     let doorCheckInterval = startDoorInterval(bot);
 
@@ -2733,87 +1647,6 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
         log(bot, `Planted ${seedType} at x:${x.toFixed(1)}, y:${y.toFixed(1)}, z:${z.toFixed(1)}.`);
     }
     return true;
-}
-
-export async function fillBucket(bot, liquidType = 'water') {
-    /**
-     * Fill an empty bucket with water or lava from the nearest source.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} liquidType, the type of liquid to collect ('water' or 'lava'). Defaults to 'water'.
-     * @returns {Promise<boolean>} true if the bucket was filled, false otherwise.
-     * @example
-     * await skills.fillBucket(bot, 'water');
-     * await skills.fillBucket(bot, 'lava');
-     **/
-    // Validate liquid type
-    if (liquidType !== 'water' && liquidType !== 'lava') {
-        log(bot, `Invalid liquid type: ${liquidType}. Use 'water' or 'lava'.`);
-        return false;
-    }
-    
-    // Check for empty bucket
-    const bucket = bot.inventory.items().find(item => item.name === 'bucket');
-    if (!bucket) {
-        log(bot, `You don't have an empty bucket to fill.`);
-        return false;
-    }
-    
-    // Find all liquid source blocks within range
-    const liquidBlocks = bot.findBlocks({
-        matching: block => block.name === liquidType && block.metadata === 0, // metadata 0 = source block
-        maxDistance: 32,
-        count: 100 // Get multiple candidates
-    });
-    
-    if (!liquidBlocks || liquidBlocks.length === 0) {
-        log(bot, `No ${liquidType} source found within 32 blocks.`);
-        return false;
-    }
-    
-    // Priority: closest Y level first, then horizontal distance
-    const botY = bot.entity.position.y;
-    const botPos = bot.entity.position;
-    
-    liquidBlocks.sort((a, b) => {
-        const yDiffA = Math.abs(a.y - botY);
-        const yDiffB = Math.abs(b.y - botY);
-        
-        // If Y difference is significantly different (more than 2 blocks), prioritize by Y
-        if (Math.abs(yDiffA - yDiffB) > 2) {
-            return yDiffA - yDiffB;
-        }
-        
-        // Otherwise, sort by horizontal distance
-        const horizDistA = Math.sqrt(Math.pow(a.x - botPos.x, 2) + Math.pow(a.z - botPos.z, 2));
-        const horizDistB = Math.sqrt(Math.pow(b.x - botPos.x, 2) + Math.pow(b.z - botPos.z, 2));
-        return horizDistA - horizDistB;
-    });
-    
-    const liquidBlock = bot.blockAt(liquidBlocks[0]);
-    
-    if (!liquidBlock) {
-        log(bot, `No ${liquidType} source found within 32 blocks.`);
-        return false;
-    }
-    
-    // Move closer if needed
-    if (bot.entity.position.distanceTo(liquidBlock.position) > 4.5) {
-        bot.pathfinder.setMovements(new pf.Movements(bot));
-        await goToGoal(bot, new pf.goals.GoalNear(liquidBlock.position.x, liquidBlock.position.y, liquidBlock.position.z, 3));
-    }
-    
-    // Equip the bucket
-    await equip(bot, 'bucket');
-    
-    // Use bucket on liquid
-    try {
-        await bot.activateBlock(liquidBlock);
-        log(bot, `Filled bucket with ${liquidType}. You now have ${liquidType}_bucket.`);
-        return true;
-    } catch (err) {
-        log(bot, `Failed to fill bucket: ${err.message}`);
-        return false;
-    }
 }
 
 export async function activateNearestBlock(bot, type) {

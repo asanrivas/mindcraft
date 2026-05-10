@@ -10,7 +10,6 @@
   <a href="https://discord.gg/mp73p35dzC">Discord Support</a> | 
   <a href="https://www.youtube.com/watch?v=gRotoL8P8D8">Video Tutorial</a> | 
   <a href="https://kolbynottingham.com/mindcraft/">Blog Post</a> | 
-  <a href="https://github.com/users/kolbytn/projects/1">Contributor TODO</a> | 
   <a href="https://mindcraft-minecollab.github.io/index.html">Paper Website</a> | 
   <a href="https://github.com/mindcraft-bots/mindcraft/blob/main/minecollab.md">MineCollab</a>
 </p>
@@ -21,12 +20,14 @@ Do not connect this bot to public servers with coding enabled. This project allo
 # Getting Started
 ## Requirements
 
-- [Minecraft Java Edition](https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc) (up to v1.21.6, recommend v1.21.6)
-- [Node.js Installed](https://nodejs.org/) (at least v18)
+- [Minecraft Java Edition](https://www.minecraft.net/en-us/store/minecraft-java-bedrock-edition-pc) (up to v1.21.11, recommend v1.21.6)
+- [Node.js Installed](https://nodejs.org/) (Node v18 or v20 LTS recommended. Node v24+ may cause issues with native dependencies)
 - At least one API key from a supported API provider. See [supported APIs](#model-customization). OpenAI is the default.
 
 > [!Important]
 > If installing node on windows, ensure you check `Automatically install the necessary tools`
+>
+> If you encounter `npm install` errors on macOS, see the [FAQ](FAQ.md#common-issues) for troubleshooting native module build issues
 
 ## Install and Run
 
@@ -190,7 +191,7 @@ To use different accounts, Mindcraft will connect with the account that the Mine
 
 ## Tasks
 
-Tasks automatically start the bot with a prompt and a goal item to aquire or blueprint to construct. To run a simple task that involves collecting 4 oak_logs run 
+Tasks automatically start the bot with a prompt and a goal item to acquire or blueprint to construct. To run a simple task that involves collecting 4 oak_logs run 
 
 `node main.js --task_path tasks/basic/single_agent.json --task_id gather_oak_logs`
 
@@ -231,11 +232,11 @@ If you want more optimization and automatic launching of the minecraft world, yo
 If you intend to `allow_insecure_coding`, it is a good idea to run the app in a docker container to reduce risks of running unknown code. This is strongly recommended before connecting to remote servers, although still does not guarantee complete safety.
 
 ```bash
-docker run -i -t --rm -v $(pwd):/app -w /app -p 3000-3003:3000-3003 node:18 node main.js
+docker build -t mindcraft . && docker run --rm --add-host=host.docker.internal:host-gateway -p 8080:8080 -p 3000-3003:3000-3003 -e SETTINGS_JSON='{"auto_open_ui":false,"profiles":["./profiles/gemini.json"],"host":"host.docker.internal"}' --volume ./keys.json:/app/keys.json --name mindcraft mindcraft
 ```
 or simply
 ```bash
-docker-compose up
+docker-compose up --build
 ```
 
 When running in docker, if you want the bot to join your local minecraft server, you have to use a special host address `host.docker.internal` to call your localhost from inside your docker container. Put this into your [settings.js](settings.js):
@@ -291,14 +292,14 @@ Bot profiles are json files (such as `andy.json`) that define:
 
 ## Model Specifications
 
-LLM models can be specified simply as `"model": "gpt-4o"`, or more specifically with `"{api}/{model}"`, like `"openrouter/google/gemini-2.5-pro"`. See all supported APIs [here](#model-customization).
+LLM models can be specified simply as `"model": "gpt-5.4"`, or more specifically with `"{api}/{model}"`, like `"openrouter/google/gemini-2.5-pro"`. See all supported APIs [here](#model-customization).
 
 The `model` field can be a string or an object. A model object must specify an `api`, and optionally a `model`, `url`, and additional `params`. You can also use different models/providers for chatting, coding, vision, embedding, and voice synthesis. See the example below.
 
 ```json
 "model": {
   "api": "openai",
-  "model": "gpt-4o",
+  "model": "gpt-5.4",
   "url": "https://api.openai.com/v1/",
   "params": {
     "max_tokens": 1000,
@@ -307,18 +308,18 @@ The `model` field can be a string or an object. A model object must specify an `
 },
 "code_model": {
   "api": "openai",
-  "model": "gpt-4",
+  "model": "gpt-5.4-mini",
   "url": "https://api.openai.com/v1/"
 },
 "vision_model": {
   "api": "openai",
-  "model": "gpt-4o",
+  "model": "gpt-5.4",
   "url": "https://api.openai.com/v1/"
 },
 "embedding": {
   "api": "openai",
   "url": "https://api.openai.com/v1/",
-  "model": "text-embedding-ada-002"
+  "model": "text-embedding-3-small"
 },
 "speak_model": "openai/tts-1/echo"
 ```
@@ -369,3 +370,9 @@ This work is published in the paper [Collaborating Action by Action: A Multi-age
   url = {https://arxiv.org/abs/2504.17950},
 }
 ```
+
+## Contributors
+
+Thanks to everyone who has submitted issues on and off Github, made suggestions, and generally helped make this a better project.
+
+![Contributors](https://contrib.rocks/image?repo=mindcraft-bots/mindcraft)

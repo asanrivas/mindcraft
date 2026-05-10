@@ -62,6 +62,14 @@ if (process.env.NUM_EXAMPLES) {
 if (process.env.LOG_ALL) {
     settings.log_all_prompts = process.env.LOG_ALL;
 }
+if (process.env.SETTINGS_JSON) {
+    try {
+        Object.assign(settings, JSON.parse(process.env.SETTINGS_JSON));
+    } catch (err) {
+        console.error("Failed to parse environment variable for SETTINGS_JSON:", err);
+    }
+}
+
 
 (async () => {
     await Mindcraft.init(false, settings.mindserver_port, settings.auto_open_ui);

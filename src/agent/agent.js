@@ -16,19 +16,29 @@ import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
-import { LocalClassifier } from './local_classifier.js';
-import { LocalEmbedding } from '../models/local_embedding.js';
+import { log, validateNameFormat, handleDisconnection } from './connection_handler.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
         this.last_sender = null;
         this.count_id = count_id;
-        
-        // Initialize components with more detailed error handling
+        this._disconnectHandled = false;
+
+        // Initialize components
         this.actions = new ActionManager(this);
         this.prompter = new Prompter(this, settings.profile);
-        this.name = this.prompter.getName();
+        this.name = (this.prompter.getName() || '').trim();
         console.log(`Initializing agent ${this.name}...`);
+        
+        // Validate Name Format
+        // connection_handler now ensures the message has [LoginGuard] prefix
+        const nameCheck = validateNameFormat(this.name);
+        if (!nameCheck.success) {
+            log(this.name, nameCheck.msg);
+            process.exit(1);
+            return;
+        }
+        
         this.history = new History(this);
         this.coder = new Coder(this);
         this.npc = new NPCContoller(this);
@@ -36,24 +46,6 @@ export class Agent {
         this.self_prompter = new SelfPrompter(this);
         convoManager.initAgent(this);
         await this.prompter.initExamples();
-        
-        // Initialize local classifier if enabled
-        if (settings.use_local_embeddings) {
-            try {
-                const embeddingModel = new LocalEmbedding(settings.local_embedding_model);
-                this.localClassifier = new LocalClassifier(embeddingModel);
-                // Initialize in background (don't block startup)
-                this.localClassifier.init().catch(err => {
-                    console.warn(`[Agent] Failed to initialize local classifier: ${err.message}`);
-                    this.localClassifier = null;
-                });
-            } catch (error) {
-                console.warn(`[Agent] Local classifier disabled: ${error.message}`);
-                this.localClassifier = null;
-            }
-        } else {
-            this.localClassifier = null;
-        }
 
         // load mem first before doing task
         let save_data = null;
@@ -72,25 +64,31 @@ export class Agent {
 
         console.log(this.name, 'logging into minecraft...');
         this.bot = initBot(this.name);
+        
+        // Connection Handler
+        const onDisconnect = (event, reason) => {
+            if (this._disconnectHandled) return;
+            this._disconnectHandled = true;
 
-        initModes(this);
-
-        // Handle protocol errors more gracefully
+            // Log and Analyze
+            // handleDisconnection handles logging to console and server
+            const { type } = handleDisconnection(this.name, reason);
+     
+            process.exit(1);
+        };
+        
+        // Bind events
+        this.bot.once('kicked', (reason) => onDisconnect('Kicked', reason));
+        this.bot.once('end', (reason) => onDisconnect('Disconnected', reason));
         this.bot.on('error', (err) => {
-            if (err.message && err.message.includes('PartialReadError')) {
-                console.error(`${this.name}: Protocol error detected. This typically means:`);
-                console.error('  1. Version mismatch between client and server');
-                console.error('  2. Server is sending malformed packets');
-                console.error('  3. Network connection issue');
-                console.error(`Current version setting: ${settings.minecraft_version}`);
-                console.error(`Server version: ${this.bot.version}`);
-                console.error('\nTrying to recover by reconnecting in 5 seconds...');
-                setTimeout(() => {
-                    this.bot.quit();
-                    process.exit(1);
-                }, 5000);
+            if (String(err).includes('Duplicate') || String(err).includes('ECONNREFUSED')) {
+                 onDisconnect('Error', err);
+            } else {
+                 log(this.name, `[LoginGuard] Connection Error: ${String(err)}`);
             }
         });
+
+        initModes(this);
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
@@ -104,8 +102,9 @@ export class Agent {
         });
 		const spawnTimeoutDuration = settings.spawn_timeout;
         const spawnTimeout = setTimeout(() => {
-            console.error(`Bot has not spawned after ${spawnTimeoutDuration} seconds. Exiting.`);
-            process.exit(0);
+            const msg = `Bot has not spawned after ${spawnTimeoutDuration} seconds. Exiting.`;
+            log(this.name, msg);
+            process.exit(1);
         }, spawnTimeoutDuration * 1000);
         this.bot.once('spawn', async () => {
             try {
@@ -297,89 +296,6 @@ export class Agent {
         message = await handleEnglishTranslation(message);
         console.log('received message from', source, ':', message);
 
-        // Try local classification before LLM (only for user messages, not system/self-prompt)
-        // Skip for complex structure requests (contain dimensions like "4x4") - let LLM handle those
-        const isComplexStructure = /\d+x\d+/.test(message.toLowerCase());
-        if (!self_prompt && !from_other_bot && this.localClassifier && settings.use_local_embeddings && !isComplexStructure) {
-            try {
-                const classification = await this.localClassifier.classify(message, source);
-                if (classification) {
-                    if (classification.type === 'command' && classification.confidence >= (settings.local_intent_threshold || 0.75)) {
-                        // High confidence command match - execute directly
-                        console.log(`[LocalClassifier] Matched command: ${classification.command} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`);
-                        this.history.add(source, message);
-                        
-                        // Build command string with extracted args
-                        let commandStr = classification.command;
-                        if (classification.args && classification.args.length > 0) {
-                            // Format args: strings in quotes, numbers as-is
-                            const argsStr = classification.args.map(arg => {
-                                // Check if it's a number
-                                if (/^-?\d+(\.\d+)?$/.test(arg)) {
-                                    return arg;
-                                }
-                                return `"${arg}"`;
-                            }).join(', ');
-                            commandStr = `${classification.command}(${argsStr})`;
-                        }
-                        
-                        // Check if command requires args but we didn't extract any
-                        const { getCommand } = await import('./commands/index.js');
-                        const cmd = getCommand(classification.command);
-                        const requiredArgs = cmd && cmd.params ? Object.keys(cmd.params).length : 0;
-                        const extractedArgs = classification.args ? classification.args.length : 0;
-                        
-                        if (requiredArgs > 0 && extractedArgs === 0) {
-                            console.log(`[LocalClassifier] Command ${classification.command} requires ${requiredArgs} args but none extracted, falling back to LLM`);
-                            // Fall through to LLM - don't execute incomplete command
-                        } else {
-                            // Execute the command
-                            this.history.add(this.name, commandStr);
-                            const execute_res = await executeCommand(this, commandStr);
-                            if (execute_res) {
-                                this.history.add('system', execute_res);
-                                this.routeResponse(source, execute_res);
-                            }
-                            this.history.save();
-                            return true;
-                        }
-                    } else if (classification.type === 'simple' && classification.confidence >= (settings.local_intent_threshold * 0.9 || 0.68)) {
-                        // Simple intent match - handle directly
-                        console.log(`[LocalClassifier] Matched simple intent: ${classification.intent} (confidence: ${(classification.confidence * 100).toFixed(0)}%)`);
-                        
-                        if (classification.intent === 'yes') {
-                            this.history.add(source, message);
-                            this.history.add(this.name, 'Yes, I understand.');
-                            this.routeResponse(source, 'Yes, I understand.');
-                            this.history.save();
-                            return true;
-                        } else if (classification.intent === 'no') {
-                            this.history.add(source, message);
-                            this.history.add(this.name, 'No, I understand.');
-                            this.routeResponse(source, 'No, I understand.');
-                            this.history.save();
-                            return true;
-                        } else if (classification.intent === 'help') {
-                            // Let LLM handle help requests (they need context)
-                            // Fall through to normal flow
-                        } else if (classification.intent === 'stop') {
-                            // Execute stop command
-                            this.history.add(source, message);
-                            const execute_res = await executeCommand(this, '!stop');
-                            if (execute_res) {
-                                this.history.add('system', execute_res);
-                                this.routeResponse(source, execute_res);
-                            }
-                            this.history.save();
-                            return true;
-                        }
-                    }
-                }
-            } catch (error) {
-                console.warn(`[Agent] Local classification failed: ${error.message}, falling back to LLM`);
-            }
-        }
-
         const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up || convoManager.responseScheduledFor(source);
         
         let behavior_log = this.bot.modes.flushBehaviorLog().trim();
@@ -539,17 +455,22 @@ export class Agent {
         this.bot.on('error' , (err) => {
             console.error('Error event!', err);
         });
+        // Use connection handler for runtime disconnects
         this.bot.on('end', (reason) => {
-            console.warn('Bot disconnected! Killing agent process.', reason)
-            this.cleanKill('Bot disconnected! Killing agent process.');
+            if (!this._disconnectHandled) {
+                const { msg } = handleDisconnection(this.name, reason);
+                this.cleanKill(msg);
+            }
         });
         this.bot.on('death', () => {
             this.actions.cancelResume();
             this.actions.stop();
         });
         this.bot.on('kicked', (reason) => {
-            console.warn('Bot kicked!', reason);
-            this.cleanKill('Bot kicked! Killing agent process.');
+            if (!this._disconnectHandled) {
+                const { msg } = handleDisconnection(this.name, reason);
+                this.cleanKill(msg);
+            }
         });
         this.bot.on('messagestr', async (message, _, jsonMsg) => {
             if (jsonMsg.translate && jsonMsg.translate.startsWith('death') && message.startsWith(this.name)) {
@@ -558,7 +479,7 @@ export class Agent {
                 this.memory_bank.rememberPlace('last_death_position', death_pos.x, death_pos.y, death_pos.z);
                 let death_pos_text = null;
                 if (death_pos) {
-                    death_pos_text = `x: ${death_pos.x.toFixed(2)}, y: ${death_pos.y.toFixed(2)}, z: ${death_pos.x.toFixed(2)}`;
+                    death_pos_text = `x: ${death_pos.x.toFixed(2)}, y: ${death_pos.y.toFixed(2)}, z: ${death_pos.z.toFixed(2)}`;
                 }
                 let dimention = this.bot.game.dimension;
                 this.handleMessage('system', `You died at position ${death_pos_text || "unknown"} in the ${dimention} dimension with the final message: '${message}'. Your place of death is saved as 'last_death_position' if you want to return. Previous actions were stopped and you have respawned.`);

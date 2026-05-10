@@ -8,7 +8,7 @@ import { plugin as collectblock } from 'mineflayer-collectblock';
 import { plugin as autoEat } from 'mineflayer-auto-eat';
 import plugin from 'mineflayer-armor-manager';
 const armorManager = plugin;
-let mc_version = null; // Will be set dynamically in initBot()
+let mc_version = settings.minecraft_version;
 let mcdata = null;
 let Item = null;
 
@@ -51,43 +51,69 @@ export const WOOL_COLORS = [
     'black'
 ]
 
-// Entities that should NEVER be attacked - safety net in addition to isHostile() whitelist
-export const FRIENDLY_ENTITIES = [
-    'villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot',
-    'horse', 'donkey', 'mule', 'llama', 'panda', 'fox', 'ocelot', 'rabbit',
-    'sheep', 'cow', 'pig', 'chicken', 'bee', 'turtle', 'axolotl', 'frog',
-    'goat', 'camel', 'sniffer', 'armadillo', 'strider', 'mooshroom'
-];
-
-/**
- * Check if an entity is friendly and should never be attacked
- * @param {Entity} entity - the entity to check
- * @returns {boolean} true if the entity is friendly
- */
-export function isFriendly(entity) {
-    if (!entity || !entity.name) return false;
-    const entityName = entity.name.toLowerCase();
-    return FRIENDLY_ENTITIES.some(name => entityName.includes(name));
-}
 
 export function initBot(username) {
-    // Read version dynamically from settings (set by mindcraft.js after server detection)
-    const configuredVersion = settings.minecraft_version;
-
     const options = {
         username: username,
         host: settings.host,
         port: settings.port,
         auth: settings.auth,
-        version: configuredVersion,
+        version: mc_version,
+        checkTimeoutInterval: 60000,  // 60s keep-alive check (default 30s) — reduces disconnects on slow servers
     }
-    if (!configuredVersion || configuredVersion === "auto") {
+    if (!mc_version || mc_version === "auto") {
         delete options.version;
     }
 
-    console.log(`[mcdata] Creating bot with version: ${options.version || 'auto-detect'}`)
-
     const bot = createBot(options);
+
+    // Throttle position packets to avoid kicks on Paper/Spigot servers
+    // Paper enforces stricter packet rate limits than vanilla, causing ECONNRESET
+    // when mineflayer sends position updates faster than 50ms apart
+    let lastPositionUpdate = 0;
+    let pendingPositionPacket = null;
+    const POSITION_THROTTLE_MS = 50;
+    const originalWrite = bot._client.write.bind(bot._client);
+    bot._client.write = function(name, data) {
+        if (name === 'position' || name === 'position_look' || name === 'look') {
+            const now = Date.now();
+            if (now - lastPositionUpdate < POSITION_THROTTLE_MS) {
+                // Queue this packet so the last position update is never lost
+                if (!pendingPositionPacket) {
+                    pendingPositionPacket = setTimeout(() => {
+                        pendingPositionPacket = null;
+                        lastPositionUpdate = Date.now();
+                        originalWrite(name, data);
+                    }, POSITION_THROTTLE_MS - (now - lastPositionUpdate));
+                }
+                return;
+            }
+            lastPositionUpdate = now;
+            if (pendingPositionPacket) {
+                clearTimeout(pendingPositionPacket);
+                pendingPositionPacket = null;
+            }
+        }
+        return originalWrite(name, data);
+    };
+
+    // Suppress PartialReadError for non-critical packets
+    // Paper servers sometimes send packets that node-minecraft-protocol
+    // can't fully parse (scoreboard, resource_pack, custom_payload, etc.)
+    // These errors crash the bot but the packets aren't needed for gameplay
+    const originalEmit = bot._client.emit.bind(bot._client);
+    bot._client.emit = function(event, ...args) {
+        if (event === 'error' && args[0]) {
+            const err = args[0];
+            const errStr = err instanceof Error ? err.message : String(err);
+            if (errStr.includes('PartialReadError')) {
+                console.warn('[mcdata] Suppressed PartialReadError:', errStr.substring(0, 120));
+                return true; // Swallow the error
+            }
+        }
+        return originalEmit(event, ...args);
+    };
+
     bot.loadPlugin(pathfinder);
     bot.loadPlugin(pvp);
     bot.loadPlugin(collectblock);
@@ -103,16 +129,6 @@ export function initBot(username) {
         Item = prismarine_items(mc_version);
     });
 
-    // Add error handlers for protocol parsing errors
-    bot.on('error', (err) => {
-        if (err.message && err.message.includes('PartialReadError')) {
-            console.error('Protocol parsing error - this may indicate a version mismatch or server issue:', err.message);
-            console.error('Tip: Try specifying a specific minecraft version in settings.js instead of "auto"');
-        } else {
-            console.error('Bot error:', err);
-        }
-    });
-
     return bot;
 }
 
@@ -124,23 +140,7 @@ export function isHuntable(mob) {
 
 export function isHostile(mob) {
     if (!mob || !mob.name) return false;
-    // Explicit list of hostile mobs to avoid attacking friendly mobs like allays, bees, wolves, cats, etc.
-    const hostileMobs = [
-        'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'enderman', 'witch',
-        'slime', 'magma_cube', 'blaze', 'ghast', 'wither_skeleton', 'stray', 'husk',
-        'drowned', 'phantom', 'pillager', 'ravager', 'vindicator', 'evoker', 'vex',
-        'guardian', 'elder_guardian', 'shulker', 'hoglin', 'zoglin', 'piglin_brute',
-        'warden', 'breeze', 'bogged', 'silverfish', 'endermite',
-        // Boss mobs
-        'ender_dragon', 'wither'
-    ];
-    // Note: zombified_piglin, piglin, wolf, bee, iron_golem, polar_bear are neutral (only attack when provoked)
-    // They are NOT included to prevent Andy from attacking first and provoking them
-    const mobName = mob.name.toLowerCase();
-    return hostileMobs.includes(mobName) ||
-           mobName.includes('zombie') && !mobName.includes('zombified_piglin') ||
-           mobName.includes('skeleton') ||
-           mobName.includes('illager');
+    return  (mob.type === 'mob' || mob.type === 'hostile') && mob.name !== 'iron_golem' && mob.name !== 'snow_golem';
 }
 
 // blocks that don't work with collectBlock, need to be manually collected
@@ -463,25 +463,8 @@ export function initializeLoopingItems() {
  */
 export function getDetailedCraftingPlan(targetItem, count = 1, current_inventory = {}) {
     initializeLoopingItems();
-    if (!targetItem) {
-        return "Error: No item name provided. Usage: !getCraftingPlan(\"item_name\", quantity)";
-    }
-    if (count <= 0) {
-        return `Error: Quantity must be a positive number, got ${count}. Usage: !getCraftingPlan("${targetItem}", 1)`;
-    }
-    if (!getItemId(targetItem)) {
-        // Try to suggest similar valid item names
-        let suggestion = "";
-        if (targetItem === "boat") {
-            suggestion = " Did you mean 'oak_boat', 'spruce_boat', 'birch_boat', 'jungle_boat', 'acacia_boat', or 'dark_oak_boat'?";
-        } else if (targetItem.includes("plank") && !targetItem.endsWith("s")) {
-            suggestion = ` Did you mean '${targetItem}s'?`;
-        } else if (targetItem === "wood" || targetItem === "log") {
-            suggestion = " Did you mean 'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', or 'dark_oak_log'?";
-        } else if (targetItem === "pick" || targetItem === "pickaxe") {
-            suggestion = " Did you mean 'wooden_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'diamond_pickaxe', or 'netherite_pickaxe'?";
-        }
-        return `Error: '${targetItem}' is not a valid Minecraft item name.${suggestion} Use exact item names like 'oak_planks', 'iron_ingot', 'diamond_sword'.`;
+    if (!targetItem || count <= 0 || !getItemId(targetItem)) {
+        return "Invalid input. Please provide a valid item name and positive count.";
     }
 
     if (isBaseItem(targetItem)) {

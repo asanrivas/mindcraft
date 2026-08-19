@@ -1001,7 +1001,8 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
 
 export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
     /**
-     * Fill a rectangular area with blocks, optionally multiple levels high.
+     * Fill a rectangular area with blocks using an efficient snake pattern.
+     * Bot walks along rows, placing blocks while standing on previously placed blocks.
      * Builds from bottom to top for structural support. Resumable if interrupted.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
      * @param {string} blockType, the type of block to place (e.g., "dirt", "cobblestone").
@@ -1037,84 +1038,50 @@ export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
     let totalPlaced = 0;
     let totalSkipped = 0;
 
-    // Build level by level, bottom to top (for structural support)
+    // Build level by level, bottom to top
     for (let level = 0; level < buildHeight; level++) {
         const currentY = baseY + level;
 
-        // Helper to check if a position has an adjacent solid block to build off
-        function hasAdjacentSolid(x, z) {
-            const directions = [
-                [0, -1, 0], [0, 1, 0],  // below, above
-                [-1, 0, 0], [1, 0, 0],  // west, east
-                [0, 0, -1], [0, 0, 1]   // north, south
-            ];
-            for (const [dx, dy, dz] of directions) {
-                const block = bot.blockAt(new Vec3(x + dx, currentY + dy, z + dz));
-                if (block && !emptyBlocks.includes(block.name)) {
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        // Scan this level
-        let needsPlacing = new Set();
-        let alreadyDone = 0;
-
-        for (let x = minX; x <= maxX; x++) {
-            for (let z = minZ; z <= maxZ; z++) {
-                const existingBlock = bot.blockAt(new Vec3(x, currentY, z));
-                if (existingBlock && existingBlock.name === blockType) {
-                    alreadyDone++;
-                } else if (existingBlock && !emptyBlocks.includes(existingBlock.name)) {
-                    alreadyDone++; // Different solid block, skip
-                } else {
-                    needsPlacing.add(`${x},${z}`);
-                }
-            }
-        }
-
-        totalSkipped += alreadyDone;
-
-        if (needsPlacing.size === 0) {
-            if (buildHeight > 1) {
-                log(bot, `Level ${level + 1}/${buildHeight} (y=${currentY}): already complete.`);
-            }
-            continue;
-        }
-
         if (buildHeight > 1) {
-            log(bot, `Level ${level + 1}/${buildHeight} (y=${currentY}): placing ${needsPlacing.size} blocks...`);
+            log(bot, `Level ${level + 1}/${buildHeight} (y=${currentY}): starting...`);
         }
 
         let levelPlaced = 0;
-        let lastPlacedCount = -1;
+        let levelSkipped = 0;
 
-        // Multiple passes for blocks needing support
-        while (needsPlacing.size > 0 && levelPlaced !== lastPlacedCount) {
-            lastPlacedCount = levelPlaced;
+        // Snake pattern: alternate direction each row for efficient walking
+        for (let x = minX; x <= maxX; x++) {
+            const rowIndex = x - minX;
+            const goingForward = rowIndex % 2 === 0;
 
-            const positionsThisPass = Array.from(needsPlacing).map(key => {
-                const [x, z] = key.split(',').map(Number);
-                return { x, z, key, hasSupport: hasAdjacentSolid(x, z) };
-            }).sort((a, b) => (b.hasSupport ? 1 : 0) - (a.hasSupport ? 1 : 0));
+            // Determine z iteration direction
+            const zStart = goingForward ? minZ : maxZ;
+            const zEnd = goingForward ? maxZ : minZ;
+            const zStep = goingForward ? 1 : -1;
 
-            for (const pos of positionsThisPass) {
+            for (let z = zStart; goingForward ? z <= zEnd : z >= zEnd; z += zStep) {
                 if (bot.interrupt_code) {
                     log(bot, `Fill interrupted at level ${level + 1}. Placed ${totalPlaced + levelPlaced}/${totalBlocks} total. Run same command to resume.`);
                     return totalPlaced + levelPlaced;
                 }
 
-                if (!pos.hasSupport && needsPlacing.size > 1) {
+                // Check if block already exists
+                const existingBlock = bot.blockAt(new Vec3(x, currentY, z));
+                if (existingBlock && existingBlock.name === blockType) {
+                    levelSkipped++;
+                    continue;
+                }
+                if (existingBlock && !emptyBlocks.includes(existingBlock.name)) {
+                    levelSkipped++; // Different solid block, skip
                     continue;
                 }
 
-                const success = await placeBlock(bot, blockType, pos.x, currentY, pos.z, 'bottom');
+                // Place the block
+                const success = await placeBlock(bot, blockType, x, currentY, z, 'bottom');
                 if (success) {
                     levelPlaced++;
-                    needsPlacing.delete(pos.key);
 
-                    if ((totalPlaced + levelPlaced) % 20 === 0) {
+                    if ((totalPlaced + levelPlaced) % 50 === 0) {
                         log(bot, `Progress: ${totalPlaced + levelPlaced}/${totalBlocks} blocks placed.`);
                     }
                 }
@@ -1122,9 +1089,10 @@ export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
         }
 
         totalPlaced += levelPlaced;
+        totalSkipped += levelSkipped;
 
-        if (needsPlacing.size > 0) {
-            log(bot, `Level ${level + 1}: Could not place ${needsPlacing.size} blocks (no support).`);
+        if (buildHeight > 1 && levelPlaced > 0) {
+            log(bot, `Level ${level + 1}/${buildHeight} complete: ${levelPlaced} placed, ${levelSkipped} skipped.`);
         }
     }
 
@@ -1541,16 +1509,28 @@ export async function putInChest(bot, itemName, num=-1, x=null, y=null, z=null) 
     const isDoubleChest = totalSlots === 54;
     const chestType = isDoubleChest ? 'double chest' : container.name;
 
+    // Pre-check: does the chest have room for this item?
+    // If not, skip the deposit() call entirely — avoids 20s updateSlot timeout on full chests
+    const chestContents = openedContainer.containerItems();
+    const occupiedSlots = chestContents.length;
+    const emptySlots = totalSlots - occupiedSlots;
+    const existingStacks = chestContents.filter(i => i.name === itemName);
+    const hasPartialStack = existingStacks.some(i => i.count < i.stackSize);
+    if (emptySlots === 0 && !hasPartialStack) {
+        await openedContainer.close();
+        log(bot, `Could not deposit any ${itemName}. The ${chestType} is full.`);
+        return false;
+    }
+
     // Count items BEFORE deposit
     const countBefore = matchingItems.reduce((sum, item) => sum + item.count, 0);
     const itemType = matchingItems[0].type;
 
     try {
-        // Deposit all at once - mineflayer now waits for slot updates on chest windows
+        // Deposit all at once - mineflayer waits for slot updates on chest windows
         await openedContainer.deposit(itemType, null, to_put);
     } catch (err) {
         // "destination full" = chest filled mid-deposit, some items may have been deposited already
-        // "Can't find X in slots" = item gone (shouldn't happen since we checked)
         console.log(`[putInChest] Deposit threw: ${err.message}`);
     }
 
@@ -1770,6 +1750,18 @@ export async function depositAllItems(bot, excludeItems = [], x=null, y=null, z=
         const isDoubleChest = totalSlots === 54;
         const chestType = isDoubleChest ? 'double chest' : container.name;
 
+        // If double chest, mark the partner half as used too so we don't revisit it
+        if (isDoubleChest) {
+            const pos = container.position;
+            for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+                const neighbor = bot.blockAt({x: pos.x+dx, y: pos.y, z: pos.z+dz});
+                if (neighbor && neighbor.name === 'chest') {
+                    usedContainers.add(`${pos.x+dx},${pos.y},${pos.z+dz}`);
+                    break;
+                }
+            }
+        }
+
         let deposited = 0;
         let chestFull = false;
 
@@ -1779,6 +1771,16 @@ export async function depositAllItems(bot, excludeItems = [], x=null, y=null, z=
             // Skip equipped armor
             if (item.name.includes('helmet') || item.name.includes('chestplate') ||
                 item.name.includes('leggings') || item.name.includes('boots')) continue;
+
+            // Pre-check capacity to avoid 20s updateSlot timeout on full chests
+            const chestContents = openedContainer.containerItems();
+            const emptySlots = totalSlots - chestContents.length;
+            const hasPartialStack = chestContents.some(i => i.name === item.name && i.count < i.stackSize);
+            if (emptySlots === 0 && !hasPartialStack) {
+                log(bot, `${chestType} at (${container.position.x}, ${container.position.y}, ${container.position.z}) is full, trying next chest...`);
+                chestFull = true;
+                break;
+            }
 
             try {
                 await openedContainer.deposit(item.type, null, item.count);

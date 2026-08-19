@@ -1,0 +1,402 @@
+/**
+ * Layout and Responsive Grid Styles for Mindcraft UI
+ * Mobile-first responsive design - Minecraft Theme Adjusted
+ */
+
+/* ===== Container ===== */
+
+.container {
+    width: 100%;
+    margin-left: auto;
+    margin-right: auto;
+    padding-left: var(--space-lg);
+    padding-right: var(--space-lg);
+}
+
+@media (min-width: 640px) {
+    .container {
+        max-width: 640px;
+    }
+}
+
+@media (min-width: 768px) {
+    .container {
+        max-width: 768px;
+    }
+}
+
+@media (min-width: 1024px) {
+    .container {
+        max-width: 1024px;
+    }
+}
+
+@media (min-width: 1280px) {
+    .container {
+        max-width: 1280px;
+    }
+}
+
+@media (min-width: 1536px) {
+    .container {
+        max-width: 1536px;
+    }
+}
+
+/* ===== Page Header ===== */
+
+.page-header {
+    margin-bottom: var(--space-xl);
+    padding: var(--space-lg) var(--space-sm);
+    /* No border bottom, handled by title style */
+}
+
+.page-title-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-lg);
+}
+
+@media (min-width: 768px) {
+    .page-title-row {
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+    }
+}
+
+.page-title {
+    font-size: var(--font-size-3xl);
+    font-weight: 400; /* Pixel font usually 400 */
+    margin: 0;
+    color: #ffffff;
+    text-shadow: 4px 4px 0px #000;
+}
+
+.page-title-left {
+    display: flex;
+    align-items: center;
+    gap: var(--space-lg);
+}
+
+.page-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+}
+
+/* ===== Agents Grid ===== */
+
+.agents-grid {
+    display: grid;
+    gap: var(--space-2xl);
+    width: 100%;
+    align-items: start;
+}
+
+/* Mobile: 1 column */
+@media (max-width: 1023px) {
+    .agents-grid {
+        grid-template-columns: 1fr;
+        gap: var(--space-xl);
+    }
+}
+
+/* Tablet and Desktop: max 2 columns for better readability */
+@media (min-width: 1024px) {
+    .agents-grid {
+        grid-template-columns: repeat(auto-fit, minmax(600px, 1fr)); /* Slightly narrower minmax */
+        max-width: 1800px;
+        margin: 0 auto;
+    }
+}
+
+/* ===== Agent Card Grid Layout ===== */
+
+.agent-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: var(--space-md);
+}
+
+@media (min-width: 640px) {
+    .agent-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+}
+
+@media (min-width: 768px) {
+    .agent-grid {
+        grid-template-columns: repeat(4, 1fr);
+    }
+}
+
+@media (min-width: 1024px) {
+    .agent-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (min-width: 1280px) {
+    .agent-grid {
+        grid-template-columns: repeat(3, 1fr);
+    }
+}
+
+/* ===== Charts Grid ===== */
+
+.charts-grid {
+    display: grid;
+    gap: var(--space-xl);
+    padding: var(--space-md);
+    background: #444; /* Dark background for charts area */
+    border: 2px solid #000;
+    box-shadow: inset 2px 2px 0 #333;
+}
+
+/* Mobile: 1 column */
+@media (max-width: 767px) {
+    .charts-grid {
+        grid-template-columns: 1fr;
+    }
+}
+
+/* Tablet and up: 2 columns */
+@media (min-width: 768px) {
+    .charts-grid {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+/* Full-width chart items (like position map) */
+.chart-full-width {
+    grid-column: 1 / -1;
+}
+
+/* ===== Controls Row ===== */
+
+.controls-row {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-md);
+}
+
+@media (min-width: 640px) {
+    .controls-row {
+        flex-direction: row;
+        align-items: center;
+    }
+}
+
+.controls-input-group {
+    display: flex;
+    gap: var(--space-md);
+    flex: 1;
+}
+
+.controls-input {
+    flex: 1;
+    min-width: 0;
+}
+
+.controls-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-md);
+}
+
+@media (max-width: 639px) {
+    .controls-buttons {
+        width: 100%;
+    }
+
+    .controls-buttons .btn {
+        flex: 1;
+        min-width: 0;
+    }
+}
+
+/* ===== Settings Form Grid ===== */
+
+.settings-form {
+    display: grid;
+    gap: var(--space-md);
+}
+
+@media (min-width: 768px) {
+    .settings-form {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (min-width: 1024px) {
+    .settings-form {
+        grid-template-columns: repeat(3, 1fr);
+    }
+}
+
+/* ===== Responsive Utilities ===== */
+
+/* Hide on mobile */
+.hide-mobile {
+    display: none;
+}
+
+@media (min-width: 640px) {
+    .hide-mobile {
+        display: block;
+    }
+}
+
+/* Hide on desktop */
+.hide-desktop {
+    display: block;
+}
+
+@media (min-width: 640px) {
+    .hide-desktop {
+        display: none;
+    }
+}
+
+/* Show only on mobile */
+.mobile-only {
+    display: block;
+}
+
+@media (min-width: 640px) {
+    .mobile-only {
+        display: none;
+    }
+}
+
+/* Show only on tablet and up */
+.tablet-up {
+    display: none;
+}
+
+@media (min-width: 768px) {
+    .tablet-up {
+        display: block;
+    }
+}
+
+/* ===== Responsive Text Sizes ===== */
+
+.responsive-title {
+    font-size: var(--font-size-xl);
+}
+
+@media (min-width: 640px) {
+    .responsive-title {
+        font-size: var(--font-size-2xl);
+    }
+}
+
+@media (min-width: 768px) {
+    .responsive-title {
+        font-size: var(--font-size-3xl);
+    }
+}
+
+/* ===== Aspect Ratios ===== */
+
+.aspect-video {
+    aspect-ratio: 16/9;
+}
+
+.aspect-square {
+    aspect-ratio: 1/1;
+}
+
+.aspect-wide {
+    aspect-ratio: 2/1;
+}
+
+/* ===== Spacing Utilities ===== */
+
+.space-y-sm > * + * {
+    margin-top: var(--space-sm);
+}
+
+.space-y-md > * + * {
+    margin-top: var(--space-md);
+}
+
+.space-y-lg > * + * {
+    margin-top: var(--space-lg);
+}
+
+.space-y-xl > * + * {
+    margin-top: var(--space-xl);
+}
+
+/* ===== Mobile-Specific Adjustments ===== */
+
+@media (max-width: 639px) {
+    /* Larger touch targets on mobile */
+    .btn {
+        min-height: 44px;
+        min-width: 44px;
+    }
+
+    /* Stack modal footer on mobile */
+    .modal-footer {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .modal-footer-actions {
+        width: 100%;
+    }
+
+    .modal-footer-actions .btn {
+        flex: 1;
+    }
+
+    /* Full width modals on mobile */
+    .modal {
+        width: 95vw;
+        height: 90vh;
+    }
+
+    /* Reduce padding on mobile */
+    .agent-card-header,
+    .agent-card-body,
+    .agent-card-footer {
+        padding: var(--space-lg);
+    }
+
+    /* Stack page footer buttons */
+    .page-footer {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .page-footer > div {
+        width: 100%;
+    }
+
+    .page-footer button {
+        width: 100%;
+    }
+}
+
+/* ===== Print Styles ===== */
+
+@media print {
+    .page-footer,
+    .controls-row,
+    .btn,
+    .modal-backdrop {
+        display: none !important;
+    }
+
+    .agent-card {
+        page-break-inside: avoid;
+    }
+
+    body {
+        padding-bottom: 0;
+    }
+}

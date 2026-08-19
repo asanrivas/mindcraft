@@ -1,0 +1,140 @@
+/**
+ * CSS Custom Properties for Mindcraft UI
+ * Defines color palette and theme variables (Minecraft Theme)
+ */
+
+@font-face {
+    font-family: 'Monocraft';
+    src: url('https://cdn.jsdelivr.net/gh/IdreesInc/Monocraft@main/dist/Monocraft-ttf/Monocraft.ttf') format('truetype');
+    font-weight: normal;
+    font-style: normal;
+}
+
+:root {
+    /* Minecraft Palette */
+    --mc-bg: #C6C6C6;
+    --mc-dark-grey: #8B8B8B;
+    --mc-shadow: #555555;
+    --mc-highlight: #FFFFFF;
+    --mc-black: #1E1E1E;
+    
+    /* Color palette - Minecraft Theme */
+    --color-background: #121212; /* Dark background behind windows */
+    --color-card: var(--mc-bg);
+    --color-card-hover: #D0D0D0;
+    --color-border: #3a3a3a;
+    
+    /* Input colors */
+    --color-input: #000000;
+    --color-input-border: #A0A0A0;
+    --color-input-text: #ffffff;
+
+    /* Text colors */
+    --color-foreground: #3f3f3f; /* Dark text for light grey bg */
+    --color-muted-foreground: #555555;
+    --color-secondary-text: #404040;
+
+    /* Accent colors */
+    --color-primary: #339933; /* Minecraft Green */
+    --color-primary-hover: #267f26;
+    --color-accent: #3b82f6; 
+    --color-accent-hover: #2563eb;
+    --color-destructive: #ff3333;
+    --color-destructive-hover: #cc0000;
+    --color-warning: #ffaa00;
+    --color-muted: #6e6e6e;
+    --color-muted-hover: #595959;
+
+    /* Status colors */
+    --color-online: #55FF55;
+    --color-offline: #FF5555;
+    --color-joining: #FFAA00;
+
+    /* Spacing */
+    --space-xs: 4px;
+    --space-sm: 8px;
+    --space-md: 12px;
+    --space-lg: 16px;
+    --space-xl: 20px;
+    --space-2xl: 24px;
+
+    /* Border radius - NO RADIUS IN MINECRAFT */
+    --radius-sm: 0px;
+    --radius-md: 0px;
+    --radius-lg: 0px;
+
+    /* Shadows - Pixelated style */
+    --shadow-sm: 4px 4px 0px rgba(0, 0, 0, 0.5);
+    --shadow-md: 6px 6px 0px rgba(0, 0, 0, 0.5);
+    --shadow-lg: 8px 8px 0px rgba(0, 0, 0, 0.5);
+    --shadow-xl: 10px 10px 0px rgba(0, 0, 0, 0.4);
+
+    /* Transitions */
+    --transition-fast: 0s;
+    --transition-base: 0s; /* Instant transitions for retro feel */
+    --transition-slow: 0s;
+
+    /* Z-index layers */
+    --z-base: 1;
+    --z-dropdown: 100;
+    --z-sticky: 200;
+    --z-fixed: 300;
+    --z-modal-backdrop: 1000;
+    --z-modal: 1010;
+    --z-popover: 1020;
+    --z-tooltip: 1030;
+
+    /* Typography */
+    --font-family: 'Monocraft', monospace;
+    --font-size-xs: 0.85rem;
+    --font-size-sm: 1rem;
+    --font-size-base: 1.1rem;
+    --font-size-lg: 1.25rem;
+    --font-size-xl: 1.5rem;
+    --font-size-2xl: 1.75rem;
+    --font-size-3xl: 2.25rem;
+
+    /* Glassmorphism -> Solid Minecraft Panel */
+    --glass-background: var(--mc-bg);
+    --glass-border: transparent; 
+    --glass-blur: none;
+}
+
+/* Global reset and base styles */
+* {
+    box-sizing: border-box;
+    image-rendering: pixelated; /* Ensure images stay sharp */
+}
+
+body {
+    margin: 0;
+    padding: var(--space-xl);
+    padding-bottom: var(--space-2xl);
+    font-family: var(--font-family);
+    background: var(--color-background);
+    /* Simple grid pattern background */
+    background-image: 
+        linear-gradient(rgba(255, 255, 255, 0.05) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255, 255, 255, 0.05) 1px, transparent 1px);
+    background-size: 20px 20px;
+    color: #ffffff; /* Default body text white on dark bg */
+    line-height: 1.4;
+    -webkit-font-smoothing: none; /* Disable anti-aliasing for crisp text */
+}
+
+h1, h2, h3, h4, h5, h6 {
+    margin: 0;
+    font-weight: 400; /* Pixel fonts usually don't need bold */
+    text-transform: uppercase;
+    text-shadow: 2px 2px 0px #000;
+}
+
+button {
+    font-family: inherit;
+    cursor: pointer;
+}
+
+input, textarea, select {
+    font-family: inherit;
+}
+

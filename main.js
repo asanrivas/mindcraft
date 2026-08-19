@@ -5,6 +5,8 @@ import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
 import { readFileSync } from 'fs';
 
+let mindserverInitialized = false;
+
 // Add timestamps to all console output
 const originalLog = console.log;
 const originalError = console.error;
@@ -145,13 +147,31 @@ async function waitForPlayers() {
 }
 
 async function startAgents() {
-    await Mindcraft.init(settings.mindserver_host_public || false, settings.mindserver_port, settings.auto_open_ui);
+    // Only initialize MindServer once
+    if (!mindserverInitialized) {
+        await Mindcraft.init(settings.mindserver_host_public || false, settings.mindserver_port, settings.auto_open_ui);
+        mindserverInitialized = true;
+    }
+
+    const exitPromises = [];
 
     for (let i = 0; i < settings.profiles.length; i++) {
         const profile = settings.profiles[i];
         const profile_json = JSON.parse(readFileSync(profile, 'utf8'));
         settings.profile = profile_json;
         await Mindcraft.createAgent(settings);
+
+        // Set up exit callback to detect when agent disconnects
+        const agentProcess = Mindcraft.getAgentProcess(profile_json.name);
+        if (agentProcess) {
+            const exitPromise = new Promise(resolve => {
+                agentProcess.onExit((code, signal) => {
+                    console.log(`[Auto-Login] Agent ${profile_json.name} exited cleanly (idle disconnect)`);
+                    resolve();
+                });
+            });
+            exitPromises.push(exitPromise);
+        }
 
         // Add delay between agents to allow spawn before next connection
         // Need longer delay because createAgent() returns before bot spawns
@@ -160,17 +180,28 @@ async function startAgents() {
             await new Promise(resolve => setTimeout(resolve, 15000));
         }
     }
+
+    // Return a promise that resolves when all agents exit cleanly
+    return Promise.all(exitPromises);
 }
 
 (async () => {
     const autoLoginEnabled = args.auto_login || settings.auto_login;
+
     if (autoLoginEnabled) {
         console.log(`[Auto-Login] Mode enabled. Check interval: ${checkInterval} minutes`);
         console.log(`[Auto-Login] Server: ${settings.host || 'localhost'}:${settings.port || 55916}`);
         console.log(`[Auto-Login] Profiles: ${settings.profiles.join(', ')}`);
         console.log('');
-        await waitForPlayers();
-    }
 
-    await startAgents();
+        // Continuous loop: wait for players -> start agents -> wait for exit -> repeat
+        while (true) {
+            await waitForPlayers();
+            await startAgents();
+            console.log(`[Auto-Login] All agents disconnected. Returning to player detection mode...`);
+        }
+    } else {
+        // Non-auto-login mode: just start agents once
+        await startAgents();
+    }
 })();

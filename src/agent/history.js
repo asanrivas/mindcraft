@@ -82,9 +82,9 @@ export class History {
         console.log("Storing memories...");
         this.memory = await this.agent.prompter.promptMemSaving(turns);
 
-        if (this.memory.length > 500) {
-            this.memory = this.memory.slice(0, 500);
-            this.memory += '...(Memory truncated to 500 chars. Compress it more next time)';
+        if (this.memory.length > 1000) {
+            this.memory = this.memory.slice(0, 1000);
+            this.memory += '...(truncated, compress more next time)';
         }
 
         console.log("Memory updated to: ", this.memory);

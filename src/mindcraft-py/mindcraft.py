@@ -7,6 +7,11 @@ import atexit
 import threading
 import sys
 import signal
+import shutil
+
+def get_runtime():
+    """Return 'bun' if available, otherwise 'node'."""
+    return "bun" if shutil.which("bun") else "node"
 
 class Mindcraft:
     def __init__(self):
@@ -29,7 +34,7 @@ class Mindcraft:
         node_script_path = os.path.abspath(os.path.join(os.path.dirname(__file__), 'init-mindcraft.js'))
         
         self.process = subprocess.Popen([
-            'node',
+            get_runtime(),
             node_script_path,
             '--mindserver_port', str(self.port)
         ], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)

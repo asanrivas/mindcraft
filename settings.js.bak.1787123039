@@ -1,7 +1,7 @@
 const settings = {
-    minecraft_version: "1.21.11", // forced to compatible version (1.21.11 server unsupported)
+    minecraft_version: "1.21.8", // forced to compatible version (1.21.11 server unsupported)
     host: "localhost", // or "localhost", "your.ip.address.here"
-    port: 25565, // set to -1 to automatically scan for open ports
+    port: 25566, // set to -1 to automatically scan for open ports
     auth: "offline", // or "microsoft"
 
     // the mindserver manages all agents and hosts the UI
@@ -68,11 +68,11 @@ const settings = {
     log_all_prompts: true, // log ALL prompts to file
 
     // Auto-login settings
-    auto_login: false, // wait for players before logging in (or use --auto_login flag)
+    auto_login: true, // wait for players before logging in (or use --auto_login flag)
     auto_login_interval: 5, // minutes between server checks for players
 
     // Idle disconnect settings
-    idle_disconnect_timeout: 0, // minutes of idle time before disconnecting (0 = disabled)
+    idle_disconnect_timeout: 30, // minutes of idle time before disconnecting (0 = disabled)
 };
 
 export default settings;

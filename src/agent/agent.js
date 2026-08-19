@@ -68,6 +68,12 @@ export class Agent {
         // Handle protocol errors more gracefully
         this.bot.on('error', (err) => {
             const errMsg = err.message || err.toString();
+
+            // Ignore parse errors - they happen with some chest interactions but aren't fatal
+            if (errMsg.includes('Parse error') || errMsg.includes('array size is abnormally large')) {
+                return; // Handled in the other error handler
+            }
+
             if (errMsg.includes('PartialReadError') || errMsg.includes('buffer end')) {
                 console.error(`${this.name}: Protocol error detected: ${errMsg}`);
                 console.error('This typically means network instability or server lag.');
@@ -601,9 +607,16 @@ export class Agent {
         });
         // Logging callbacks
         this.bot.on('error' , (err) => {
+            const errMsg = err.message || err.toString();
+
+            // Ignore parse errors - they happen with some chest interactions but aren't fatal
+            if (errMsg.includes('Parse error') || errMsg.includes('array size is abnormally large')) {
+                console.warn('[Protocol] Parse error (non-fatal, ignoring):', errMsg.split('\n')[0]);
+                return;
+            }
+
             console.error('Error event!', err);
             // Check for connection-related errors
-            const errMsg = err.message || err.toString();
             if (errMsg.includes('ECONNRESET') ||
                 errMsg.includes('ETIMEDOUT') ||
                 errMsg.includes('ENOTCONN') ||

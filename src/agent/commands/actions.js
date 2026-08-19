@@ -531,6 +531,71 @@ export const actionsList = [
         }, true, 600)  // resume=true allows resuming after interruption
     },
     {
+        name: '!serverFill',
+        description: 'FAST fill using server /fill command - places thousands of blocks INSTANTLY. Requires operator permissions. Use this for large builds instead of !fill.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "stone_bricks", "cobblestone").' },
+            'x1': { type: 'int', description: 'X coordinate of the first corner.' },
+            'y1': { type: 'int', description: 'Y coordinate of the first corner.' },
+            'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
+            'x2': { type: 'int', description: 'X coordinate of the second corner.' },
+            'y2': { type: 'int', description: 'Y coordinate of the second corner.' },
+            'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
+            'mode': { type: 'string', description: 'Fill mode: "replace" (default), "hollow", "outline", "destroy", or "keep".', optional: true }
+        },
+        perform: async (agent, blockType, x1, y1, z1, x2, y2, z2, mode = 'replace') => {
+            const validModes = ['replace', 'hollow', 'outline', 'destroy', 'keep'];
+            if (!validModes.includes(mode)) mode = 'replace';
+
+            const command = `/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} ${mode}`;
+            agent.bot.chat(command);
+
+            // Calculate approximate blocks
+            const dx = Math.abs(x2 - x1) + 1;
+            const dy = Math.abs(y2 - y1) + 1;
+            const dz = Math.abs(z2 - z1) + 1;
+            const totalBlocks = dx * dy * dz;
+
+            return `Server fill executed: ${totalBlocks} blocks of ${blockType} (${mode} mode). Command: ${command}`;
+        }
+    },
+    {
+        name: '!serverSummon',
+        description: 'INSTANT summon using server /summon command. Spawns entities immediately at specified location.',
+        params: {
+            'entityType': { type: 'string', description: 'The entity to summon (e.g., "villager", "iron_golem", "cow").' },
+            'x': { type: 'int', description: 'X coordinate to summon at.', optional: true },
+            'y': { type: 'int', description: 'Y coordinate to summon at.', optional: true },
+            'z': { type: 'int', description: 'Z coordinate to summon at.', optional: true }
+        },
+        perform: async (agent, entityType, x, y, z) => {
+            const pos = agent.bot.entity.position;
+            const spawnX = x !== undefined ? Math.floor(x) : Math.floor(pos.x);
+            const spawnY = y !== undefined ? Math.floor(y) : Math.floor(pos.y);
+            const spawnZ = z !== undefined ? Math.floor(z) : Math.floor(pos.z);
+
+            const command = `/summon ${entityType} ${spawnX} ${spawnY} ${spawnZ}`;
+            agent.bot.chat(command);
+
+            return `Summoned ${entityType} at (${spawnX}, ${spawnY}, ${spawnZ})`;
+        }
+    },
+    {
+        name: '!serverSetblock',
+        description: 'INSTANT setblock using server /setblock command. Places a single block immediately.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x': { type: 'int', description: 'X coordinate.' },
+            'y': { type: 'int', description: 'Y coordinate.' },
+            'z': { type: 'int', description: 'Z coordinate.' }
+        },
+        perform: async (agent, blockType, x, y, z) => {
+            const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}`;
+            agent.bot.chat(command);
+            return `Set block ${blockType} at (${x}, ${y}, ${z})`;
+        }
+    },
+    {
         name: '!plantTrees',
         description: 'Plant saplings in a grid pattern with specified spacing. Automatically detects ground height. Great for creating tree farms or forests.',
         params: {

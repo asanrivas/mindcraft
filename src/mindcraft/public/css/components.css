@@ -1,0 +1,476 @@
+/**
+ * Component Styles for Mindcraft UI
+ * Minecraft Theme - Retro, Pixelated, Beveled
+ */
+
+/* ===== Animations ===== */
+
+/* Minimized animations for retro feel */
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}
+
+@keyframes slideDown {
+    from { transform: translateY(-4px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+}
+
+/* ===== Agent Cards (Minecraft Windows) ===== */
+
+.agent-card {
+    background: var(--mc-bg);
+    border: 2px solid var(--mc-black);
+    box-shadow: inset 2px 2px 0px var(--mc-highlight), inset -2px -2px 0px var(--mc-shadow);
+    padding: 0; /* Content padding handled by children */
+    margin-bottom: var(--space-xl);
+    position: relative;
+    /* No radius */
+    border-radius: 0; 
+}
+
+.agent-card-header {
+    padding: var(--space-md) var(--space-lg);
+    background: var(--mc-bg); /* Same as body */
+    border-bottom: 2px solid var(--mc-shadow); /* Separator */
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    color: var(--color-foreground);
+}
+
+.page-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-md);
+}
+
+.agent-card-title {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    font-size: var(--font-size-xl);
+    font-weight: 400;
+    color: #404040; /* Dark grey text title */
+    text-shadow: 1px 1px 0px #fff;
+}
+
+.agent-card-body {
+    padding: var(--space-lg);
+}
+
+.agent-card-footer {
+    padding: var(--space-lg);
+    border-top: 2px solid var(--mc-highlight); /* Light separator for footer */
+    border-bottom: 2px solid var(--mc-shadow); /* Inner shadow effect */
+    background: #c0c0c0;
+}
+
+/* ===== Status Indicators ===== */
+
+.status-indicator {
+    width: 12px;
+    height: 12px;
+    background: #000;
+    border: 2px solid #000;
+    display: inline-block;
+    box-shadow: inset 2px 2px 0 #fff; /* Shiny effect */
+}
+
+.status-indicator.online {
+    background: var(--color-online);
+}
+
+.status-indicator.offline {
+    background: var(--color-offline);
+}
+
+.status-indicator.joining {
+    background: var(--color-joining);
+    animation: blink 1s step-end infinite;
+}
+
+/* ===== Buttons (Minecraft Style) ===== */
+
+.btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 2px solid var(--mc-black);
+    background: var(--mc-bg);
+    box-shadow: inset 2px 2px 0px var(--mc-highlight), inset -2px -2px 0px var(--mc-shadow);
+    color: #404040;
+    padding: 8px 16px;
+    font-family: inherit;
+    font-size: var(--font-size-base);
+    text-shadow: 1px 1px 0px #fff;
+    cursor: pointer;
+    position: relative;
+    user-select: none;
+}
+
+.btn:hover:not(:disabled) {
+    background: #D0D0D0; /* Slightly lighter */
+    box-shadow: inset 2px 2px 0px #FFF, inset -2px -2px 0px #606060; /* Slightly brighter highlight */
+}
+
+.btn:active:not(:disabled) {
+    background: #A0A0A0;
+    box-shadow: inset 2px 2px 0px var(--mc-shadow), inset -2px -2px 0px var(--mc-highlight); /* Inset look */
+    transform: translateY(2px);
+}
+
+.btn:disabled {
+    color: #808080;
+    text-shadow: 1px 1px 0px #e0e0e0;
+    cursor: default;
+    filter: brightness(0.9);
+}
+
+/* Button variants - mostly changes text/icon color in this theme, or bg tint */
+.btn-primary { color: #006600; }
+.btn-destructive { color: #8B0000; }
+.btn-accent { color: #0000AA; }
+
+/* Small buttons */
+.btn-sm {
+    padding: 4px 8px;
+    font-size: var(--font-size-sm);
+    border-width: 2px;
+}
+
+/* ===== Badges ===== */
+
+.badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    background: var(--mc-dark-grey);
+    border: 2px solid var(--mc-black);
+    color: #FFF;
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    text-shadow: 2px 2px 0 #000;
+}
+
+/* ===== Progress Bars (XP/Health Bar Style) ===== */
+
+.progress {
+    position: relative;
+    width: 100%;
+    height: 20px;
+    background: #555; /* Dark background */
+    border: 2px solid #000;
+    border-bottom-color: #FFF; /* Bevel inverse */
+    border-right-color: #FFF;
+    border-top-color: #333;
+    border-left-color: #333;
+}
+
+.progress-fill {
+    height: 100%;
+    background: var(--color-primary);
+    box-shadow: inset 0 2px 0 rgba(255,255,255,0.3), inset 0 -2px 0 rgba(0,0,0,0.3);
+}
+
+.progress-fill.health-low { background: #AA0000; }
+.progress-fill.health-medium { background: #FFAA00; }
+
+.progress-label {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: var(--font-size-xs);
+    color: #FFF;
+    text-shadow: 2px 2px 0 #000;
+}
+
+/* ===== Inputs (Minecraft Text Box) ===== */
+
+.input {
+    width: 100%;
+    padding: 10px;
+    background: #000;
+    border: 2px solid #A0A0A0; /* Highlight border */
+    border-top-color: #555;
+    border-left-color: #555;
+    border-bottom-color: #FFF;
+    border-right-color: #FFF;
+    color: #FFF;
+    font-family: inherit;
+    font-size: var(--font-size-base);
+}
+
+.input:focus {
+    outline: none;
+    background: #1a1a1a;
+    border-color: #FFF;
+}
+
+.input:disabled {
+    background: #333;
+    color: #888;
+}
+
+/* ===== Collapsible Sections ===== */
+
+.collapsible-trigger {
+    width: 100%;
+    padding: var(--space-md);
+    background: var(--mc-bg);
+    border: none;
+    border-top: 2px solid var(--mc-highlight);
+    border-bottom: 2px solid var(--mc-shadow);
+    color: #404040;
+    font-weight: 400;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    text-shadow: 1px 1px 0 #FFF;
+}
+
+.collapsible-trigger:hover {
+    background: #D0D0D0;
+}
+
+.collapsible-content {
+    max-height: 0;
+    overflow: hidden;
+    background: #B0B0B0; /* Slightly darker inside */
+    box-shadow: inset 0px 4px 4px rgba(0,0,0,0.2);
+}
+
+.collapsible-content.expanded {
+    max-height: 2000px;
+    border-bottom: 2px solid var(--mc-black);
+}
+
+/* ===== Charts & Stats ===== */
+
+.chart-container {
+    padding: var(--space-md);
+    background: #000;
+    border: 2px solid #555;
+    border-bottom-color: #FFF;
+    border-right-color: #FFF;
+    margin-bottom: var(--space-md);
+}
+
+.chart-title {
+    color: #FFF;
+    text-align: center;
+    margin-bottom: var(--space-sm);
+    text-transform: uppercase;
+}
+
+.stats-grid {
+    display: grid;
+    gap: var(--space-sm);
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+
+.stat-item {
+    padding: var(--space-sm);
+    background: #8B8B8B; /* Darker slot bg */
+    border: 2px solid #FFF; /* Highlight bottom/right */
+    border-top-color: #373737;
+    border-left-color: #373737;
+    border-bottom-color: #FFF;
+    border-right-color: #FFF;
+    color: #FFF;
+    display: flex;
+    flex-direction: column;
+    text-shadow: 2px 2px 0 #000;
+}
+
+.stat-label {
+    font-size: 0.8em;
+    color: #DDD;
+    margin-bottom: 4px;
+}
+
+.stat-value {
+    font-size: 1.1em;
+}
+
+/* ===== Inventory ===== */
+
+.inventory-section-content {
+    padding: var(--space-md);
+    background: var(--mc-bg);
+}
+
+.inventory-grid {
+    display: grid;
+    grid-template-columns: repeat(9, 1fr); /* Minecraft standard 9 columns */
+    gap: 4px;
+    background: var(--mc-bg);
+}
+
+.inventory-item {
+    aspect-ratio: 1;
+    background: #8B8B8B;
+    border: 2px solid #373737;
+    border-bottom-color: #FFF;
+    border-right-color: #FFF;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.8em;
+    color: #FFF;
+    text-shadow: 2px 2px 0 #000;
+    overflow: visible; /* Allow tooltip to overflow */
+    position: relative;
+    cursor: help;
+}
+
+.inventory-item:empty::before {
+    content: ''; 
+}
+
+.inventory-item img {
+    width: 80%;
+    height: 80%;
+    object-fit: contain;
+    image-rendering: pixelated;
+    display: block;
+}
+
+.inventory-item .count {
+    position: absolute;
+    bottom: 2px;
+    right: 2px;
+    font-size: 0.9em;
+    color: #FFF;
+    text-shadow: 2px 2px 0 #000;
+    font-weight: bold;
+    z-index: 1;
+}
+
+/* Minecraft Tooltip */
+.inventory-item[data-tooltip]:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: 100%;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(16, 0, 16, 0.95); /* Deep purple/black */
+    border: 2px solid #2d0a63; /* Purple border */
+    color: #FFF;
+    padding: 4px 8px;
+    z-index: 1000;
+    white-space: nowrap;
+    pointer-events: none;
+    font-size: 0.8rem;
+    text-shadow: 2px 2px 0 #000;
+    box-shadow: 4px 4px 4px rgba(0,0,0,0.5);
+    margin-bottom: 6px;
+    border-radius: 4px;
+}
+
+/* ===== Modal ===== */
+
+.modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.8);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: var(--z-modal-backdrop);
+}
+
+.modal-backdrop.open {
+    display: flex;
+}
+
+.modal {
+    background: var(--mc-bg);
+    border: 4px solid var(--mc-black);
+    /* Double border effect for modal */
+    box-shadow: inset 4px 4px 0px var(--mc-highlight), inset -4px -4px 0px var(--mc-shadow);
+    width: 80vw;
+    max-width: 800px;
+    height: 80vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.modal-header {
+    padding: var(--space-lg);
+    border-bottom: 2px solid var(--mc-shadow);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+.modal-title {
+    color: #404040;
+    text-shadow: 1px 1px 0 #FFF;
+}
+
+.modal-body {
+    padding: var(--space-lg);
+    flex: 1;
+    overflow-y: auto;
+    background: #C0C0C0;
+}
+
+.modal-footer {
+    padding: var(--space-lg);
+    border-top: 2px solid var(--mc-highlight);
+    background: var(--mc-bg);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+}
+
+/* ===== Message History ===== */
+
+.message-history-container {
+    background: rgba(0,0,0,0.5);
+    border: 2px solid #FFF; /* Chat box style */
+    border-top-color: #373737;
+    border-left-color: #373737;
+    padding: 8px;
+    color: #FFF;
+    text-shadow: 2px 2px 0 #000;
+    font-family: monospace;
+}
+
+.message-history-item {
+    padding: 2px 0;
+    border-bottom: none;
+}
+
+.message-time {
+    color: #AAA;
+    margin-right: 8px;
+}
+
+/* ===== Viewer Container ===== */
+
+.viewer-container {
+    width: 100%;
+    aspect-ratio: 16/9;
+    background: #000;
+    border: 4px solid #222;
+    margin-bottom: 0; /* Tight fit */
+}
+
+/* ===== Setting Form ===== */
+
+.setting-wrapper {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-sm);
+    background: transparent;
+    border-bottom: 1px dashed #777;
+    margin-bottom: 4px;
+}
+

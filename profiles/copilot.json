@@ -1,0 +1,18 @@
+{
+    "name": "andy",
+    "model": {
+        "api": "copilot-mem0",
+        "model": "tiered",
+        "params": {
+            "max_tokens": 4096,
+            "tier_router": "claude-haiku-4.5",
+            "tier_simple": "claude-haiku-4.5",
+            "tier_medium": "claude-sonnet-4.5",
+            "tier_hard":   "claude-opus-4.5"
+        }
+    },
+    "embedding": {
+        "api": "local-embed"
+    },
+    "use_memory_saving": true
+}

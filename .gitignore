@@ -1,5 +1,7 @@
 .vscode/
 .idea/
+.claude/
+.cursor/
 node_modules/
 package-lock.json
 code_records/
@@ -28,3 +30,7 @@ tasks/construction_tasks/train/**
 server_data*
 **/.DS_Store
 src/mindcraft-py/__pycache__/
+docs/
+logs/
+maps/
+minedmap_output/

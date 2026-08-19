@@ -2,6 +2,39 @@ import net from 'net';
 import mc from 'minecraft-protocol';
 
 /**
+ * Gets the player count from a Minecraft server.
+ * @param {string} ip - The server IP address.
+ * @param {number} port - The server port.
+ * @param {number} timeout - The connection timeout in ms.
+ * @returns {Promise<Object|null>} - Player info {online, max, sample} or null if failed.
+ */
+export async function getPlayerCount(ip, port, timeout = 3000) {
+    return new Promise((resolve) => {
+        let timeoutId = setTimeout(() => {
+            resolve(null);
+        }, timeout);
+
+        mc.ping({
+            host: ip,
+            port
+        }, (err, response) => {
+            clearTimeout(timeoutId);
+
+            if (err) {
+                return resolve(null);
+            }
+
+            const players = response?.players || { online: 0, max: 0, sample: [] };
+            resolve({
+                online: players.online || 0,
+                max: players.max || 0,
+                sample: players.sample || []
+            });
+        });
+    });
+}
+
+/**
  * Scans the IP address for Minecraft LAN servers and collects their info.
  * @param {string} ip - The IP address to scan.
  * @param {number} port - The port to check.
@@ -135,20 +168,26 @@ export async function getServer(host, port, version) {
 
     serverString = `(Host: ${server.host}, Port: ${server.port}, Version: ${server.version})`;
 
-    if (version === "auto") 
+    if (version === "auto")
         serverVersion = server.version;
     else
         serverVersion = version;
+
     // Server version unsupported / mismatch
-    const isSupported = mc.supportedVersions.some(v => 
-        serverVersion === v || (serverVersion.startsWith(v) && serverVersion.charAt(v.length) === '.')
-    ); // Checks version or parent version (e.g. if 1.7 is supported then 1.7.2 will be allowed)
-     if (!isSupported)
-        throw new Error(`MC server was found ${serverString}, but version is unsupported. Supported versions are: ${mc.supportedVersions.join(", ")}.`);
-    else if (version !== "auto" && server.version !== version)
-        throw new Error(`MC server was found ${serverString}, but version is incorrect. Expected ${version}, but found ${server.version}. Check the server version in settings.js.`);
-    else
+    if (mc.supportedVersions.indexOf(serverVersion) === -1) {
+        // If server version unsupported and we have a specific version set, use that
+        if (version !== "auto" && mc.supportedVersions.indexOf(version) !== -1) {
+            console.warn(`warn: Server version ${server.version} unsupported, forcing ${version}...`);
+            server.version = version;
+        } else {
+            throw new Error(`MC server was found ${serverString}, but version is unsupported. Supported versions are: ${mc.supportedVersions.join(", ")}.`);
+        }
+    } else if (version !== "auto" && server.version !== version) {
+        console.warn(`warn: Server reports ${server.version}, but forcing ${version} as configured.`);
+        server.version = version;
+    } else {
         console.log(`MC server found. ${serverString}`);
+    }
 
     return server;
 }

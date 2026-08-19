@@ -149,8 +149,16 @@ export class Letta {
 
     /**
      * Initialize the local embedding model (singleton pattern)
+     * Skip if using Letta's server-side embeddings (letta/*)
      */
     async initEmbedding() {
+        // Letta handles embeddings server-side for letta/* models
+        if (this.embeddingModel.startsWith('letta/')) {
+            console.log(`[Letta] Embeddings handled by Letta server: ${this.embeddingModel}`);
+            this.embedder = 'letta-server';
+            return;
+        }
+
         if (this.embedder) return;
 
         if (this.embeddingInitializing) {
@@ -251,5 +259,100 @@ export class Letta {
         }
 
         return response.ok;
+    }
+
+    /**
+     * Store an event memory in Letta's archival memory
+     * @param {string} eventType - Type of event (death, player_join, player_leave, inventory, location)
+     * @param {string} description - Human-readable description of the event
+     * @param {Object} data - Additional event data
+     * @param {string} userId - User ID to associate with (default: 'system')
+     */
+    async storeEventMemory(eventType, description, data = {}, userId = 'system') {
+        if (!this.agentId) return;
+
+        try {
+            const timestamp = new Date().toISOString();
+            const memoryContent = `[${eventType.toUpperCase()}] [${timestamp}] ${description}`;
+
+            // Store in Letta's archival memory
+            const response = await fetch(
+                `${this.url}/v1/agents/${this.agentId}/archival`,
+                {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        content: memoryContent,
+                        metadata: {
+                            event_type: eventType,
+                            user_id: userId,
+                            timestamp: timestamp,
+                            ...data
+                        }
+                    }),
+                }
+            );
+
+            if (response.ok) {
+                console.log(`[Letta] Event stored: ${eventType} - ${description}`);
+            } else {
+                const error = await response.text();
+                console.warn(`[Letta] Event memory failed: ${error}`);
+            }
+        } catch (err) {
+            console.warn(`[Letta] Event memory failed: ${err.message}`);
+        }
+    }
+
+    /**
+     * Convenience methods for common events
+     */
+    async recordDeath(location, cause = 'unknown') {
+        const { x, y, z } = location;
+        await this.storeEventMemory(
+            'death',
+            `Bot died at x:${Math.round(x)} y:${Math.round(y)} z:${Math.round(z)}. Cause: ${cause}`,
+            { location: { x, y, z }, cause }
+        );
+    }
+
+    async recordPlayerJoin(playerName) {
+        await this.storeEventMemory(
+            'player_join',
+            `${playerName} joined the game`,
+            { player: playerName },
+            playerName
+        );
+    }
+
+    async recordPlayerLeave(playerName) {
+        await this.storeEventMemory(
+            'player_leave',
+            `${playerName} left the game`,
+            { player: playerName },
+            playerName
+        );
+    }
+
+    async recordInventoryChange(action, items) {
+        const itemStr = items.map(i => `${i.count}x ${i.name}`).join(', ');
+        await this.storeEventMemory(
+            'inventory',
+            `${action}: ${itemStr}`,
+            { action, items }
+        );
+    }
+
+    async recordImportantLocation(name, location, description = '') {
+        const { x, y, z } = location;
+        await this.storeEventMemory(
+            'location',
+            `Important location "${name}" at x:${Math.round(x)} y:${Math.round(y)} z:${Math.round(z)}. ${description}`,
+            { name, location: { x, y, z }, description }
+        );
+    }
+
+    async close() {
+        // Nothing to close
     }
 }

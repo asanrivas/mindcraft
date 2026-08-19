@@ -8,7 +8,7 @@ import { plugin as collectblock } from 'mineflayer-collectblock';
 import { plugin as autoEat } from 'mineflayer-auto-eat';
 import plugin from 'mineflayer-armor-manager';
 const armorManager = plugin;
-let mc_version = settings.minecraft_version;
+let mc_version = null; // Will be set dynamically in initBot()
 let mcdata = null;
 let Item = null;
 
@@ -51,19 +51,42 @@ export const WOOL_COLORS = [
     'black'
 ]
 
+// Entities that should NEVER be attacked - safety net in addition to isHostile() whitelist
+export const FRIENDLY_ENTITIES = [
+    'villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot',
+    'horse', 'donkey', 'mule', 'llama', 'panda', 'fox', 'ocelot', 'rabbit',
+    'sheep', 'cow', 'pig', 'chicken', 'bee', 'turtle', 'axolotl', 'frog',
+    'goat', 'camel', 'sniffer', 'armadillo', 'strider', 'mooshroom'
+];
+
+/**
+ * Check if an entity is friendly and should never be attacked
+ * @param {Entity} entity - the entity to check
+ * @returns {boolean} true if the entity is friendly
+ */
+export function isFriendly(entity) {
+    if (!entity || !entity.name) return false;
+    const entityName = entity.name.toLowerCase();
+    return FRIENDLY_ENTITIES.some(name => entityName.includes(name));
+}
 
 export function initBot(username) {
+    // Read version dynamically from settings (set by mindcraft.js after server detection)
+    const configuredVersion = settings.minecraft_version;
+
     const options = {
         username: username,
         host: settings.host,
         port: settings.port,
         auth: settings.auth,
-        version: mc_version,
+        version: configuredVersion,
         checkTimeoutInterval: 60000,  // 60s keep-alive check (default 30s) — reduces disconnects on slow servers
     }
-    if (!mc_version || mc_version === "auto") {
+    if (!configuredVersion || configuredVersion === "auto") {
         delete options.version;
     }
+
+    console.log(`[mcdata] Creating bot with version: ${options.version || 'auto-detect'}`)
 
     const bot = createBot(options);
 
@@ -140,7 +163,23 @@ export function isHuntable(mob) {
 
 export function isHostile(mob) {
     if (!mob || !mob.name) return false;
-    return  (mob.type === 'mob' || mob.type === 'hostile') && mob.name !== 'iron_golem' && mob.name !== 'snow_golem';
+    // Explicit list of hostile mobs to avoid attacking friendly mobs like allays, bees, wolves, cats, etc.
+    const hostileMobs = [
+        'zombie', 'skeleton', 'creeper', 'spider', 'cave_spider', 'enderman', 'witch',
+        'slime', 'magma_cube', 'blaze', 'ghast', 'wither_skeleton', 'stray', 'husk',
+        'drowned', 'phantom', 'pillager', 'ravager', 'vindicator', 'evoker', 'vex',
+        'guardian', 'elder_guardian', 'shulker', 'hoglin', 'zoglin', 'piglin_brute',
+        'warden', 'breeze', 'bogged', 'silverfish', 'endermite',
+        // Boss mobs
+        'ender_dragon', 'wither'
+    ];
+    // Note: zombified_piglin, piglin, wolf, bee, iron_golem, polar_bear are neutral (only attack when provoked)
+    // They are NOT included to prevent Andy from attacking first and provoking them
+    const mobName = mob.name.toLowerCase();
+    return hostileMobs.includes(mobName) ||
+           mobName.includes('zombie') && !mobName.includes('zombified_piglin') ||
+           mobName.includes('skeleton') ||
+           mobName.includes('illager');
 }
 
 // blocks that don't work with collectBlock, need to be manually collected
@@ -463,8 +502,25 @@ export function initializeLoopingItems() {
  */
 export function getDetailedCraftingPlan(targetItem, count = 1, current_inventory = {}) {
     initializeLoopingItems();
-    if (!targetItem || count <= 0 || !getItemId(targetItem)) {
-        return "Invalid input. Please provide a valid item name and positive count.";
+    if (!targetItem) {
+        return "Error: No item name provided. Usage: !getCraftingPlan(\"item_name\", quantity)";
+    }
+    if (count <= 0) {
+        return `Error: Quantity must be a positive number, got ${count}. Usage: !getCraftingPlan("${targetItem}", 1)`;
+    }
+    if (!getItemId(targetItem)) {
+        // Try to suggest similar valid item names
+        let suggestion = "";
+        if (targetItem === "boat") {
+            suggestion = " Did you mean 'oak_boat', 'spruce_boat', 'birch_boat', 'jungle_boat', 'acacia_boat', or 'dark_oak_boat'?";
+        } else if (targetItem.includes("plank") && !targetItem.endsWith("s")) {
+            suggestion = ` Did you mean '${targetItem}s'?`;
+        } else if (targetItem === "wood" || targetItem === "log") {
+            suggestion = " Did you mean 'oak_log', 'spruce_log', 'birch_log', 'jungle_log', 'acacia_log', or 'dark_oak_log'?";
+        } else if (targetItem === "pick" || targetItem === "pickaxe") {
+            suggestion = " Did you mean 'wooden_pickaxe', 'stone_pickaxe', 'iron_pickaxe', 'diamond_pickaxe', or 'netherite_pickaxe'?";
+        }
+        return `Error: '${targetItem}' is not a valid Minecraft item name.${suggestion} Use exact item names like 'oak_planks', 'iron_ingot', 'diamond_sword'.`;
     }
 
     if (isBaseItem(targetItem)) {

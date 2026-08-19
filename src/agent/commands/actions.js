@@ -183,7 +183,13 @@ export const actionsList = [
         perform: async function (agent, name) {
             const pos = agent.bot.entity.position;
             agent.memory_bank.rememberPlace(name, pos.x, pos.y, pos.z);
-            return `Location saved as "${name}".`;
+
+            // Also store in Mem0 with coordinates
+            if (agent.prompter?.chat_model?.recordImportantLocation) {
+                agent.prompter.chat_model.recordImportantLocation(name, pos, `Saved by player request`);
+            }
+
+            return `Location "${name}" saved at x:${Math.round(pos.x)} y:${Math.round(pos.y)} z:${Math.round(pos.z)}.`;
         }
     },
     {
@@ -228,46 +234,216 @@ export const actionsList = [
         })
     },
     {
-        name: '!putInChest',
-        description: 'Put the given item in the nearest storage container (chest, ender chest, shulker box, or barrel).',
+        name: '!chestPut',
+        description: 'Put the given item in a storage container. Uses nearest chest if no coordinates specified.',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the item to put in the container.' },
-            'num': { type: 'int', description: 'The number of items to put in the container.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of items to put in the container.', domain: [1, Number.MAX_SAFE_INTEGER] },
+            'x': { type: 'int', description: 'X coordinate of the chest. Optional - omit to use nearest chest.', optional: true },
+            'y': { type: 'int', description: 'Y coordinate of the chest. Optional.', optional: true },
+            'z': { type: 'int', description: 'Z coordinate of the chest. Optional.', optional: true }
         },
-        perform: runAsAction(async (agent, item_name, num) => {
-            await skills.putInChest(agent.bot, item_name, num);
+        perform: runAsAction(async (agent, item_name, num, x, y, z) => {
+            await skills.putInChest(agent.bot, item_name, num, x, y, z);
         })
     },
     {
-        name: '!takeFromChest',
-        description: 'Take the given items from the nearest storage container (chest, ender chest, shulker box, or barrel).',
+        name: '!chestTake',
+        description: 'Take items from a storage container. Uses nearest chest if no coordinates specified.',
         params: {
             'item_name': { type: 'ItemName', description: 'The name of the item to take.' },
-            'num': { type: 'int', description: 'The number of items to take.', domain: [1, Number.MAX_SAFE_INTEGER] }
+            'num': { type: 'int', description: 'The number of items to take.', domain: [1, Number.MAX_SAFE_INTEGER] },
+            'x': { type: 'int', description: 'X coordinate of the chest. Optional - omit to use nearest chest.', optional: true },
+            'y': { type: 'int', description: 'Y coordinate of the chest. Optional.', optional: true },
+            'z': { type: 'int', description: 'Z coordinate of the chest. Optional.', optional: true }
         },
-        perform: runAsAction(async (agent, item_name, num) => {
-            await skills.takeFromChest(agent.bot, item_name, num);
+        perform: runAsAction(async (agent, item_name, num, x, y, z) => {
+            await skills.takeFromChest(agent.bot, item_name, num, x, y, z);
         })
     },
     {
-        name: '!viewChest',
-        description: 'View the items/counts of the nearest storage container (chest, ender chest, shulker box, or barrel).',
-        params: { },
-        perform: runAsAction(async (agent) => {
-            await skills.viewChest(agent.bot);
-        })
-    },
-    {
-        name: '!depositAll',
-        description: 'Deposit ALL items from inventory into the nearest storage container. Keeps essential tools (pickaxe, sword, axe, shovel) by default.',
+        name: '!chestView',
+        description: 'View the items/counts of a storage container. Uses nearest chest if no coordinates specified.',
         params: {
-            'except': { type: 'string', description: 'Comma-separated list of items to keep (e.g., "torch,food,coal"). Optional.' }
+            'x': { type: 'int', description: 'X coordinate of the chest. Optional - omit to use nearest chest.', optional: true },
+            'y': { type: 'int', description: 'Y coordinate of the chest. Optional.', optional: true },
+            'z': { type: 'int', description: 'Z coordinate of the chest. Optional.', optional: true }
+        },
+        perform: runAsAction(async (agent, x, y, z) => {
+            await skills.viewChest(agent.bot, x, y, z);
+        })
+    },
+    {
+        name: '!chestDepositAll',
+        description: 'Deposit ALL items from inventory into a storage container. Keeps essential tools by default. Uses nearest chest if no coordinates specified.',
+        params: {
+            'except': { type: 'string', description: 'Comma-separated list of items to keep (e.g., "torch,food,coal"). Optional.', optional: true },
+            'x': { type: 'int', description: 'X coordinate of the chest. Optional - omit to use nearest chest.', optional: true },
+            'y': { type: 'int', description: 'Y coordinate of the chest. Optional.', optional: true },
+            'z': { type: 'int', description: 'Z coordinate of the chest. Optional.', optional: true }
+        },
+        perform: runAsAction(async (agent, except, x, y, z) => {
+            const excludeItems = except ? except.split(',').map(s => s.trim()) : [];
+            await skills.depositAllItems(agent.bot, excludeItems, x, y, z);
+        })
+    },
+    {
+        name: '!chestList',
+        description: 'List all storage containers (chests, barrels, shulker boxes) within range, sorted by distance.',
+        params: {
+            'range': { type: 'int', description: 'Search radius in blocks. Default 32.', optional: true, domain: [1, 128] }
+        },
+        perform: runAsAction(async (agent, range) => {
+            const searchRange = range || 32;
+            const containers = skills.listNearbyChests(agent.bot, searchRange);
+            if (containers.length === 0) {
+                skills.log(agent.bot, `No storage containers found within ${searchRange} blocks.`);
+                return;
+            }
+            skills.log(agent.bot, `Found ${containers.length} storage containers within ${searchRange} blocks:`);
+            for (const c of containers.slice(0, 10)) {
+                skills.log(agent.bot, `  ${c.type} at (${c.position.x}, ${c.position.y}, ${c.position.z}) - ${c.distance} blocks away`);
+            }
+            if (containers.length > 10) {
+                skills.log(agent.bot, `  ... and ${containers.length - 10} more`);
+            }
+        })
+    },
+    // ============= CHEST MASTER COMMANDS =============
+    {
+        name: '!chestName',
+        description: 'Give a friendly name to a chest at specific coordinates for easy access later (e.g., "ores", "food", "building").',
+        params: {
+            'name': { type: 'string', description: 'Friendly name for the chest (e.g., "ores", "food", "building", "dump").' },
+            'x': { type: 'int', description: 'X coordinate of the chest.' },
+            'y': { type: 'int', description: 'Y coordinate of the chest.' },
+            'z': { type: 'int', description: 'Z coordinate of the chest.' }
+        },
+        perform: runAsAction(async (agent, name, x, y, z) => {
+            const success = skills.nameChest(agent.bot, name, x, y, z);
+            // Store in Mem0 for semantic memory recall
+            if (success && agent.prompter?.chat_model?.recordImportantLocation) {
+                agent.prompter.chat_model.recordImportantLocation(
+                    `chest_${name}`,
+                    { x, y, z },
+                    `Named chest "${name}" for storing ${name} items`
+                );
+            }
+        })
+    },
+    {
+        name: '!chestListNamed',
+        description: 'List all named chests that have been saved.',
+        params: {},
+        perform: runAsAction(async (agent) => {
+            skills.listNamedChests(agent.bot);
+        })
+    },
+    {
+        name: '!chestForget',
+        description: 'Remove a named chest from memory.',
+        params: {
+            'name': { type: 'string', description: 'Name of the chest to forget.' }
+        },
+        perform: runAsAction(async (agent, name) => {
+            skills.forgetChest(agent.bot, name);
+        })
+    },
+    {
+        name: '!chestPutNamed',
+        description: 'Put items into a named chest.',
+        params: {
+            'chest_name': { type: 'string', description: 'Name of the chest to put items in.' },
+            'item_name': { type: 'ItemName', description: 'The item to put in the chest.' },
+            'num': { type: 'int', description: 'Number of items to put. Use -1 for all.', domain: [-1, Number.MAX_SAFE_INTEGER] }
+        },
+        perform: runAsAction(async (agent, chest_name, item_name, num) => {
+            await skills.putInNamedChest(agent.bot, chest_name, item_name, num);
+
+            // Store in Mem0 for semantic recall
+            const chest = skills.getNamedChest(chest_name);
+            if (chest && agent.prompter?.chat_model?.recordChestDeposit) {
+                await agent.prompter.chat_model.recordChestDeposit(
+                    chest_name,
+                    { x: chest.x, y: chest.y, z: chest.z },
+                    [{ name: item_name, count: num }]
+                );
+            }
+        })
+    },
+    {
+        name: '!chestTakeNamed',
+        description: 'Take items from a named chest.',
+        params: {
+            'chest_name': { type: 'string', description: 'Name of the chest to take items from.' },
+            'item_name': { type: 'ItemName', description: 'The item to take.' },
+            'num': { type: 'int', description: 'Number of items to take. Use -1 for all.', domain: [-1, Number.MAX_SAFE_INTEGER] }
+        },
+        perform: runAsAction(async (agent, chest_name, item_name, num) => {
+            await skills.takeFromNamedChest(agent.bot, chest_name, item_name, num);
+        })
+    },
+    {
+        name: '!chestViewNamed',
+        description: 'View the contents of a named chest.',
+        params: {
+            'chest_name': { type: 'string', description: 'Name of the chest to view.' }
+        },
+        perform: runAsAction(async (agent, chest_name) => {
+            await skills.viewNamedChest(agent.bot, chest_name);
+        })
+    },
+    {
+        name: '!chestDepositSorted',
+        description: 'Auto-sort inventory items into named chests by category (ores, building, food, tools, weapons, armor). Set up category chests first with !chestName.',
+        params: {
+            'except': { type: 'string', description: 'Comma-separated list of items to keep. Optional.', optional: true }
         },
         perform: runAsAction(async (agent, except) => {
             const excludeItems = except ? except.split(',').map(s => s.trim()) : [];
-            await skills.depositAllItems(agent.bot, excludeItems);
+            const result = await skills.depositAllSorted(agent.bot, excludeItems);
+
+            // Store deposits in Mem0 for semantic recall
+            if (result.success && result.deposits && agent.prompter?.chat_model?.recordChestDeposit) {
+                for (const deposit of result.deposits) {
+                    await agent.prompter.chat_model.recordChestDeposit(
+                        deposit.chestName,
+                        deposit.location,
+                        deposit.items
+                    );
+                }
+            }
         })
     },
+    {
+        name: '!chestFind',
+        description: 'Search for an item across all nearby chests and report which containers have it.',
+        params: {
+            'item_name': { type: 'ItemName', description: 'The item to search for.' },
+            'range': { type: 'int', description: 'Search radius in blocks. Default 32.', optional: true, domain: [1, 128] }
+        },
+        perform: runAsAction(async (agent, item_name, range) => {
+            await skills.findItemInChests(agent.bot, item_name, range || 32);
+        })
+    },
+    {
+        name: '!chestTransfer',
+        description: 'Transfer items from one chest to another.',
+        params: {
+            'item_name': { type: 'string', description: 'Item to transfer, or "all" for everything.' },
+            'num': { type: 'int', description: 'Number of items to transfer. Use -1 for all.', domain: [-1, Number.MAX_SAFE_INTEGER] },
+            'from_x': { type: 'int', description: 'Source chest X coordinate.' },
+            'from_y': { type: 'int', description: 'Source chest Y coordinate.' },
+            'from_z': { type: 'int', description: 'Source chest Z coordinate.' },
+            'to_x': { type: 'int', description: 'Destination chest X coordinate.' },
+            'to_y': { type: 'int', description: 'Destination chest Y coordinate.' },
+            'to_z': { type: 'int', description: 'Destination chest Z coordinate.' }
+        },
+        perform: runAsAction(async (agent, item_name, num, from_x, from_y, from_z, to_x, to_y, to_z) => {
+            await skills.transferBetweenChests(agent.bot, item_name, num, from_x, from_y, from_z, to_x, to_y, to_z);
+        })
+    },
+    // ============= END CHEST MASTER COMMANDS =============
     {
         name: '!discard',
         description: 'Discard the given item from the inventory.',
@@ -338,20 +514,86 @@ export const actionsList = [
         })
     },
     {
-        name: '!coverArea',
-        description: 'Cover a rectangular area with blocks at a specified height. Useful for filling ponds, making floors, or covering surfaces.',
+        name: '!fill',
+        description: 'Fill a rectangular area with blocks. Can build floors (height=1) or walls (height=5+). Like Minecraft /fill command.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "dirt", "cobblestone").' },
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
             'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
             'x2': { type: 'int', description: 'X coordinate of the second corner.' },
             'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
-            'y': { type: 'int', description: 'Y coordinate (height) to place blocks at.' }
+            'y': { type: 'int', description: 'Y coordinate (starting height) to place blocks at.' },
+            'height': { type: 'int', description: 'How many levels high to build (default 1). Use 5 for standard walls.', optional: true }
         },
-        perform: runAsAction(async (agent, blockType, x1, z1, x2, z2, y) => {
-            const placed = await skills.coverArea(agent.bot, blockType, x1, z1, x2, z2, y);
-            return `Covered area with ${placed} ${blockType} blocks.`;
-        }, false, 600)
+        perform: runAsAction(async (agent, blockType, x1, z1, x2, z2, y, height = 1) => {
+            const placed = await skills.fill(agent.bot, blockType, x1, z1, x2, z2, y, height);
+            return `Filled area with ${placed} ${blockType} blocks.`;
+        }, true, 600)  // resume=true allows resuming after interruption
+    },
+    {
+        name: '!serverFill',
+        description: 'FAST fill using server /fill command - places thousands of blocks INSTANTLY. Requires operator permissions. Use this for large builds instead of !fill.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "stone_bricks", "cobblestone").' },
+            'x1': { type: 'int', description: 'X coordinate of the first corner.' },
+            'y1': { type: 'int', description: 'Y coordinate of the first corner.' },
+            'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
+            'x2': { type: 'int', description: 'X coordinate of the second corner.' },
+            'y2': { type: 'int', description: 'Y coordinate of the second corner.' },
+            'z2': { type: 'int', description: 'Z coordinate of the second corner.' },
+            'mode': { type: 'string', description: 'Fill mode: "replace" (default), "hollow", "outline", "destroy", or "keep".', optional: true }
+        },
+        perform: async (agent, blockType, x1, y1, z1, x2, y2, z2, mode = 'replace') => {
+            const validModes = ['replace', 'hollow', 'outline', 'destroy', 'keep'];
+            if (!validModes.includes(mode)) mode = 'replace';
+
+            const command = `/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} ${mode}`;
+            agent.bot.chat(command);
+
+            // Calculate approximate blocks
+            const dx = Math.abs(x2 - x1) + 1;
+            const dy = Math.abs(y2 - y1) + 1;
+            const dz = Math.abs(z2 - z1) + 1;
+            const totalBlocks = dx * dy * dz;
+
+            return `Server fill executed: ${totalBlocks} blocks of ${blockType} (${mode} mode). Command: ${command}`;
+        }
+    },
+    {
+        name: '!serverSummon',
+        description: 'INSTANT summon using server /summon command. Spawns entities immediately at specified location.',
+        params: {
+            'entityType': { type: 'string', description: 'The entity to summon (e.g., "villager", "iron_golem", "cow").' },
+            'x': { type: 'int', description: 'X coordinate to summon at.', optional: true },
+            'y': { type: 'int', description: 'Y coordinate to summon at.', optional: true },
+            'z': { type: 'int', description: 'Z coordinate to summon at.', optional: true }
+        },
+        perform: async (agent, entityType, x, y, z) => {
+            const pos = agent.bot.entity.position;
+            const spawnX = x !== undefined ? Math.floor(x) : Math.floor(pos.x);
+            const spawnY = y !== undefined ? Math.floor(y) : Math.floor(pos.y);
+            const spawnZ = z !== undefined ? Math.floor(z) : Math.floor(pos.z);
+
+            const command = `/summon ${entityType} ${spawnX} ${spawnY} ${spawnZ}`;
+            agent.bot.chat(command);
+
+            return `Summoned ${entityType} at (${spawnX}, ${spawnY}, ${spawnZ})`;
+        }
+    },
+    {
+        name: '!serverSetblock',
+        description: 'INSTANT setblock using server /setblock command. Places a single block immediately.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x': { type: 'int', description: 'X coordinate.' },
+            'y': { type: 'int', description: 'Y coordinate.' },
+            'z': { type: 'int', description: 'Z coordinate.' }
+        },
+        perform: async (agent, blockType, x, y, z) => {
+            const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}`;
+            agent.bot.chat(command);
+            return `Set block ${blockType} at (${x}, ${y}, ${z})`;
+        }
     },
     {
         name: '!plantTrees',
@@ -367,7 +609,7 @@ export const actionsList = [
         perform: runAsAction(async (agent, saplingType, x1, z1, x2, z2, spacing = 4) => {
             const planted = await skills.plantTreeGrid(agent.bot, saplingType, x1, z1, x2, z2, spacing);
             return `Planted ${planted} ${saplingType} saplings with ${spacing} block spacing.`;
-        }, false, 600)
+        }, true, 600)  // resume=true allows resuming after interruption
     },
     {
         name: '!attack',

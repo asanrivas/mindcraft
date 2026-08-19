@@ -28,10 +28,16 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-COPY package*.json .
+# Install Bun
+RUN npm install -g bun
+
+# Copy package files
+COPY package.json bun.lock ./
 COPY patches ./patches
-RUN npm install
+
+# Install dependencies
+RUN bun install
 
 COPY . .
 
-CMD ["npm", "start"]
+CMD ["bun", "run", "main.js"]

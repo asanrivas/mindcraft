@@ -50,13 +50,23 @@ export class Examples {
         let turn_text = this.turnsToText(turns);
         if (this.model !== null) {
             let embedding = await this.model.embed(turn_text);
-            this.examples.sort((a, b) => 
-                cosineSimilarity(embedding, this.embeddings[this.turnsToText(b)]) -
-                cosineSimilarity(embedding, this.embeddings[this.turnsToText(a)])
-            );
+            // Handle null embeddings (when model fails or is disabled)
+            if (embedding && embedding.length > 0) {
+                this.examples.sort((a, b) =>
+                    cosineSimilarity(embedding, this.embeddings[this.turnsToText(b)]) -
+                    cosineSimilarity(embedding, this.embeddings[this.turnsToText(a)])
+                );
+            }
+            else {
+                // Fallback to word overlap if embeddings unavailable
+                this.examples.sort((a, b) =>
+                    wordOverlapScore(turn_text, this.turnsToText(b)) -
+                    wordOverlapScore(turn_text, this.turnsToText(a))
+                );
+            }
         }
         else {
-            this.examples.sort((a, b) => 
+            this.examples.sort((a, b) =>
                 wordOverlapScore(turn_text, this.turnsToText(b)) -
                 wordOverlapScore(turn_text, this.turnsToText(a))
             );

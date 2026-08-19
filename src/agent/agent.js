@@ -16,15 +16,16 @@ import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
 import { speak } from './speak.js';
-import { log, validateNameFormat, handleDisconnection } from './connection_handler.js';
+import { log, validateNameFormat } from './connection_handler.js';
+import { loadNamedChestsFromFile, setNamedChestsSaveCallback } from './library/skills.js';
+import { IdleBehavior } from './idle_behavior.js';
 
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
         this.last_sender = null;
         this.count_id = count_id;
-        this._disconnectHandled = false;
 
-        // Initialize components
+        // Initialize components with more detailed error handling
         this.actions = new ActionManager(this);
         this.prompter = new Prompter(this, settings.profile);
         this.name = (this.prompter.getName() || '').trim();
@@ -44,6 +45,7 @@ export class Agent {
         this.npc = new NPCContoller(this);
         this.memory_bank = new MemoryBank();
         this.self_prompter = new SelfPrompter(this);
+        this.idle_behavior = new IdleBehavior(this);
         convoManager.initAgent(this);
         await this.prompter.initExamples();
 
@@ -52,6 +54,13 @@ export class Agent {
         if (load_mem) {
             save_data = this.history.load();
         }
+
+        // Always load named chests (they persist independently of conversation memory)
+        const memoryFilePath = `./bots/${this.name}/memory.json`;
+        loadNamedChestsFromFile(memoryFilePath);
+        // Set up save callback so named chest changes persist
+        setNamedChestsSaveCallback(() => this.history.save());
+
         let taskStart = null;
         if (save_data) {
             taskStart = save_data.taskStart;
@@ -64,36 +73,35 @@ export class Agent {
 
         console.log(this.name, 'logging into minecraft...');
         this.bot = initBot(this.name);
-        
-        // Connection Handler
-        const onDisconnect = (event, reason) => {
-            if (this._disconnectHandled) return;
-            this._disconnectHandled = true;
 
-            // Log and Analyze
-            // handleDisconnection handles logging to console and server
-            const { type } = handleDisconnection(this.name, reason);
-     
-            process.exit(1);
-        };
-        
-        // Bind events
-        this.bot.once('kicked', (reason) => onDisconnect('Kicked', reason));
-        this.bot.once('end', (reason) => onDisconnect('Disconnected', reason));
+        initModes(this);
+
         this.bot.on('error', (err) => {
-            if (String(err).includes('Duplicate') || String(err).includes('ECONNREFUSED')) {
-                 onDisconnect('Error', err);
-            } else {
-                 log(this.name, `[LoginGuard] Connection Error: ${String(err)}`);
+            const errMsg = err.message || err.toString();
+
+            // Ignore parse errors - they happen with some chest interactions but aren't fatal
+            if (errMsg.includes('Parse error') || errMsg.includes('array size is abnormally large')) {
+                return; // Handled in the other error handler
+            }
+
+            if (errMsg.includes('PartialReadError') || errMsg.includes('buffer end')) {
+                console.error(`${this.name}: Protocol error detected: ${errMsg}`);
+                console.error('This typically means network instability or server lag.');
+                console.error('Forcing restart in 3 seconds...');
+                this._forceRestart(3000);
+            } else if (String(err).includes('Duplicate') || String(err).includes('ECONNREFUSED')) {
+                log(this.name, `[LoginGuard] Connection Error: ${String(err)}`);
+                this._forceRestart(3000);
             }
         });
 
-        initModes(this);
+        // Connection watchdog - detects stuck disconnects
+        this._startConnectionWatchdog();
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
             serverProxy.login();
-            
+
             // Set skin for profile, requires Fabric Tailor. (https://modrinth.com/mod/fabrictailor)
             if (this.prompter.profile.skin)
                 this.bot.chat(`/skin set URL ${this.prompter.profile.skin.model} ${this.prompter.profile.skin.path}`);
@@ -115,13 +123,13 @@ export class Agent {
 
                 // wait for a bit so stats are not undefined
                 await new Promise((resolve) => setTimeout(resolve, 1000));
-                
+
                 console.log(`${this.name} spawned.`);
                 this.clearBotLogs();
-              
+
                 this._setupEventHandlers(save_data, init_message);
                 this.startEvents();
-              
+
                 if (!load_mem) {
                     if (settings.task) {
                         this.task.initBotTask();
@@ -153,7 +161,7 @@ export class Agent {
             "Set the weather to",
             "Gamerule "
         ];
-        
+
         const respondFunc = async (username, message) => {
             if (message === "") return;
             if (username === this.name) return;
@@ -180,10 +188,43 @@ export class Agent {
 		this.respondFunc = respondFunc;
 
         this.bot.on('whisper', respondFunc);
-        
+
         this.bot.on('chat', (username, message) => {
-            if (serverProxy.getNumOtherAgents() > 0) return;
-            // only respond to open chat messages when there are no other agents
+            // With multiple agents, use smart filtering instead of blocking all public chat
+            if (serverProxy.getNumOtherAgents() > 0) {
+                const lowerMsg = message.toLowerCase();
+                const lowerName = this.name.toLowerCase();
+
+                // 1. Respond if message mentions this bot's name
+                if (lowerMsg.includes(lowerName)) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // 2. Respond to broadcast keywords (all bots should respond)
+                const broadcastKeywords = ['everyone', 'all bots', 'all of you', 'both of you', 'you all'];
+                if (broadcastKeywords.some(kw => lowerMsg.includes(kw))) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // 3. Respond to important shared commands (all bots should act)
+                const sharedCommands = ['go to bed', 'sleep', 'gotobed'];
+                if (sharedCommands.some(cmd => lowerMsg.includes(cmd))) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // 4. Respond to direct commands starting with !
+                if (message.trim().startsWith('!')) {
+                    respondFunc(username, message);
+                    return;
+                }
+
+                // Otherwise, ignore public chat when multiple agents present
+                return;
+            }
+            // Single agent mode - respond to all public chat
             respondFunc(username, message);
         });
 
@@ -283,7 +324,7 @@ export class Agent {
                     this.history.add(source, message);
                 }
                 let execute_res = await executeCommand(this, message);
-                if (execute_res) 
+                if (execute_res)
                     this.routeResponse(source, execute_res);
                 return true;
             }
@@ -297,7 +338,7 @@ export class Agent {
         console.log('received message from', source, ':', message);
 
         const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up || convoManager.responseScheduledFor(source);
-        
+
         let behavior_log = this.bot.modes.flushBehaviorLog().trim();
         if (behavior_log.length > 0) {
             const MAX_LOG = 500;
@@ -331,7 +372,7 @@ export class Agent {
             if (command_name) { // contains query or command
                 res = truncCommandMessage(res); // everything after the command is ignored
                 this.history.add(this.name, res);
-                
+
                 if (!commandExists(command_name)) {
                     this.history.add('system', `Command ${command_name} does not exist.`);
                     console.warn('Agent hallucinated command:', command_name)
@@ -374,7 +415,7 @@ export class Agent {
                 this.routeResponse(source, res);
                 break;
             }
-            
+
             this.history.save();
         }
 
@@ -453,24 +494,48 @@ export class Agent {
         });
         // Logging callbacks
         this.bot.on('error' , (err) => {
+            const errMsg = err.message || err.toString();
+
+            // Ignore parse errors - they happen with some chest interactions but aren't fatal
+            if (errMsg.includes('Parse error') || errMsg.includes('array size is abnormally large')) {
+                console.warn('[Protocol] Parse error (non-fatal, ignoring):', errMsg.split('\n')[0]);
+                return;
+            }
+
             console.error('Error event!', err);
+            // Check for connection-related errors
+            if (errMsg.includes('ECONNRESET') ||
+                errMsg.includes('ETIMEDOUT') ||
+                errMsg.includes('ENOTCONN') ||
+                errMsg.includes('socket hang up')) {
+                console.error('[Connection] Network error detected, forcing restart...');
+                this._forceRestart(2000);
+            }
         });
         // Use connection handler for runtime disconnects
         this.bot.on('end', (reason) => {
-            if (!this._disconnectHandled) {
-                const { msg } = handleDisconnection(this.name, reason);
-                this.cleanKill(msg);
+            console.warn('Bot disconnected!', reason);
+            // Clear watchdog interval
+            if (this._watchdogInterval) {
+                clearInterval(this._watchdogInterval);
             }
+            // Use force restart for cleaner reconnection
+            console.log('[Connection] Triggering auto-restart...');
+            this._forceRestart(2000);
         });
         this.bot.on('death', () => {
             this.actions.cancelResume();
             this.actions.stop();
         });
         this.bot.on('kicked', (reason) => {
-            if (!this._disconnectHandled) {
-                const { msg } = handleDisconnection(this.name, reason);
-                this.cleanKill(msg);
+            console.warn('Bot kicked!', reason);
+            // Clear watchdog interval
+            if (this._watchdogInterval) {
+                clearInterval(this._watchdogInterval);
             }
+            // Still restart on kick - server may have just restarted
+            console.log('[Connection] Kicked, triggering auto-restart...');
+            this._forceRestart(5000); // Wait 5 seconds before reconnecting after kick
         });
         this.bot.on('messagestr', async (message, _, jsonMsg) => {
             if (jsonMsg.translate && jsonMsg.translate.startsWith('death') && message.startsWith(this.name)) {
@@ -482,7 +547,32 @@ export class Agent {
                     death_pos_text = `x: ${death_pos.x.toFixed(2)}, y: ${death_pos.y.toFixed(2)}, z: ${death_pos.z.toFixed(2)}`;
                 }
                 let dimention = this.bot.game.dimension;
+
+                // Store death in Mem0 if available
+                if (this.prompter.chat_model?.recordDeath) {
+                    this.prompter.chat_model.recordDeath(death_pos, message);
+                }
+
                 this.handleMessage('system', `You died at position ${death_pos_text || "unknown"} in the ${dimention} dimension with the final message: '${message}'. Your place of death is saved as 'last_death_position' if you want to return. Previous actions were stopped and you have respawned.`);
+            }
+        });
+
+        // Player join/leave events for Mem0
+        this.bot.on('playerJoined', (player) => {
+            if (player.username !== this.name) {
+                console.log(`[Event] ${player.username} joined the game`);
+                if (this.prompter.chat_model?.recordPlayerJoin) {
+                    this.prompter.chat_model.recordPlayerJoin(player.username);
+                }
+            }
+        });
+
+        this.bot.on('playerLeft', (player) => {
+            if (player.username !== this.name) {
+                console.log(`[Event] ${player.username} left the game`);
+                if (this.prompter.chat_model?.recordPlayerLeave) {
+                    this.prompter.chat_model.recordPlayerLeave(player.username);
+                }
             }
         });
         this.bot.on('idle', () => {
@@ -520,19 +610,157 @@ export class Agent {
     async update(delta) {
         await this.bot.modes.update();
         this.self_prompter.update(delta);
+        await this.idle_behavior.update(delta);
         await this.checkTaskDone();
     }
 
     isIdle() {
         return !this.actions.executing;
     }
-    
+
 
     cleanKill(msg='Killing agent process...', code=1) {
         this.history.add('system', msg);
-        this.bot.chat(code > 1 ? 'Restarting.': 'Exiting.');
+        try {
+            this.bot.chat(code > 1 ? 'Restarting.': 'Exiting.');
+        } catch (e) {
+            // Bot may already be disconnected
+        }
         this.history.save();
         process.exit(code);
+    }
+
+    _forceRestart(delay = 0) {
+        if (this._isRestarting) return; // Prevent multiple restart attempts
+        this._isRestarting = true;
+
+        console.log(`[Watchdog] Force restart scheduled in ${delay}ms`);
+
+        setTimeout(() => {
+            console.log('[Watchdog] Executing force restart...');
+            try {
+                this.bot.quit();
+            } catch (e) {
+                // Bot may already be disconnected
+            }
+            process.exit(1); // Exit with code 1 triggers auto-restart
+        }, delay);
+    }
+
+    _startConnectionWatchdog() {
+        this._lastActivity = Date.now();
+        this._lastPlayerInteraction = Date.now();
+        this._isRestarting = false;
+        this._watchdogInterval = null;
+
+        // Update activity timestamp on any bot event
+        const updateActivity = () => {
+            this._lastActivity = Date.now();
+        };
+
+        // Update player interaction timestamp on chat/whisper
+        const updatePlayerInteraction = () => {
+            this._lastPlayerInteraction = Date.now();
+        };
+
+        this.bot.on('move', updateActivity);
+        this.bot.on('health', updateActivity);
+        this.bot.on('time', updateActivity);
+        this.bot.on('physicsTick', updateActivity);
+
+        // Track player interactions separately
+        this.bot.on('chat', (username) => {
+            updateActivity();
+            if (username !== this.name) {
+                updatePlayerInteraction();
+            }
+        });
+        this.bot.on('whisper', (username) => {
+            updateActivity();
+            if (username !== this.name) {
+                updatePlayerInteraction();
+            }
+        });
+
+        // Start watchdog after spawn
+        this.bot.once('spawn', () => {
+            const WATCHDOG_INTERVAL = 30000; // Check every 30 seconds
+            const MAX_INACTIVE_TIME = 120000; // 2 minutes without activity = stuck
+            const IDLE_DISCONNECT_TIMEOUT = (settings.idle_disconnect_timeout || 0) * 60 * 1000;
+
+            this._watchdogInterval = setInterval(() => {
+                const timeSinceActivity = Date.now() - this._lastActivity;
+                const timeSincePlayerInteraction = Date.now() - this._lastPlayerInteraction;
+
+                // Check if bot client is still connected
+                const isConnected = this.bot._client &&
+                                   this.bot._client.socket &&
+                                   !this.bot._client.ended;
+
+                if (!isConnected) {
+                    console.warn('[Watchdog] Bot client disconnected but process still running!');
+                    this._forceRestart(1000);
+                    return;
+                }
+
+                if (timeSinceActivity > MAX_INACTIVE_TIME) {
+                    console.warn(`[Watchdog] No activity for ${Math.round(timeSinceActivity/1000)}s - possible stuck state`);
+                    console.warn('[Watchdog] Forcing restart...');
+                    this._forceRestart(1000);
+                    return;
+                }
+
+                // Idle disconnect check: no player interaction + no active goal
+                if (IDLE_DISCONNECT_TIMEOUT > 0) {
+                    const hasActiveGoal = this.self_prompter && this.self_prompter.isActive();
+                    const isExecutingAction = this.actions && this.actions.executing;
+
+                    if (!hasActiveGoal && !isExecutingAction && timeSincePlayerInteraction > IDLE_DISCONNECT_TIMEOUT) {
+                        const idleMinutes = Math.round(timeSincePlayerInteraction / 60000);
+                        console.log(`[Watchdog] Idle for ${idleMinutes} minutes with no goals. Disconnecting to save resources.`);
+                        this._idleDisconnect();
+                        return;
+                    }
+                }
+            }, WATCHDOG_INTERVAL);
+
+            console.log('[Watchdog] Connection watchdog started');
+            if (IDLE_DISCONNECT_TIMEOUT > 0) {
+                console.log(`[Watchdog] Idle disconnect enabled: ${settings.idle_disconnect_timeout} minutes`);
+            }
+        });
+    }
+
+    _idleDisconnect() {
+        if (this._isRestarting) return;
+        this._isRestarting = true;
+
+        console.log('[Watchdog] Performing idle disconnect...');
+
+        // Clear watchdog interval
+        if (this._watchdogInterval) {
+            clearInterval(this._watchdogInterval);
+        }
+
+        // Save state before disconnecting
+        this.history.add('system', 'Disconnecting due to idle timeout. Will reconnect when players are online.');
+        this.history.save();
+
+        try {
+            this.bot.chat('Going idle. I\'ll be back when someone needs me!');
+        } catch (e) {
+            // Bot may already be disconnected
+        }
+
+        setTimeout(() => {
+            try {
+                this.bot.quit();
+            } catch (e) {
+                // Ignore
+            }
+            // Exit with code 0 - this tells agent_process NOT to auto-restart
+            process.exit(0);
+        }, 1000);
     }
     async checkTaskDone() {
         if (this.task.data) {
@@ -540,7 +768,6 @@ export class Agent {
             if (res) {
                 await this.history.add('system', `Task ended with score : ${res.score}`);
                 await this.history.save();
-                // await new Promise(resolve => setTimeout(resolve, 3000)); // Wait 3 second for save to complete
                 console.log('Task finished:', res.message);
                 this.killAll();
             }

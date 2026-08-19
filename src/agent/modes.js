@@ -1,11 +1,11 @@
-import * as skills from './library/skills.js';
-import * as world from './library/world.js';
-import * as mc from '../utils/mcdata.js';
-import settings from './settings.js'
-import convoManager from './conversation.js';
+import * as skills from "./library/skills.js";
+import * as world from "./library/world.js";
+import * as mc from "../utils/mcdata.js";
+import settings from "./settings.js";
+import convoManager from "./conversation.js";
 
-async function say(agent, message) {
-    agent.bot.modes.behavior_log += message + '\n';
+function say(agent, message) {
+    agent.bot.modes.behavior_log += message + "\n";
     if (agent.shut_up || !settings.narrate_behavior) return;
     agent.openChat(message);
 }
@@ -23,74 +23,116 @@ async function say(agent, message) {
 // to perform longer actions, use the execute function which won't block the update loop
 const modes_list = [
     {
-        name: 'self_preservation',
-        description: 'Respond to drowning, burning, and damage at low health. Interrupts all actions.',
-        interrupts: ['all'],
+        name: "self_preservation",
+        description:
+            "Respond to drowning, burning, and damage at low health. Interrupts all actions.",
+        interrupts: ["all"],
         on: true,
         active: false,
-        fall_blocks: ['sand', 'gravel', 'concrete_powder'], // includes matching substrings like 'sandstone' and 'red_sand'
+        fall_blocks: ["sand", "gravel", "concrete_powder"], // includes matching substrings like 'sandstone' and 'red_sand'
         update: async function (agent) {
             const bot = agent.bot;
             let block = bot.blockAt(bot.entity.position);
             let blockAbove = bot.blockAt(bot.entity.position.offset(0, 1, 0));
-            if (!block) block = {name: 'air'}; // hacky fix when blocks are not loaded
-            if (!blockAbove) blockAbove = {name: 'air'};
-            if (blockAbove.name === 'water') {
+            if (!block) block = { name: "air" }; // hacky fix when blocks are not loaded
+            if (!blockAbove) blockAbove = { name: "air" };
+            if (blockAbove.name === "water") {
                 // does not call execute so does not interrupt other actions
                 if (!bot.pathfinder.goal) {
-                    bot.setControlState('jump', true);
+                    bot.setControlState("jump", true);
                 }
-            }
-            else if (this.fall_blocks.some(name => blockAbove.name.includes(name))) {
+            } else if (
+                this.fall_blocks.some((name) => blockAbove.name.includes(name))
+            ) {
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 2);
                 });
-            }
-            else if (block.name === 'lava' || block.name === 'fire' ||
-                blockAbove.name === 'lava' || blockAbove.name === 'fire') {
-                say(agent, 'I\'m on fire!');
+            } else if (
+                block.name === "lava" ||
+                block.name === "fire" ||
+                blockAbove.name === "lava" ||
+                blockAbove.name === "fire"
+            ) {
+                say(agent, "I'm on fire!");
                 // if you have a water bucket, use it
                 let waterBucket = bot.inventory.findInventoryItem('water_bucket');
                 if (waterBucket) {
                     execute(this, agent, async () => {
-                        let success = await skills.placeBlock(bot, 'water_bucket', block.position.x, block.position.y, block.position.z);
-                        if (success) say(agent, 'Placed some water, ahhhh that\'s better!');
+                        let success = await skills.placeBlock(
+                            bot,
+                            "water_bucket",
+                            block.position.x,
+                            block.position.y,
+                            block.position.z,
+                        );
+                        if (success)
+                            say(
+                                agent,
+                                "Placed some water, ahhhh that's better!",
+                            );
                     });
-                }
-                else {
+                } else {
                     execute(this, agent, async () => {
                         let waterBucket = bot.inventory.findInventoryItem('water_bucket');
                         if (waterBucket) {
-                            let success = await skills.placeBlock(bot, 'water_bucket', block.position.x, block.position.y, block.position.z);
-                            if (success) say(agent, 'Placed some water, ahhhh that\'s better!');
+                            let success = await skills.placeBlock(
+                                bot,
+                                "water_bucket",
+                                block.position.x,
+                                block.position.y,
+                                block.position.z,
+                            );
+                            if (success)
+                                say(
+                                    agent,
+                                    "Placed some water, ahhhh that's better!",
+                                );
                             return;
                         }
-                        let nearestWater = world.getNearestBlock(bot, 'water', 20);
+                        let nearestWater = world.getNearestBlock(
+                            bot,
+                            "water",
+                            20,
+                        );
                         if (nearestWater) {
                             const pos = nearestWater.position;
-                            let success = await skills.goToPosition(bot, pos.x, pos.y, pos.z, 0.2);
-                            if (success) say(agent, 'Found some water, ahhhh that\'s better!');
+                            let success = await skills.goToPosition(
+                                bot,
+                                pos.x,
+                                pos.y,
+                                pos.z,
+                                0.2,
+                            );
+                            if (success)
+                                say(
+                                    agent,
+                                    "Found some water, ahhhh that's better!",
+                                );
                             return;
                         }
                         await skills.moveAway(bot, 5);
                     });
                 }
-            }
-            else if (Date.now() - bot.lastDamageTime < 3000 && (bot.health < 5 || bot.lastDamageTaken >= bot.health)) {
-                say(agent, 'I\'m dying!');
+            } else if (
+                Date.now() - bot.lastDamageTime < 3000 &&
+                (bot.health < 5 || bot.lastDamageTaken >= bot.health)
+            ) {
+                say(agent, "I'm dying!");
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 20);
                 });
-            }
-            else if (agent.isIdle()) {
+            } else if (agent.isIdle()) {
                 bot.clearControlStates(); // clear jump if not in danger or doing anything else
             }
-        }
+        },
     },
     {
-        name: 'unstuck',
-        description: 'Attempt to get unstuck when in the same place for a while. Interrupts some actions.',
-        interrupts: ['all'],
+        name: "unstuck",
+        description:
+            "Attempt to get unstuck when in the same place for a while. Interrupts some actions.",
+        interrupts: ["all"],
+        // Building operations should not be interrupted - they have their own timeout
+        excludeFromInterrupt: ["action:fill", "action:plantTrees"],
         on: true,
         active: false,
         prev_location: null,
@@ -100,7 +142,7 @@ const modes_list = [
         max_stuck_time: 20,
         prev_dig_block: null,
         update: async function (agent) {
-            if (agent.isIdle()) { 
+            if (agent.isIdle()) {
                 this.prev_location = null;
                 this.stuck_time = 0;
                 return; // don't get stuck when idle
@@ -110,23 +152,32 @@ const modes_list = [
             if (cur_dig_block && !this.prev_dig_block) {
                 this.prev_dig_block = cur_dig_block;
             }
-            if (this.prev_location && this.prev_location.distanceTo(bot.entity.position) < this.distance && cur_dig_block == this.prev_dig_block) {
+            if (
+                this.prev_location &&
+                this.prev_location.distanceTo(bot.entity.position) <
+                    this.distance &&
+                cur_dig_block == this.prev_dig_block
+            ) {
                 this.stuck_time += (Date.now() - this.last_time) / 1000;
-            }
-            else {
+            } else {
                 this.prev_location = bot.entity.position.clone();
                 this.stuck_time = 0;
                 this.prev_dig_block = null;
             }
-            const max_stuck_time = cur_dig_block?.name === 'obsidian' ? this.max_stuck_time * 2 : this.max_stuck_time;
+            const max_stuck_time =
+                cur_dig_block?.name === "obsidian"
+                    ? this.max_stuck_time * 2
+                    : this.max_stuck_time;
             if (this.stuck_time > max_stuck_time) {
-                say(agent, 'I\'m stuck!');
+                say(agent, "I'm stuck!");
                 this.stuck_time = 0;
                 execute(this, agent, async () => {
-                    const crashTimeout = setTimeout(() => { agent.cleanKill("Got stuck and couldn't get unstuck") }, 10000);
+                    const crashTimeout = setTimeout(() => {
+                        agent.cleanKill("Got stuck and couldn't get unstuck");
+                    }, 10000);
                     await skills.moveAway(bot, 5);
                     clearTimeout(crashTimeout);
-                    say(agent, 'I\'m free.');
+                    say(agent, "I'm free.");
                 });
             }
             this.last_time = Date.now();
@@ -135,21 +186,28 @@ const modes_list = [
             this.prev_location = null;
             this.stuck_time = 0;
             this.prev_dig_block = null;
-        }
+        },
     },
     {
-        name: 'cowardice',
-        description: 'Run away from enemies. Interrupts all actions.',
-        interrupts: ['all'],
+        name: "cowardice",
+        description: "Run away from enemies. Interrupts most actions (except building).",
+        interrupts: ["all"],
+        // Actions that should NOT be interrupted by cowardice (building operations)
+        excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:!stay"],
         on: true,
         active: false,
         update: async function (agent) {
-            const enemy = world.getNearestEntityWhere(agent.bot, entity => mc.isHostile(entity), 16);
-            if (enemy && await world.isClearPath(agent.bot, enemy)) {
+            const enemy = world.getNearestEntityWhere(
+                agent.bot,
+                (entity) => mc.isHostile(entity),
+                16,
+            );
+            if (enemy && (await world.isClearPath(agent.bot, enemy))) {
                 // Safety check: Don't run from villagers or friendly entities
-                const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot'];
-                if (friendlyEntities.some(name => enemy.name.includes(name))) {
-                    console.log(`[COWARDICE] Skipping ${enemy.name} - marked as friendly`);
+                if (mc.isFriendly(enemy)) {
+                    console.log(
+                        `[COWARDICE] Skipping ${enemy.name} - marked as friendly`,
+                    );
                     return;
                 }
 
@@ -158,27 +216,36 @@ const modes_list = [
                     await skills.avoidEnemies(agent.bot, 24);
                 });
             }
-        }
+        },
     },
     {
-        name: 'self_defense',
-        description: 'Attack nearby enemies. Interrupts all actions.',
-        interrupts: ['all'],
+        name: "self_defense",
+        description: "Attack nearby enemies. Interrupts most actions (except building).",
+        interrupts: ["all"],
+        // Actions that should NOT be interrupted by self_defense (building operations)
+        excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:!stay"],
         on: true,
         active: false,
         update: async function (agent) {
-            const enemy = world.getNearestEntityWhere(agent.bot, entity => mc.isHostile(entity), 8);
-            if (enemy && await world.isClearPath(agent.bot, enemy)) {
+            const enemy = world.getNearestEntityWhere(
+                agent.bot,
+                (entity) => mc.isHostile(entity),
+                8,
+            );
+            if (enemy && (await world.isClearPath(agent.bot, enemy))) {
                 // Enhanced logging to debug attacks
-                const entityType = enemy.type || 'unknown';
-                const entityName = enemy.name || 'unknown';
+                const entityType = enemy.type || "unknown";
+                const entityName = enemy.name || "unknown";
                 const isActuallyHostile = mc.isHostile(enemy);
-                console.log(`[SELF_DEFENSE] Detected entity: name="${entityName}", type="${entityType}", isHostile=${isActuallyHostile}`);
+                console.log(
+                    `[SELF_DEFENSE] Detected entity: name="${entityName}", type="${entityType}", isHostile=${isActuallyHostile}`,
+                );
 
                 // Safety check: Don't attack villagers, players, or other friendly entities
-                const friendlyEntities = ['villager', 'player', 'iron_golem', 'allay', 'cat', 'wolf', 'parrot', 'horse', 'donkey', 'mule', 'llama'];
-                if (friendlyEntities.some(name => entityName.includes(name))) {
-                    console.log(`[SELF_DEFENSE] Skipping ${entityName} - marked as friendly`);
+                if (mc.isFriendly(enemy)) {
+                    console.log(
+                        `[SELF_DEFENSE] Skipping ${entityName} - marked as friendly`,
+                    );
                     return;
                 }
 
@@ -187,28 +254,33 @@ const modes_list = [
                     await skills.defendSelf(agent.bot, 8);
                 });
             }
-        }
+        },
     },
     {
-        name: 'hunting',
-        description: 'Hunt nearby animals when idle.',
-        interrupts: ['action:followPlayer'],
+        name: "hunting",
+        description: "Hunt nearby animals when idle.",
+        interrupts: ["action:followPlayer"],
         on: true,
         active: false,
         update: async function (agent) {
-            const huntable = world.getNearestEntityWhere(agent.bot, entity => mc.isHuntable(entity), 8);
-            if (huntable && await world.isClearPath(agent.bot, huntable)) {
+            const huntable = world.getNearestEntityWhere(
+                agent.bot,
+                (entity) => mc.isHuntable(entity),
+                8,
+            );
+            if (huntable && (await world.isClearPath(agent.bot, huntable))) {
                 execute(this, agent, async () => {
                     say(agent, `Hunting ${huntable.name}!`);
                     await skills.attackEntity(agent.bot, huntable);
                 });
             }
-        }
+        },
     },
     {
-        name: 'item_collecting',
-        description: 'Collect nearby items when idle or when items are dropped.',
-        interrupts: ['action:followPlayer', 'action:!stop', 'action:!stayHere'],
+        name: "item_collecting",
+        description:
+            "Collect nearby items when idle or when items are dropped.",
+        interrupts: ["action:followPlayer", "action:!stop", "action:!stayHere"],
         on: true,
         active: false,
 
@@ -217,15 +289,27 @@ const modes_list = [
         noticed_at: -1,
         last_inventory_snapshot: null,
         update: async function (agent) {
-            let item = world.getNearestEntityWhere(agent.bot, entity => entity.name === 'item', 8);
+            let item = world.getNearestEntityWhere(
+                agent.bot,
+                (entity) => entity.name === "item",
+                8,
+            );
             let empty_inv_slots = agent.bot.inventory.emptySlotCount();
 
             // More aggressive item collection - interrupt more actions when items are very close
-            const distance = item ? agent.bot.entity.position.distanceTo(item.position) : 999;
+            const distance = item
+                ? agent.bot.entity.position.distanceTo(item.position)
+                : 999;
             const is_very_close = distance < 3; // items within 3 blocks are considered "given" items
             const can_interrupt = agent.isIdle() || is_very_close;
 
-            if (item && item !== this.prev_item && await world.isClearPath(agent.bot, item) && empty_inv_slots > 1 && can_interrupt) {
+            if (
+                item &&
+                item !== this.prev_item &&
+                (await world.isClearPath(agent.bot, item)) &&
+                empty_inv_slots > 1 &&
+                can_interrupt
+            ) {
                 if (this.noticed_at === -1) {
                     this.noticed_at = Date.now();
                     // Reduce wait time for very close items (likely given by player)
@@ -236,7 +320,9 @@ const modes_list = [
                 const wait_time = is_very_close ? 0.5 : this.wait; // 0.5s for close items, 1.5s for others
                 if (Date.now() - this.noticed_at > wait_time * 1000) {
                     // Take inventory snapshot before pickup
-                    const before_items = agent.bot.inventory.items().map(i => ({name: i.name, count: i.count}));
+                    const before_items = agent.bot.inventory
+                        .items()
+                        .map((i) => ({ name: i.name, count: i.count }));
 
                     say(agent, `Picking up items!`);
                     this.prev_item = item;
@@ -248,38 +334,42 @@ const modes_list = [
                         const new_items = [];
 
                         for (const item of after_items) {
-                            const before_item = before_items.find(b => b.name === item.name);
+                            const before_item = before_items.find(
+                                (b) => b.name === item.name,
+                            );
                             if (!before_item) {
                                 new_items.push(`${item.count} ${item.name}`);
                             } else if (item.count > before_item.count) {
-                                new_items.push(`${item.count - before_item.count} ${item.name}`);
+                                new_items.push(
+                                    `${item.count - before_item.count} ${item.name}`,
+                                );
                             }
                         }
 
-                        // Notify agent about picked up items if currently executing an action
-                        if (new_items.length > 0 && !agent.isIdle()) {
-                            const items_list = new_items.join(', ');
+                        // Notify agent about picked up items
+                        if (new_items.length > 0) {
+                            const items_list = new_items.join(", ");
                             say(agent, `Picked up: ${items_list}`);
-                            // Auto-message to inform LLM about new resources if working on a task
+                            // Auto-message to inform LLM about new resources
                             setTimeout(() => {
-                                if (!agent.isIdle() && agent.actions.currentActionLabel) {
-                                    agent.handleMessage('system', `(AUTO) You just picked up ${items_list}. You now have these materials available. Check your inventory and continue with your current task if you have what you need.`);
-                                }
+                                const message = agent.isIdle()
+                                    ? `(AUTO) You just picked up ${items_list}. What would you like to do with these items?`
+                                    : `(AUTO) You just picked up ${items_list}. You now have these materials available. Check your inventory and continue with your current task if you have what you need.`;
+                                agent.handleMessage("system", message);
                             }, 500);
                         }
                     });
                     this.noticed_at = -1;
                 }
-            }
-            else {
+            } else {
                 this.noticed_at = -1;
             }
-        }
+        },
     },
     {
-        name: 'torch_placing',
-        description: 'Place torches when idle and there are no torches nearby.',
-        interrupts: ['action:followPlayer'],
+        name: "torch_placing",
+        description: "Place torches when idle and there are no torches nearby.",
+        interrupts: ["action:followPlayer"],
         on: true,
         active: false,
         cooldown: 5,
@@ -289,36 +379,57 @@ const modes_list = [
                 if (Date.now() - this.last_place < this.cooldown * 1000) return;
                 execute(this, agent, async () => {
                     const pos = agent.bot.entity.position;
-                    await skills.placeBlock(agent.bot, 'torch', pos.x, pos.y, pos.z, 'bottom', true);
+                    await skills.placeBlock(
+                        agent.bot,
+                        "torch",
+                        pos.x,
+                        pos.y,
+                        pos.z,
+                        "bottom",
+                        true,
+                    );
                 });
                 this.last_place = Date.now();
             }
-        }
+        },
     },
     {
-        name: 'elbow_room',
-        description: 'Move away from nearby players when idle.',
-        interrupts: ['action:followPlayer'],
+        name: "elbow_room",
+        description: "Move away from nearby players when idle.",
+        interrupts: ["action:followPlayer"],
         on: true,
         active: false,
         distance: 0.5,
         update: async function (agent) {
-            const player = world.getNearestEntityWhere(agent.bot, entity => entity.type === 'player', this.distance);
+            const player = world.getNearestEntityWhere(
+                agent.bot,
+                (entity) => entity.type === "player",
+                this.distance,
+            );
             if (player) {
                 execute(this, agent, async () => {
                     // wait a random amount of time to avoid identical movements with other bots
                     const wait_time = Math.random() * 1000;
-                    await new Promise(resolve => setTimeout(resolve, wait_time));
-                    if (player.position.distanceTo(agent.bot.entity.position) < this.distance) {
-                        await skills.moveAwayFromEntity(agent.bot, player, this.distance);
+                    await new Promise((resolve) =>
+                        setTimeout(resolve, wait_time),
+                    );
+                    if (
+                        player.position.distanceTo(agent.bot.entity.position) <
+                        this.distance
+                    ) {
+                        await skills.moveAwayFromEntity(
+                            agent.bot,
+                            player,
+                            this.distance,
+                        );
                     }
                 });
             }
-        }
+        },
     },
     {
-        name: 'idle_staring',
-        description: 'Animation to look around at entities when idle.',
+        name: "idle_staring",
+        description: "Animation to look around at entities when idle.",
         interrupts: [],
         on: true,
         active: false,
@@ -328,53 +439,62 @@ const modes_list = [
         next_change: 0,
         update: function (agent) {
             const entity = agent.bot.nearestEntity();
-            let entity_in_view = entity && entity.position.distanceTo(agent.bot.entity.position) < 10 && entity.name !== 'enderman';
+            let entity_in_view =
+                entity &&
+                entity.position.distanceTo(agent.bot.entity.position) < 10 &&
+                entity.name !== "enderman";
             if (entity_in_view && entity !== this.last_entity) {
                 this.staring = true;
                 this.last_entity = entity;
                 this.next_change = Date.now() + Math.random() * 1000 + 4000;
             }
             if (entity_in_view && this.staring) {
-                let isbaby = entity.type !== 'player' && entity.metadata[16];
-                let height = isbaby ? entity.height/2 : entity.height;
+                let isbaby = entity.type !== "player" && entity.metadata[16];
+                let height = isbaby ? entity.height / 2 : entity.height;
                 agent.bot.lookAt(entity.position.offset(0, height, 0));
             }
-            if (!entity_in_view)
-                this.last_entity = null;
+            if (!entity_in_view) this.last_entity = null;
             if (Date.now() > this.next_change) {
                 // look in random direction
                 this.staring = Math.random() < 0.3;
                 if (!this.staring) {
                     const yaw = Math.random() * Math.PI * 2;
-                    const pitch = (Math.random() * Math.PI/2) - Math.PI/4;
+                    const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;
                     agent.bot.look(yaw, pitch, false);
                 }
                 this.next_change = Date.now() + Math.random() * 10000 + 2000;
             }
-        }
+        },
     },
     {
-        name: 'cheat',
-        description: 'Use cheats to instantly place blocks and teleport.',
+        name: "cheat",
+        description: "Use cheats to instantly place blocks and teleport.",
         interrupts: [],
         on: false,
         active: false,
-        update: function (agent) { /* do nothing */ }
-    }
+        update: function (agent) {
+            /* do nothing */
+        },
+    },
 ];
 
-async function execute(mode, agent, func, timeout=-1) {
-    if (agent.self_prompter.isActive())
-        agent.self_prompter.stopLoop();
+async function execute(mode, agent, func, timeout = -1) {
+    if (agent.self_prompter.isActive()) agent.self_prompter.stopLoop();
     let interrupted_action = agent.actions.currentActionLabel;
     mode.active = true;
-    let code_return = await agent.actions.runAction(`mode:${mode.name}`, async () => {
-        await func();
-    }, { timeout });
+    let code_return = await agent.actions.runAction(
+        `mode:${mode.name}`,
+        async () => {
+            await func();
+        },
+        { timeout },
+    );
     mode.active = false;
-    console.log(`Mode ${mode.name} finished executing, code_return: ${code_return.message}`);
+    console.log(
+        `Mode ${mode.name} finished executing, code_return: ${code_return.message}`,
+    );
 
-    let should_reprompt = 
+    let should_reprompt =
         interrupted_action && // it interrupted a previous action
         !agent.actions.resume_func && // there is no resume function
         !agent.self_prompter.isActive() && // self prompting is not on
@@ -382,10 +502,13 @@ async function execute(mode, agent, func, timeout=-1) {
 
     if (should_reprompt) {
         // auto prompt to respond to the interruption
-        let role = convoManager.inConversation() ? agent.last_sender : 'system';
+        let role = convoManager.inConversation() ? agent.last_sender : "system";
         let logs = agent.bot.modes.flushBehaviorLog();
-        agent.handleMessage(role, `(AUTO MESSAGE)Your previous action '${interrupted_action}' was interrupted by ${mode.name}.
-        Your behavior log: ${logs}\nRespond accordingly.`);
+        agent.handleMessage(
+            role,
+            `(AUTO MESSAGE)Your previous action '${interrupted_action}' was interrupted by ${mode.name}.
+        Your behavior log: ${logs}\nRespond accordingly.`,
+        );
     }
 }
 
@@ -403,7 +526,7 @@ class ModeController {
     This can be used to expose sensitive information by malicious prompters.
     */
     constructor() {
-        this.behavior_log = '';
+        this.behavior_log = "";
     }
 
     exists(mode_name) {
@@ -438,19 +561,20 @@ class ModeController {
         }
     }
 
-    getMiniDocs() { // no descriptions
-        let res = 'Agent Modes:';
+    getMiniDocs() {
+        // no descriptions
+        let res = "Agent Modes:";
         for (let mode of modes_list) {
-            let on = mode.on ? 'ON' : 'OFF';
+            let on = mode.on ? "ON" : "OFF";
             res += `\n- ${mode.name}(${on})`;
         }
         return res;
     }
 
     getDocs() {
-        let res = 'Agent Modes:';
+        let res = "Agent Modes:";
         for (let mode of modes_list) {
-            let on = mode.on ? 'ON' : 'OFF';
+            let on = mode.on ? "ON" : "OFF";
             res += `\n- ${mode.name}(${on}): ${mode.description}`;
         }
         return res;
@@ -461,8 +585,23 @@ class ModeController {
             this.unPauseAll();
         }
         for (let mode of modes_list) {
-            let interruptible = mode.interrupts.some(i => i === 'all') || mode.interrupts.some(i => i === _agent.actions.currentActionLabel);
-            if (mode.on && !mode.paused && !mode.active && (_agent.isIdle() || interruptible)) {
+            const currentAction = _agent.actions.currentActionLabel;
+
+            // Check if current action is excluded from this mode's interrupts
+            const isExcluded = mode.excludeFromInterrupt &&
+                mode.excludeFromInterrupt.some((i) => i === currentAction);
+
+            let interruptible =
+                !isExcluded && (
+                    mode.interrupts.some((i) => i === "all") ||
+                    mode.interrupts.some((i) => i === currentAction)
+                );
+            if (
+                mode.on &&
+                !mode.paused &&
+                !mode.active &&
+                (_agent.isIdle() || interruptible)
+            ) {
                 await mode.update(_agent);
             }
             if (mode.active) break;
@@ -471,7 +610,7 @@ class ModeController {
 
     flushBehaviorLog() {
         const log = this.behavior_log;
-        this.behavior_log = '';
+        this.behavior_log = "";
         return log;
     }
 

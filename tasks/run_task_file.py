@@ -5,6 +5,11 @@ import json
 import argparse
 import subprocess
 import time
+import shutil
+
+def get_runtime():
+    """Return 'bun' if available, otherwise 'node'."""
+    return "bun" if shutil.which("bun") else "node"
 
 def run_task(task_path, task_id, profiles=None):
     """Run a single task using main.js"""
@@ -12,7 +17,8 @@ def run_task(task_path, task_id, profiles=None):
     if not os.path.isabs(task_path):
         task_path = os.path.abspath(task_path)
     
-    cmd = ["node", "main.js", "--task_path", task_path, "--task_id", task_id]
+    runtime = get_runtime()
+    cmd = [runtime] + (["run"] if runtime == "bun" else []) + ["main.js", "--task_path", task_path, "--task_id", task_id]
     
     # Add profiles if provided
     if profiles:

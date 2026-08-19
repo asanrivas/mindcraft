@@ -84,7 +84,7 @@ index b38bd30..2ca8205 100644
        bot.setControlState('jump', false)
        bot.setControlState('sprint', true)
 diff --git a/node_modules/mineflayer-pathfinder/lib/movements.js b/node_modules/mineflayer-pathfinder/lib/movements.js
-index a7e3505..84a0841 100644
+index a7e3505..eb390fc 100644
 --- a/node_modules/mineflayer-pathfinder/lib/movements.js
 +++ b/node_modules/mineflayer-pathfinder/lib/movements.js
 @@ -50,7 +50,12 @@ class Movements {
@@ -101,7 +101,7 @@ index a7e3505..84a0841 100644
  
      this.liquids = new Set()
      this.liquids.add(registry.blocksByName.water.id)
-@@ -62,7 +67,13 @@ class Movements {
+@@ -62,7 +67,28 @@ class Movements {
  
      this.climbables = new Set()
      this.climbables.add(registry.blocksByName.ladder.id)
@@ -113,10 +113,25 @@ index a7e3505..84a0841 100644
 +    if (registry.blocksByName.twisting_vines_plant) this.climbables.add(registry.blocksByName.twisting_vines_plant.id)
 +    if (registry.blocksByName.cave_vines) this.climbables.add(registry.blocksByName.cave_vines.id)
 +    if (registry.blocksByName.cave_vines_plant) this.climbables.add(registry.blocksByName.cave_vines_plant.id)
++
++    // Underwater plants - should be passable when swimming
++    this.underwaterPlants = new Set()
++    const underwaterPlantNames = ['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant', 'sea_pickle', 'bubble_column']
++    for (const name of underwaterPlantNames) {
++      if (registry.blocksByName[name]) this.underwaterPlants.add(registry.blocksByName[name].id)
++    }
++
++    // Ground cover blocks - should be passable/walkable (1.21.4+)
++    this.groundCover = new Set()
++    const groundCoverNames = ['leaf_litter', 'pale_moss_carpet']
++    for (const name of groundCoverNames) {
++      if (registry.blocksByName[name]) this.groundCover.add(registry.blocksByName[name].id)
++    }
++
      this.emptyBlocks = new Set()
  
      this.replaceables = new Set()
-@@ -92,13 +103,15 @@ class Movements {
+@@ -92,13 +118,15 @@ class Movements {
        }
      })
      registry.blocksArray.forEach(block => {
@@ -134,7 +149,7 @@ index a7e3505..84a0841 100644
  
      this.exclusionAreasStep = []
      this.exclusionAreasBreak = []
-@@ -230,8 +243,13 @@ class Movements {
+@@ -230,8 +258,13 @@ class Movements {
        }
      }
      b.climbable = this.climbables.has(b.type)
@@ -145,12 +160,12 @@ index a7e3505..84a0841 100644
 +    const isOpenTrapdoor = this.openable.has(b.type) && b.name.includes('trapdoor') && b._properties?.open === true
 +    const isClosedTrapdoor = this.openable.has(b.type) && b.name.includes('trapdoor') && b._properties?.open !== true
 +    
-+    b.safe = (b.boundingBox === 'empty' || b.climbable || this.carpets.has(b.type) || isOpenTrapdoor) && !this.blocksToAvoid.has(b.type)
++    b.safe = (b.boundingBox === 'empty' || b.climbable || this.carpets.has(b.type) || isOpenTrapdoor || this.underwaterPlants.has(b.type) || this.groundCover.has(b.type)) && !this.blocksToAvoid.has(b.type)
 +    b.physical = (b.boundingBox === 'block' && !this.fences.has(b.type)) || isClosedTrapdoor
      b.replaceable = this.replaceables.has(b.type) && !b.physical
      b.liquid = this.liquids.has(b.type)
      b.height = pos.y + dy
-@@ -284,6 +302,18 @@ class Movements {
+@@ -284,6 +317,18 @@ class Movements {
      cost += this.exclusionStep(block) // Is excluded so can't move or break
      cost += this.getNumEntitiesAt(block.position, 0, 0, 0) * this.entityCost
      if (block.safe) return cost
@@ -169,7 +184,7 @@ index a7e3505..84a0841 100644
      if (!this.safeToBreak(block)) return 100 // Can't break, so can't move
      toBreak.push(block.position)
  
-@@ -387,8 +417,8 @@ class Movements {
+@@ -387,8 +432,8 @@ class Movements {
      cost += this.safeOrBreak(blockB, toBreak)
      if (cost > 100) return
  
@@ -180,7 +195,7 @@ index a7e3505..84a0841 100644
        toPlace.push({ x: node.x + dir.x, y: node.y, z: node.z + dir.z, dx: 0, dy: 0, dz: 0, useOne: true }) // Indicate that a block should be used on this block not placed
      } else {
        cost += this.safeOrBreak(blockC, toBreak)
-@@ -554,6 +584,54 @@ class Movements {
+@@ -554,6 +599,54 @@ class Movements {
      neighbors.push(new Move(node.x, node.y + 1, node.z, node.remainingBlocks - toPlace.length, cost, toBreak, toPlace))
    }
  
@@ -235,7 +250,7 @@ index a7e3505..84a0841 100644
    // Jump up, down or forward over a 1 block gap
    getMoveParkourForward (node, dir, neighbors) {
      const block0 = this.getBlock(node, 0, -1, 0)
-@@ -656,8 +734,27 @@ class Movements {
+@@ -656,8 +749,27 @@ class Movements {
      this.getMoveDown(node, neighbors)
      this.getMoveUp(node, neighbors)
  

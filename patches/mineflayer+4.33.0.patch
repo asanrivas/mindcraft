@@ -19,7 +19,7 @@ index 496cf63..813a667 100644
        enchantments,
        bot.entity.effects
 diff --git a/node_modules/mineflayer/lib/plugins/inventory.js b/node_modules/mineflayer/lib/plugins/inventory.js
-index 70db312..93d2054 100644
+index 70db312..f1f72c4 100644
 --- a/node_modules/mineflayer/lib/plugins/inventory.js
 +++ b/node_modules/mineflayer/lib/plugins/inventory.js
 @@ -125,10 +125,15 @@ function inject (bot, { hideErrors }) {
@@ -39,6 +39,17 @@ index 70db312..93d2054 100644
        })
      }
    }
+@@ -470,6 +475,10 @@ function inject (bot, { hideErrors }) {
+         // expect another update in slot 2
+         await once(bot.currentWindow, 'updateSlot:2')
+       }
++    } else if (window.type && (window.type.includes('chest') || window.type.includes('generic') ||
++               window.type.includes('barrel') || window.type.includes('shulker'))) {
++      // For chest-type containers, wait for the specific slot update
++      await once(bot.currentWindow, `updateSlot:${slot}`)
+     }
+   }
+ 
 diff --git a/node_modules/mineflayer/lib/plugins/place_block.js b/node_modules/mineflayer/lib/plugins/place_block.js
 index fdaec6b..08983b6 100644
 --- a/node_modules/mineflayer/lib/plugins/place_block.js

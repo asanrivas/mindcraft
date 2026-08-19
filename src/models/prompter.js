@@ -1,4 +1,4 @@
-import { readFileSync, mkdirSync, writeFileSync} from 'fs';
+import { readFileSync, mkdirSync, writeFileSync, readdirSync, unlinkSync, statSync, existsSync } from 'fs';
 import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
 import { SkillLibrary } from "../agent/library/skill_library.js";
@@ -9,9 +9,57 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { selectAPI, createModel } from './_model_map.js';
+import Vec3 from 'vec3';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Track last cleanup time to avoid running cleanup too frequently
+let lastLogCleanup = 0;
+const CLEANUP_INTERVAL_MS = 60000; // Run cleanup at most once per minute
+
+/**
+ * Clean up old log files, keeping only the most recent ones
+ * @param {string} dirPath - Directory path to clean
+ * @param {number} keepCount - Number of files to keep (default: 20)
+ */
+function cleanupOldLogs(dirPath, keepCount = 20) {
+    try {
+        if (!existsSync(dirPath)) return;
+
+        let files = readdirSync(dirPath)
+            .filter(f => {
+                const filePath = path.join(dirPath, f);
+                try {
+                    return statSync(filePath).isFile();
+                } catch {
+                    return false;
+                }
+            })
+            .map(f => ({
+                name: f,
+                path: path.join(dirPath, f),
+                mtime: statSync(path.join(dirPath, f)).mtime.getTime()
+            }))
+            .sort((a, b) => b.mtime - a.mtime); // Sort by modification time, newest first
+
+        // Delete files beyond keepCount
+        if (files.length > keepCount) {
+            const toDelete = files.slice(keepCount);
+            for (const file of toDelete) {
+                try {
+                    unlinkSync(file.path);
+                    console.log(`[Cleanup] Deleted old log: ${file.name}`);
+                } catch (err) {
+                    console.warn(`[Cleanup] Failed to delete ${file.name}: ${err.message}`);
+                }
+            }
+            console.log(`[Cleanup] Removed ${toDelete.length} old log file(s) from ${dirPath}`);
+        }
+    } catch (err) {
+        console.warn(`[Cleanup] Error cleaning up logs in ${dirPath}: ${err.message}`);
+    }
+}
 
 export class Prompter {
     constructor(agent, profile) {
@@ -45,7 +93,7 @@ export class Prompter {
 
         this.convo_examples = null;
         this.coding_examples = null;
-        
+
         let name = this.profile.name;
         this.cooldown = this.profile.cooldown ? this.profile.cooldown : 0;
         this.last_prompt_time = 0;
@@ -75,7 +123,7 @@ export class Prompter {
             this.vision_model = this.chat_model;
         }
 
-        
+
         let embedding_model_profile = null;
         if (this.profile.embedding) {
             try {
@@ -88,7 +136,8 @@ export class Prompter {
             this.embedding_model = createModel(embedding_model_profile);
         }
         else {
-            this.embedding_model = createModel({api: chat_model_profile.api});
+            // Use the full chat model profile for embeddings to preserve Azure config
+            this.embedding_model = createModel(chat_model_profile);
         }
 
         this.skill_libary = new SkillLibrary(agent, this.embedding_model);
@@ -113,7 +162,7 @@ export class Prompter {
         try {
             this.convo_examples = new Examples(this.embedding_model, settings.num_examples);
             this.coding_examples = new Examples(this.embedding_model, settings.num_examples);
-            
+
             // Wait for both examples to load before proceeding
             await Promise.all([
                 this.convo_examples.load(this.profile.conversation_examples),
@@ -134,6 +183,71 @@ export class Prompter {
         }
     }
 
+    _getSurroundings(bot) {
+        if (!bot || !bot.entity) return 'Surroundings: Unknown';
+        
+        const pos = bot.entity.position;
+        const roundPos = { x: Math.floor(pos.x), y: Math.floor(pos.y), z: Math.floor(pos.z) };
+        const facing = bot.entity.yaw; 
+        
+        // Helper to map yaw to cardinal
+        // Minecraft Yaw: South=0, West=PI/2, North=PI, East=-PI/2
+        // We normalize to 0-2PI then segment
+        let normalizedYaw = facing % (2 * Math.PI);
+        if (normalizedYaw < 0) normalizedYaw += 2 * Math.PI;
+        
+        const cardinal = ['South', 'West', 'North', 'East'][Math.round(normalizedYaw / (Math.PI / 2)) % 4];
+
+        // 5x5x3 grid around bot
+        let grid = `IMMEDIATE SURROUNDINGS (Facing: ${cardinal} at ${roundPos.x},${roundPos.y},${roundPos.z}):\n`;
+        
+        // Symbols
+        const sym = (name) => {
+            if (name === 'air') return ' _ ';
+            if (name === 'water') return ' ~ ';
+            if (name === 'lava') return ' ! ';
+            if (name === 'fire' || name === 'soul_fire') return ' ^ ';
+            if (name.includes('log')) return ' O ';
+            if (name.includes('leaves')) return ' * ';
+            if (name.includes('glass')) return ' []';
+            if (name.includes('door')) return ' D ';
+            if (name.includes('cactus')) return ' X ';
+            if (name.includes('magma')) return ' M ';
+            return ' # '; // Solid
+        };
+
+        const range = [-1, 0, 1];
+        const labels = ['FEET (y-1)', 'BODY (y+0)', 'HEAD (y+1)'];
+        
+        // Y levels: -1 (feet), 0 (body), 1 (head)
+        for (let y = -1; y <= 1; y++) {
+            grid += `  [${labels[y + 1]}]:\n`;
+            for (let z = -2; z <= 2; z++) {
+                grid += '    ';
+                for (let x = -2; x <= 2; x++) {
+                    const block = bot.blockAt(pos.offset(x, y, z));
+                    const isSelf = (x === 0 && z === 0 && (y === 0 || y === 1));
+                    if (isSelf) grid += '[@]';
+                    else grid += sym(block ? block.name : 'air');
+                }
+                grid += '\n';
+            }
+        }
+        return grid;
+    }
+
+    _getRecentActions(agent) {
+        // Strategy: Use history for stability.
+        const history = agent.history.getHistory();
+        const recentSystem = history
+            .filter(msg => msg.role === 'system' && !msg.content.startsWith('Summarized memory'))
+            .slice(-5)
+            .map(msg => msg.content)
+            .join('\n');
+            
+        return `RECENT ACTIONS/EVENTS:\n${recentSystem || 'No recent actions recorded.'}`;
+    }
+
     async replaceStrings(prompt, messages, examples=null, to_summarize=[], last_goals=null) {
         prompt = prompt.replaceAll('$NAME', this.agent.name);
 
@@ -145,6 +259,29 @@ export class Prompter {
                 let stats = await getCommand('!stats').perform(this.agent) + '\n';
                 stats += await getCommand('!entities').perform(this.agent) + '\n';
                 
+                // Add Environmental Context
+                const bot = this.agent.bot;
+                if (bot && bot.entity) {
+                    const pos = bot.entity.position;
+                    let biome = 'Unknown';
+                    try {
+                        // biome detection might fail if chunk not loaded
+                        const b = bot.world.getBiome(pos);
+                        if (b) biome = b.name;
+                    } catch (e) {}
+
+                    // Light level (0-15)
+                    const block = bot.blockAt(pos);
+                    const light = block ? block.light : 0;
+                    const skyLight = block ? block.skyLight : 0;
+                    
+                    const time = bot.time.timeOfDay;
+                    const isNight = time > 13000 && time < 23000;
+                    const timeLabel = isNight ? "Night (Danger)" : "Day (Safe)";
+                    
+                    stats += `Environment: Biome=${biome} | Light=${light} (Sky=${skyLight}) | Time=${timeLabel}\n`;
+                }
+
                 // Conditionally include nearby blocks
                 if (settings.include_nearby_blocks !== false) {
                     stats += await getCommand('!nearbyBlocks').perform(this.agent);
@@ -152,6 +289,15 @@ export class Prompter {
                 prompt = prompt.replaceAll('$STATS', stats);
             }
         }
+        
+        // New Context Variables
+        if (prompt.includes('$SURROUNDINGS')) {
+            prompt = prompt.replaceAll('$SURROUNDINGS', this._getSurroundings(this.agent.bot));
+        }
+        if (prompt.includes('$RECENT_ACTIONS')) {
+            prompt = prompt.replaceAll('$RECENT_ACTIONS', this._getRecentActions(this.agent));
+        }
+
         if (prompt.includes('$INVENTORY')) {
             // Conditional inventory based on settings
             if (settings.include_inventory === false) {
@@ -180,22 +326,6 @@ export class Prompter {
             prompt = prompt.replaceAll('$EXAMPLES', await examples.createExampleMessage(messages));
         if (prompt.includes('$MEMORY'))
             prompt = prompt.replaceAll('$MEMORY', this.agent.history.memory);
-        if (prompt.includes('$RELEVANT_MEMORIES')) {
-            // Semantic memory search - find relevant memories based on current conversation
-            if (settings.use_local_embeddings && messages && messages.length > 0) {
-                // Use the last user message as search query
-                const lastUserMessage = messages.slice().reverse().find(msg => msg.role === 'user');
-                if (lastUserMessage) {
-                    const query = lastUserMessage.content.replace(/^[^:]+:\s*/, ''); // Remove sender prefix
-                    const relevantMemories = await this.agent.history.getRelevantMemories(query, 3);
-                    prompt = prompt.replaceAll('$RELEVANT_MEMORIES', relevantMemories || '');
-                } else {
-                    prompt = prompt.replaceAll('$RELEVANT_MEMORIES', '');
-                }
-            } else {
-                prompt = prompt.replaceAll('$RELEVANT_MEMORIES', '');
-            }
-        }
         if (prompt.includes('$TO_SUMMARIZE'))
             prompt = prompt.replaceAll('$TO_SUMMARIZE', stringifyTurns(to_summarize));
         if (prompt.includes('$CONVO'))
@@ -392,5 +522,12 @@ export class Prompter {
 
         logFile = path.join(logDir, logFile);
         await fs.appendFile(logFile, String(logEntry), 'utf-8');
+
+        // Periodically clean up old logs (at most once per minute)
+        const now = Date.now();
+        if (now - lastLogCleanup > CLEANUP_INTERVAL_MS) {
+            lastLogCleanup = now;
+            cleanupOldLogs(logDir, 20);
+        }
     }
 }

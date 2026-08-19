@@ -8,6 +8,12 @@ export class AgentProcess {
     constructor(name, port) {
         this.name = name;
         this.port = port;
+        this.onExitCallback = null;
+    }
+
+    // Set a callback to be called when the agent exits (regardless of exit code)
+    onExit(callback) {
+        this.onExitCallback = callback;
     }
 
     start(load_memory=false, init_message=null, count_id=0) {
@@ -48,6 +54,9 @@ export class AgentProcess {
                 console.log('Restarting agent...');
                 this.start(true, 'Agent process restarted.', count_id, this.port);
                 last_restart = Date.now();
+            } else if (code === 0 && this.onExitCallback) {
+                // Clean exit (e.g., idle disconnect) - notify caller
+                this.onExitCallback(code, signal);
             }
         });
     

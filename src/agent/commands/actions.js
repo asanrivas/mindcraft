@@ -3,6 +3,8 @@ import * as swim from '../library/swim.js';
 import { measureSwim, formatProbe } from '../library/swim_probe.js';
 import * as worldGuard from '../library/world_guard.js';
 import * as creative from '../library/creative.js';
+import * as mining from '../library/mining.js';
+import { ORIGIN as MEM_ORIGIN } from '../memory_store.js';
 import { Vec3 } from 'vec3';
 import fs from 'fs';
 import settings from '../settings.js';
@@ -1112,6 +1114,20 @@ export const actionsList = [
             'selfPrompt': { type: 'string', description: 'The goal prompt.' },
         },
         perform: async function (agent, prompt) {
+            // Authorship comes from agent.command_author, stamped where the command entered the
+            // system. self_prompter.isActive() looked like the right signal and is NOT: the model
+            // emits !goal from an ordinary turn BEFORE the loop starts, so that check reported
+            // "user" and let a self-invented goal claim user immunity - observed live.
+            const fromModel = agent.command_author === 'model';
+            const res = fromModel
+                ? agent.history.store.setGoal(prompt, MEM_ORIGIN.AGENT)
+                : agent.history.setUserGoal(prompt);
+            if (!res.ok) {
+                return `Kept the existing goal: ${agent.history.store.goal()} (${res.reason}). `
+                     + 'Ask the player to change it if it is finished.';
+            }
+            agent.history.saveStore();
+
             if (convoManager.inConversation()) {
                 agent.self_prompter.setPromptPaused(prompt);
             }
@@ -1315,6 +1331,18 @@ export const actionsList = [
             if (!r.ok) return `CREATIVE CLEAR FAILED: ${r.error}`;
             return `CREATIVE CLEAR: emptied ${r.cleared} slot(s).`;
         }, false, 1)
+    },
+    {
+        name: '!branchMine',
+        description: 'Dig down and branch-mine for ores, then return to where you started. Use this instead of !collectBlocks for ores.',
+        params: {
+            'depth': { type: 'int', description: 'Y level to mine at, e.g. -12 for diamonds.', domain: [-60, 60] },
+            'length': { type: 'int', description: 'Length of the main corridor in blocks.', domain: [4, 64] }
+        },
+        perform: runAsAction(async (agent, depth, length) => {
+            const r = await mining.branchMine(agent.bot, { targetY: depth, mainLength: length });
+            return mining.formatMineReport(r);
+        }, false, 20)
     },
     {
         name: '!creativeIdSweep',

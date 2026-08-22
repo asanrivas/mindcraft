@@ -5,6 +5,7 @@ import { LocalEmbedding } from '../models/local_embedding.js';
 import { cosineSimilarity } from '../utils/math.js';
 import { getNamedChestsJson } from './library/skills.js';
 import { getBudget } from '../utils/context_budget.js';
+import { MemoryStore, ORIGIN, KIND, saveStore, loadStore } from './memory_store.js';
 
 /**
  * Clean up old log files, keeping only the most recent ones
@@ -63,8 +64,21 @@ export class History {
 
         this.turns = [];
 
-        // Natural language memory as a summary of recent messages + previous memory
+        // Natural language memory as a summary of recent messages + previous memory.
+        // Kept as the rendered VIEW of `store`; the store is the source of truth.
         this.memory = '';
+
+        /**
+         * Typed, provenance-tracked memory. `this.memory` used to be a single blob that the
+         * summariser rewrote wholesale, so a user-assigned task survived only as long as the
+         * model chose to restate it - and one did not, silently replacing "build a base, mine,
+         * return" with a self-invented 5820-block trek that then reloaded on every restart.
+         *
+         * The store refuses an agent write against a user-authored record, so that class of
+         * loss is now impossible rather than merely discouraged. See memory_store.js.
+         */
+        this.store_fp = `./bots/${this.name}/memory_store.json`;
+        this.store = new MemoryStore();
 
         // Maximum number of messages to keep in context before saving chunk to memory.
         // Scaled from the model's context window unless explicitly configured.
@@ -87,16 +101,65 @@ export class History {
         return JSON.parse(JSON.stringify(this.turns));
     }
 
+    /** Persist the typed store (atomic write + journal append). Never throws. */
+    saveStore() {
+        try { saveStore(this.store, this.store_fp); }
+        catch (err) { console.warn('[History] could not save memory store:', err.message); }
+    }
+
+    /**
+     * Load the typed store, migrating the legacy blob the first time.
+     *
+     * The migration imports everything as AGENT origin: prose written by a model cannot prove a
+     * human asked for it, and marking it USER would grant exactly the immunity the store exists
+     * to withhold. A real user goal is set explicitly via setGoal(..., ORIGIN.USER).
+     */
+    loadStore(legacyBlob = '') {
+        try {
+            this.store = loadStore(this.store_fp);
+            if (this.store.records.size === 0 && legacyBlob) {
+                const n = this.store.importLegacyBlob(legacyBlob);
+                console.log(`[History] migrated ${n} fact(s) from the legacy memory blob (all agent-origin).`);
+                this.saveStore();
+            }
+        } catch (err) {
+            console.warn('[History] could not load memory store:', err.message);
+            this.store = new MemoryStore();
+        }
+        return this.store;
+    }
+
+    /** Set the goal as a durable, user-authored record the model cannot overwrite. */
+    setUserGoal(text) {
+        const r = this.store.setGoal(text, ORIGIN.USER);
+        if (r.ok) {
+            this.memory = this.store.render(getBudget().memory_chars);
+            this.saveStore();
+        }
+        return r;
+    }
+
     async summarizeMemories(turns) {
         console.log("Storing memories...");
-        this.memory = await this.agent.prompter.promptMemSaving(turns);
-        this.memory = stripGroundedFacts(this.memory);
+        const summary = stripGroundedFacts(await this.agent.prompter.promptMemSaving(turns));
+
+        // Route the model's summary through the store as AGENT-origin writes. Any line that
+        // tries to rewrite a user-authored record - the goal, above all - is rejected here
+        // rather than silently winning, which is the whole point of the store.
+        const before = this.store.goal();
+        const rejectedBefore = this.store.rejections;
+        this.store.importLegacyBlob(summary);
+        const blocked = this.store.rejections - rejectedBefore;
+        if (blocked > 0) {
+            console.log(`[History] memory store rejected ${blocked} agent write(s) against user-authored records.`);
+        }
+        if (before && this.store.goal() !== before) {
+            console.warn('[History] user goal changed during summarisation - this should be impossible.');
+        }
 
         const memory_cap = getBudget().memory_chars;
-        if (this.memory.length > memory_cap) {
-            this.memory = this.memory.slice(0, memory_cap);
-            this.memory += '...(truncated, compress more next time)';
-        }
+        this.memory = this.store.render(memory_cap);
+        this.saveStore();
 
         console.log("Memory updated to: ", this.memory);
 
@@ -220,8 +283,13 @@ export class History {
                 return null;
             }
             const data = JSON.parse(readFileSync(this.memory_fp, 'utf8'));
-            this.memory = data.memory || '';
             this.turns = data.turns || [];
+
+            // The typed store is the source of truth; `this.memory` is its rendered view. On the
+            // first run it is seeded from the legacy blob so nothing already remembered is lost.
+            this.loadStore(data.memory || '');
+            this.memory = this.store.records.size ? this.store.render(getBudget().memory_chars)
+                                                  : (data.memory || '');
             // Load saved places if available
             if (data.saved_places && this.agent.memory_bank) {
                 this.agent.memory_bank.loadJson(data.saved_places);

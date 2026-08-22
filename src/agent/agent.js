@@ -371,6 +371,13 @@ export class Agent {
                     // add the preceding message to the history to give context for newAction
                     this.history.add(source, message);
                 }
+                // Authorship, recorded at the only point where it is still known. By the time a
+                // command's perform() runs, the text alone cannot say whether a person typed it
+                // or the model emitted it - and memory_store needs that to protect a user's goal
+                // from being overwritten by one the model invented. Inferring it later from
+                // self_prompter.isActive() is wrong: the model issues !goal from an ordinary
+                // turn, before the loop starts, and that read as "user".
+                this.command_author = 'user';
                 let execute_res = await executeCommand(this, message);
                 if (execute_res)
                     this.routeResponse(source, execute_res);
@@ -448,6 +455,7 @@ export class Agent {
                         this.routeResponse(source, pre_message);
                 }
 
+                this.command_author = 'model';   // see the note on the user path above
                 let execute_res = await executeCommand(this, res);
 
                 console.log('Agent executed:', command_name, 'and got:', execute_res);

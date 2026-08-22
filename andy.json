@@ -1,38 +1,38 @@
 {
     "name": "andy",
     "model": {
-        "api": "llamacpp",
-        "model": "qwen3.5-9b-uncensored",
-        "url": "http://127.0.0.1:8000/v1",
+        "api": "openrouter",
+        "model": "stealth/ox-alpha",
         "params": {
-            "max_tokens": "auto",
-            "temperature": 0.7,
-            "top_p": 0.8,
-            "top_k": 20,
-            "presence_penalty": 1.5,
-            "chat_template_kwargs": {
-                "enable_thinking": false
-            }
+            "max_tokens": 2048,
+            "temperature": 0.7
         }
     },
     "backup_model": [
         {
-            "api": "openrouter",
-            "model": "stealth/ox-alpha",
-            "params": {
-                "max_tokens": 2048,
-                "temperature": 0.7
-            }
-        },
-        {
             "api": "fireworks",
             "model": "deepseek-v4-flash-0731",
+            "url": "https://api.fireworks.ai/inference/v1",
             "params": {
                 "max_tokens": 1024,
                 "reasoning_effort": "low",
                 "temperature": 0.7
-            },
-            "url": "https://api.fireworks.ai/inference/v1"
+            }
+        },
+        {
+            "api": "llamacpp",
+            "model": "qwen3.5-9b-uncensored",
+            "url": "http://127.0.0.1:8000/v1",
+            "params": {
+                "max_tokens": "auto",
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "top_k": 20,
+                "presence_penalty": 1.5,
+                "chat_template_kwargs": {
+                    "enable_thinking": false
+                }
+            }
         }
     ],
     "backup_cooldown_secs": 60,

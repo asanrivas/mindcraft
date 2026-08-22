@@ -129,6 +129,38 @@ function readerAt(bot, pos) {
 }
 
 /**
+ * How long to allow a single block break before giving up on it.
+ *
+ * `tools.digWithTool` does a bare `await bot.dig(block)`, which is UNBOUNDED: mineflayer waits
+ * for a block-update packet that, on this protocol-775-vs-774 server, may never arrive. That is
+ * what hung the first two live mining runs - `executing code...` and then nothing at all, in
+ * both creative and survival, with the bot never moving a block.
+ *
+ * Nothing legitimate takes 8s: netherite through deepslate is well under a second. A dig that
+ * exceeds this is not slow, it is lost, so abandon it and let the caller's stall detection deal
+ * with the consequences.
+ */
+const DIG_TIMEOUT_MS = 8000;
+
+/** `digWithTool`, but it always settles. Cancels the in-flight dig so the next one can start. */
+async function digBounded(bot, block, ms = DIG_TIMEOUT_MS) {
+    let timer;
+    try {
+        await Promise.race([
+            digWithTool(bot, block),
+            new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('dig timeout')), ms); }),
+        ]);
+        return true;
+    } catch {
+        // Leave mineflayer in a usable state: a dig it still believes is running blocks the next.
+        try { bot.stopDigging?.(); } catch { /* nothing useful to do */ }
+        return false;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+/**
  * Dig one cell if it is safe and solid. Returns what happened, never throws.
  * @returns {Promise<'dug'|'skipped'|'blocked'|'unsafe'>}
  */
@@ -142,12 +174,7 @@ export async function digCell(bot, pos, opts = {}) {
         if (opts.onUnsafe) opts.onUnsafe(pos, verdict.reason);
         return 'unsafe';
     }
-    try {
-        await digWithTool(bot, block);
-        return 'dug';
-    } catch {
-        return 'blocked';
-    }
+    return (await digBounded(bot, block)) ? 'dug' : 'blocked';
 }
 
 /**
@@ -211,7 +238,7 @@ export async function staircaseDown(bot, targetY, opts = {}) {
 
         const target = ahead.offset(0, -1, 0);
         await nav.navigateTo(bot, { x: target.x + 0.5, y: target.y, z: target.z + 0.5 },
-                             { ...STEP_NAV, timeoutMs: 8000 });
+                             STEP_NAV);
 
         // Judge on MEASURED descent, never on nav's arrived flag - at these tolerances the flag
         // reads true before the bot has moved at all.
@@ -270,7 +297,7 @@ export async function mineCorridor(bot, dir, length, opts = {}) {
 
         const from = bot.entity.position.clone();
         await nav.navigateTo(bot, { x: feet.x + 0.5, y: feet.y, z: feet.z + 0.5 },
-                             { ...STEP_NAV, timeoutMs: 6000 });
+                             STEP_NAV);
         // Measured, not reported: a one-block goal sits inside nav's default arrival tolerance,
         // so `arrived` is true before the bot moves. Distance actually covered is the truth.
         const moved = bot.entity.position.distanceTo(from);
@@ -368,6 +395,12 @@ export async function branchMine(bot, opts = {}) {
         return report;
     };
 
+    // Phase logging. The first two failures were invisible - `executing code...` and then
+    // nothing for twenty minutes - so there was no way to tell a hang from slow progress
+    // without guessing. Cheap lines beat a second round of hypotheses.
+    const at = () => { const p = bot.entity.position; return `(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`; };
+    console.log(`[mine] start ${at()} target y=${o.targetY} main=${o.mainLength}`);
+
     // 1. Descend.
     if (bot.entity.position.y > o.targetY + 1) {
         const d = await staircaseDown(bot, o.targetY, { deadlineMs: Math.min(300000, left()) });
@@ -381,6 +414,7 @@ export async function branchMine(bot, opts = {}) {
         report.descended = true;
     }
     report.minedY = Math.round(bot.entity.position.y);
+    console.log(`[mine] descent done ${at()} reached=${report.descended} ${report.descendStopped || ''}`);
     if (left() <= 0) return finish('timeout during descent');
 
     // 2. Main corridor, harvesting as it goes.
@@ -388,6 +422,7 @@ export async function branchMine(bot, opts = {}) {
     const main = await mineCorridor(bot, dir, o.mainLength,
         { deadlineMs: Math.min(left(), 300000), onOre: noteOre });
     report.dug += main.dug; report.ores += main.ores;
+    console.log(`[mine] main corridor ${at()} dug=${main.dug} ores=${main.ores} stopped=${main.stopped || 'ok'}`);
     if (main.stopped === 'inventory full') return finish('inventory full');
     if (left() <= 0) return finish('timeout in main corridor');
 

@@ -1340,8 +1340,17 @@ export const actionsList = [
             'length': { type: 'int', description: 'Length of the main corridor in blocks.', domain: [4, 64] }
         },
         perform: runAsAction(async (agent, depth, length) => {
-            const r = await mining.branchMine(agent.bot, { targetY: depth, mainLength: length });
-            return mining.formatMineReport(r);
+            console.log(`[mine] perform entered depth=${depth} length=${length}`);
+            try {
+                const r = await mining.branchMine(agent.bot, { targetY: depth, mainLength: length });
+                console.log('[mine] branchMine returned');
+                return mining.formatMineReport(r);
+            } catch (err) {
+                // branchMine is documented never to throw; if it does, say so rather than letting
+                // the action manager swallow it into an idle state with no output at all.
+                console.error('[mine] branchMine THREW:', err?.stack || err);
+                return `MINE ERROR: ${err?.message || err}`;
+            }
         }, false, 20)
     },
     {

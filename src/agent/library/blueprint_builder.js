@@ -116,8 +116,20 @@ function findHover(bot, P, faceName) {
 // Own flight loop instead of bot.creative.flyTo: that one cannot be cancelled, so racing
 // it against a timeout leaks a background loop that keeps steering the bot toward a stale
 // destination forever. This version is bounded and leaves no orphan.
+//
+// Server agreement is NOT guaranteed: this mutates the client's belief, and a server that
+// rejects the moves (e.g. the bot is embedded in blocks it dug) silently pins the player
+// while the client "flies" away - every later placement then fails with a blockUpdate
+// timeout because it is issued from 100+ blocks off. Hence: declare flying via the
+// abilities packet (mineflayer never sends it, making hover technically illegal), keep the
+// step under ~7 m/s, and let forcedMove corrections stand (d is recomputed from
+// bot.entity.position each tick, which a correction overwrites).
+let declaredFlying = false;
 async function flyToWithTimeout(bot, dest, ms = 12000) {
     bot.creative.startFlying();
+    if (!declaredFlying) {
+        try { bot._client.write('abilities', { flags: 2 }); declaredFlying = true; } catch (e) { /* older proto */ }
+    }
     const start = Date.now();
     while (Date.now() - start < ms) {
         const d = dest.minus(bot.entity.position);
@@ -125,7 +137,7 @@ async function flyToWithTimeout(bot, dest, ms = 12000) {
         if (mag < 0.6) break;
         bot.physics.gravity = 0;
         bot.entity.velocity.set(0, 0, 0);
-        bot.entity.position.add(d.scaled(Math.min(0.5, mag) / mag));
+        bot.entity.position.add(d.scaled(Math.min(0.35, mag) / mag));
         await new Promise(r => setTimeout(r, 50));
     }
 }

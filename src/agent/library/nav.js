@@ -34,6 +34,7 @@ const DEFAULTS = {
     horizon: 10,         // executor lookahead, in blocks
     arriveXZ: 0.85,      // horizontal tolerance for "reached this waypoint"
     arriveDist: 2,       // horizontal tolerance for "reached the goal"
+    arriveY: 1.25,       // vertical tolerance - see atGoal(); XZ-only "arrival" is a lie
     waypointMs: 6000,    // give up on a single steering target after this
     maxReplans: 6,
     sprint: true,
@@ -596,7 +597,19 @@ export async function followPath(bot, path, opts = {}) {
                 // propulsion, so pulsing it makes the bot bob instead of advance; and neither
                 // mining nor placing works while floating, for the same reason pillaring does
                 // not. SwimAssist owns the jump key here - followPath must not touch it.
-                // Steering plus held-forward is the whole locomotion story in water.
+                //
+                // But it must still be able to LEAVE the water. Buoyancy only holds jump while
+                // the head is submerged, so a bot floating at the surface next to a one-block
+                // ledge can never rise onto it - it just presses into the wall forever. That
+                // stranded the bot outside its own igloo for 20 minutes: the planner found the
+                // route in 3ms, and the executor could not climb the final block.
+                //
+                // Ask the assist to climb whenever the route goes up. Rising is 0.175 b/t, so
+                // the bot floats up and the held-forward carries it onto the ledge - which is
+                // exactly how a player exits water onto a bank.
+                if (bot.swimAssist) {
+                    bot.swimAssist.setMode(target.y > Math.floor(p.y) ? 'climb' : 'auto');
+                }
                 lastProgress = Date.now();
             } else if (o.digWhenPinned && Date.now() - stallSince > o.pinnedMs && hops >= 2) {
                 // Genuinely pinned against a block face: hopping cannot help, and the planner
@@ -633,6 +646,9 @@ export async function followPath(bot, path, opts = {}) {
     } finally {
         bot.setControlState('forward', false);
         bot.setControlState('sprint', false);
+        // Hand buoyancy back to its default. Leaving it in 'climb' would keep shoving the bot
+        // upward against whatever is overhead long after the leg ended.
+        if (bot.swimAssist) bot.swimAssist.setMode('auto');
     }
 
     const covered = bot.entity.position.distanceTo(startPos);
@@ -695,6 +711,27 @@ function angleDelta(a, b) {
  * Plan and walk to a position, replanning as needed.
  * @returns {Promise<{arrived:boolean, covered:number, replans:number}>}
  */
+
+/**
+ * Have we actually reached the goal?
+ *
+ * The horizontal test alone is not enough, and this is the same mistake CLAUDE.md already
+ * records for WAYPOINT retirement - it just also lived at the goal level. Measured: asked to
+ * enter a doorway at y=63, the bot floating in water at y=62 outside the wall was 1.48 blocks
+ * away horizontally, so `arriveDist: 2` reported `arrived=true covered=0.0` while it sat
+ * outside the building. "Arrived" that ignores height means "gave up next to the target".
+ *
+ * goalXZOnly callers opt out entirely. arriveY is deliberately tight: one block covers standing on the target cell or on the block
+ * below it, which is the honest range for "I am there".
+ */
+function reachedGoal(p, goal, o) {
+    if (Math.hypot(goal.x - p.x, goal.z - p.z) > o.arriveDist) return false;
+    // goalXZOnly callers (travelDirection walks toward a compass heading) genuinely do not care
+    // about height - honour that, or every travel leg would report failure.
+    if (o.goalXZOnly) return true;
+    return Math.abs(p.y - goal.y) <= (o.arriveY ?? 1.25);
+}
+
 export async function navigateTo(bot, goal, opts = {}) {
     const o = { ...DEFAULTS, ...opts };
     const startPos = bot.entity.position.clone();
@@ -704,7 +741,7 @@ export async function navigateTo(bot, goal, opts = {}) {
     for (let attempt = 0; attempt < o.maxReplans; attempt++) {
         if (bot.interrupt_code) break;
         const p = bot.entity.position;
-        if (Math.hypot(goal.x - p.x, goal.z - p.z) <= o.arriveDist) break;
+        if (reachedGoal(p, goal, o)) break;
 
         const path = planPath(bot, goal, o);
         if (!path || path.length < 2) break;
@@ -718,7 +755,7 @@ export async function navigateTo(bot, goal, opts = {}) {
 
     const p = bot.entity.position;
     return {
-        arrived: Math.hypot(goal.x - p.x, goal.z - p.z) <= o.arriveDist,
+        arrived: reachedGoal(bot.entity.position, goal, o),
         covered: p.distanceTo(startPos),
         replans,
     };

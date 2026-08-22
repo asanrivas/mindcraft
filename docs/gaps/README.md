@@ -21,6 +21,7 @@ value each unlocks. Compiled 2026-08-22, after the swimming work made Andy morta
 | 3 | **Boats** | crosses oceans at ~8 blocks/s in a boat | swims at 2 b/s; no vehicle code at all — `boat` appears nowhere in skills | [boats.md](boats.md) |
 | 4 | **Ranged combat + shield** | kites with a bow, blocks with a shield | `!shoot` with bow AND crossbow shipped + live-verified; shield reflex and self_defense wiring still open (server is on peaceful — no hostiles to test against) | [ranged-combat.md](ranged-combat.md) |
 | 5 | **Resource progression** | wood -> stone -> iron -> diamond autonomously | the pieces exist (`collectBlocks`, `craftRecipe`, `smeltItem`, `digDown`) but nothing sequences them; no ore-finding strategy; `getCraftingPlan` is informational only | [resource-progression.md](resource-progression.md) |
+| 7 | **Safe autonomy for `!newAction`** | doesn't need one — a human knows the recipe | free-form codegen: crashed the bot process live while trying to walk through a door the navigator handles | [playbooks.md](playbooks.md) |
 | 6 | **The Nether** | builds a portal, lights it, navigates hell terrain | zero portal/dimension logic; the navigator has never seen lava oceans or ceiling bedrock | [nether.md](nether.md) |
 
 ## Gaps noted but NOT planned yet

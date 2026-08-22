@@ -189,12 +189,33 @@ export class Agent {
             "Gamerule "
         ];
 
+        // Every inbound line arrives TWICE: respondFunc is bound to both 'whisper' and 'chat',
+        // and a server /msg (which is how RCON talks to the bot) fires both events. The bot then
+        // answered its own duplicated history - measured live: every RCON instruction appeared
+        // twice in the conversation, the model repeated one !serverFill four times, and the
+        // duplicate turns helped drive 78 "context length exceeded" retries in a day.
+        //
+        // Deduped here rather than by unbinding an event: 'chat' is needed for public chat and
+        // 'whisper' for private, and this also absorbs any other double-delivery path.
+        const recent_messages = new Map(); // "user\0text" -> timestamp
+        const DUPLICATE_WINDOW_MS = 1500;
+
         const respondFunc = async (username, message) => {
             if (message === "") return;
             if (username === this.name) return;
             if (settings.only_chat_with.length > 0 && !settings.only_chat_with.includes(username)) return;
             try {
                 if (ignore_messages.some((m) => message.startsWith(m))) return;
+
+                const key = `${username}\0${message}`;
+                const now = Date.now();
+                const seen = recent_messages.get(key);
+                if (seen !== undefined && now - seen < DUPLICATE_WINDOW_MS) return;
+                recent_messages.set(key, now);
+                if (recent_messages.size > 64) {
+                    for (const [k, t] of recent_messages)
+                        if (now - t > DUPLICATE_WINDOW_MS) recent_messages.delete(k);
+                }
 
                 this.shut_up = false;
 

@@ -49,7 +49,8 @@ main.js → MindServer (:8080) + AgentProcess → Agent
 **Building**: `!fill(blockType, x1, z1, x2, z2, y, height)` - Fill area with blocks, height for walls
 **Movement**: `!goToPlayer`, `!followPlayer`, `!goToCoordinates`
 **Water**: `!swimTo`, `!dive`, `!surface`, `!swimProbe`
-**World**: `!worldSeed`, `!locateBiome(biome)` - both ask the server, so they need op
+**Combat**: `!shoot(mob, "bow"|"crossbow"|"auto")` - ranged, refuses players
+**World**: `!worldSeed`, `!locateBiome(biome)`, `!serverGive`, `!serverGamemode`, `!serverSpawnpoint` - operator
 **Resources**: `!collectBlocks`, `!craftRecipe`, `!getCraftingPlan`
 **Storage**: `!putInChest`, `!takeFromChest`, `!depositAll`
 **Info**: `!inventory`, `!stats`, `!surroundings`, `!scanArea`

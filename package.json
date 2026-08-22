@@ -55,7 +55,7 @@
   "scripts": {
     "postinstall": "patch-package",
     "start": "command -v bun >/dev/null 2>&1 && bun run main.js || node main.js",
-    "test": "bun tests/tools.test.mjs && bun tests/steering.test.mjs && bun tests/fallback.test.mjs && bun tests/swim.test.mjs"
+    "test": "bun tests/tools.test.mjs && bun tests/steering.test.mjs && bun tests/fallback.test.mjs && bun tests/swim.test.mjs && bun tests/archery.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",

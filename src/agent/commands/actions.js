@@ -836,6 +836,36 @@ export const actionsList = [
         }, false, 1)
     },
     {
+        name: '!shoot',
+        description: 'Shoot a mob with bow or crossbow from range. Refuses players. Needs arrows.',
+        params: {
+            'mob_type': { type: 'string', description: 'The mob to shoot, e.g. "zombie", "skeleton".' },
+            'weapon': { type: 'string', description: '"bow", "crossbow" or "auto".' }
+        },
+        perform: runAsAction(async (agent, mob_type, weapon) => {
+            const w = ['bow', 'crossbow', 'auto'].includes(String(weapon)) ? weapon : 'auto';
+            return await skills.shootBow(agent.bot, mob_type, w);
+        }, false, 3)
+    },
+    {
+        // Provisioning for survival-mode testing. Narrow like the rest: gives to THIS bot only,
+        // never to arbitrary players, so it cannot be used to shower someone else with gear.
+        name: '!serverGive',
+        description: 'Operator: give this bot an item via server /give.',
+        params: {
+            'item': { type: 'ItemName', description: 'The item to give.' },
+            'count': { type: 'int', description: 'How many.', domain: [1, 640] }
+        },
+        perform: runAsAction(async (agent, item, count) => {
+            const line = await runServerCommand(agent.bot, `/give ${agent.name} ${item} ${Math.floor(count)}`,
+                /gave|permission|Unknown|No such|Invalid/i, 5000);
+            await new Promise(r => setTimeout(r, 500));
+            const held = agent.bot.inventory.items().filter(i => i.name === item)
+                .reduce((n, i) => n + i.count, 0);
+            return `GIVE: now holding ${held} ${item}${line ? ` (server said: ${line})` : ''}.`;
+        }, false, 1)
+    },
+    {
         name: '!worldSeed',
         description: 'Ask the server for the world seed. Requires operator permission.',
         perform: runAsAction(async (agent) => {

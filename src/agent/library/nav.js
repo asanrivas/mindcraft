@@ -141,9 +141,12 @@ function classify(ctx, x, y, z) {
         if (n === 'air' || n === 'cave_air' || n === 'void_air') cls = AIR;
         // Exact matching, via the canonical classifiers. The substring test this replaced made
         // `water_cauldron` a swimmable cell and `lava_cauldron` a lava lake.
-        else if (isLavaName(n) || n === 'lava_cauldron' || n === 'fire' || n === 'cactus'
-                 || n === 'magma_block' || n === 'powder_snow' || n === 'sweet_berry_bush'
-                 || isBubbleColumn(n)) cls = HAZARD;
+        // soul_fire included explicitly: 'fire' is an exact match, so soul_fire used to fall
+        // through to the bounding-box branch (empty box -> AIR) and the planner would route
+        // straight through it. Found during the Nether gap review.
+        else if (isLavaName(n) || n === 'lava_cauldron' || n === 'fire' || n === 'soul_fire'
+                 || n === 'cactus' || n === 'magma_block' || n === 'powder_snow'
+                 || n === 'sweet_berry_bush' || isBubbleColumn(n)) cls = HAZARD;
         else if (isSwimmable(n)) cls = WATER;
         else if (b.boundingBox) cls = b.boundingBox === 'block' ? SOLID : AIR;
         else cls = SOLID;

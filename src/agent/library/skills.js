@@ -482,6 +482,54 @@ export async function attackNearest(bot, mobType, kill=true) {
     return false;
 }
 
+/**
+ * Kill a mob from range with bow or crossbow.
+ *
+ * Stand-your-ground by design: strafing needs ground acceleration this server does not grant
+ * (the onGround lie), so the winning play is to plant, aim and shoot - not to kite. Movement
+ * happens only between engagements, via the custom navigator.
+ *
+ * @param {'bow'|'crossbow'|'auto'} weapon
+ * @returns {Promise<string>} VERIFIED-style outcome line.
+ */
+export async function shootBow(bot, mobType, weapon = 'auto', maxShots = 12) {
+    const bowLib = await import('./bow.js');
+    const target0 = world.getNearbyEntities(bot, 32).find(e => e.name === mobType);
+    if (!target0) return `No ${mobType} within 32 blocks to shoot.`;
+    if (target0.type === 'player') return `Refusing to shoot a player.`;
+
+    const before = bowLib.bowInfo(bot).arrows;
+    let fired = 0, lastReason = '';
+    const t0 = Date.now();
+
+    for (let shot = 0; shot < maxShots; shot++) {
+        if (bot.interrupt_code) { lastReason = 'interrupted'; break; }
+        // Re-find each round: the entity object goes invalid on death or despawn.
+        const target = Object.values(bot.entities).find(e =>
+            e?.name === mobType && e.isValid !== false
+            && e.position.distanceTo(bot.entity.position) <= 40);
+        if (!target) { lastReason = fired > 0 ? 'target_down' : 'target_lost'; break; }
+
+        const r = await bowLib.shootAt(bot, target, weapon);
+        lastReason = r.reason;
+        if (!r.fired) {
+            if (r.reason === 'no_arrows' || r.reason.startsWith('no_')) break;
+            if (r.reason === 'friendly_in_corridor') { await new Promise(s => setTimeout(s, 800)); continue; }
+            break;
+        }
+        fired++;
+        await new Promise(s => setTimeout(s, 600)); // arrow flight + server-side damage tick
+    }
+
+    await pickupNearbyItems(bot); // recover arrows and drops
+    const after = bowLib.bowInfo(bot).arrows;
+    const downed = lastReason === 'target_down';
+    // Returned, not log()ed: runAsAction concatenates bot.output with the return value, so
+    // logging AND returning printed the line once and then a bare "true" after it.
+    return `VERIFIED SHOOT: ${downed ? `killed ${mobType}` : `${mobType} NOT confirmed dead (${lastReason})`}, `
+        + `${fired} shot(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s, arrows ${before}->${after}.`;
+}
+
 export async function attackEntity(bot, entity, kill=true) {
     /**
      * Attack mob of the given type.

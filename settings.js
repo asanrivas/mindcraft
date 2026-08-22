@@ -1,5 +1,6 @@
 const settings = {
-    minecraft_version: "auto", // Server protocol is 775 (MC 26.1) but its ping name says "Purpur 1.21.11". mineflayer/prismarine-chunk have no 26.x support yet, so we connect as 1.21.11 - see PHYSICS NOTE in docs.
+    minecraft_version: "auto", // Server protocol is 775 (MC 26.1) but its ping name says "Purpur 1.21.11". mineflayer's testedVersions gate stops at 1.21.11 - the packages below it (minecraft-protocol, minecraft-data, prismarine-chunk, prismarine-registry) already support 26.1 - so we connect as 1.21.11 until that gate is lifted. See CLAUDE.md "Movement".
+    mc_client: "mineflayer", // "mineflayer" (default) or "native" - see src/mc/index.js and docs/CLIENT_REPLACEMENT.md. Do not set "native" yet - it isn't built.
     host: "localhost", // or "localhost", "your.ip.address.here"
     port: 25565, // set to -1 to automatically scan for open ports
     auth: "offline", // or "microsoft"
@@ -12,7 +13,9 @@ const settings = {
     base_profile: "assistant", // survival, assistant, creative, or god_mode
     profiles: [
         "./andy.json",
-        "./bob.json", // builder/redstone test-subject bot
+        // bob runs in his OWN service (mindcraft-bob.service, MindServer :8081) so andy
+        // restarts never kill his long builds. Do not re-add him here - the PROFILES env
+        // var in that unit is what starts him.
         // "./rosetta.json", // Letta-powered agent with persistent memory (requires ~/letta running)
         // "./profiles/andy-4-reasoning.json",
         // "./profiles/claude.json",

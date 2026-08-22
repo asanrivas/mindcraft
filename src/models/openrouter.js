@@ -4,8 +4,9 @@ import { strictFormat } from '../utils/text.js';
 
 export class OpenRouter {
     static prefix = 'openrouter';
-    constructor(model_name, url) {
+    constructor(model_name, url, params) {
         this.model_name = model_name;
+        this.params = params || {};
 
         let config = {};
         config.baseURL = url || 'https://openrouter.ai/api/v1';
@@ -29,7 +30,8 @@ export class OpenRouter {
         const pack = {
             model: this.model_name,
             messages,
-            stop: stop_seq
+            stop: stop_seq,
+            ...this.params,
         };
 
         let res = null;
@@ -37,18 +39,23 @@ export class OpenRouter {
             console.log('Awaiting openrouter api response...');
             let completion = await this.openai.chat.completions.create(pack);
             if (!completion?.choices?.[0]) {
-                console.error('No completion or choices returned:', completion);
-                return 'No response received.';
+                throw new Error('No completion or choices returned');
             }
-            if (completion.choices[0].finish_reason === 'length') {
-                throw new Error('Context length exceeded');
+            const choice = completion.choices[0];
+            res = choice.message?.content;
+            if (!res || !res.trim()) {
+                // Reasoning models spend the completion budget on hidden reasoning and can
+                // return EMPTY content - measured on stealth/ox-alpha: 200 tokens consumed,
+                // content ''. Raise max_tokens rather than shipping the blank.
+                throw new Error(`Empty content (finish_reason=${choice.finish_reason}, `
+                    + `completion_tokens=${completion.usage?.completion_tokens}) - raise max_tokens`);
             }
             console.log('Received.');
-            res = completion.choices[0].message.content;
         } catch (err) {
-            console.error('Error while awaiting response:', err);
-            // If the error indicates a context-length problem, we can slice the turns array, etc.
-            res = 'My brain disconnected, try again.';
+            // THROW, never return a placeholder. A placeholder string reads as SUCCESS to
+            // FallbackModel and stops the chain before the next backup is ever tried - the
+            // exact bug fireworks.js and llamacpp.js already had (docs/LLM_FAILOVER.md 4).
+            throw err;
         }
         return res;
     }

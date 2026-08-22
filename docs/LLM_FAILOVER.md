@@ -26,8 +26,26 @@ never says why.
 "backup_cooldown_secs": 60
 ```
 
-`backup_model` accepts **one profile or an ordered list**, tried left to right.
-Key: `FIREWORKS_API_KEY` in `keys.json`. Measured latency: **~1.4 s**.
+`backup_model` accepts **one profile or an ordered list**, tried left to right. Both agents
+(andy, bob) run the same chain: **ox-alpha -> deepseek -> (last-resort) local**.
+
+Measured on an identical Andy-shaped prompt, 5 runs each:
+
+| model | min | median | max |
+|---|---|---|---|
+| `stealth/ox-alpha` (OpenRouter, free, 1M ctx) | 1.18 s | **1.40 s** | 10.5 s |
+| `deepseek-v4-flash-0731` (Fireworks) | 2.39 s | 2.77 s | 18.3 s |
+
+Median ~2x faster, and the 1M context should end the `context_length_exceeded` retries (78 in
+one day). Both show occasional 10-18 s spikes, so the median is the number to trust, not the mean.
+
+**ox-alpha is a stealth model**: prompts/completions are typically logged and shared with the
+provider, and cloaked models can disappear without notice - which is exactly why it sits FIRST
+in a chain rather than replacing anything.
+
+Keys live in `keys.json` (gitignored). **A shell export is not enough**: the systemd --user
+service does not inherit `~/.zshrc`, so a key exported there is invisible to the bot even though
+`getKey` falls back to `process.env`.
 
 ## 3. Design
 

@@ -1,9 +1,13 @@
 #!/usr/bin/env bun
 /**
  * Streams a placements JSON (from litematic_to_placements.mjs) as /setblock commands
- * over a single persistent RCON connection, offset by an origin (world coords of the
- * schematic's local 0,0,0). Reports a per-block success/failure summary at the end -
- * never assume success without checking the actual RCON responses.
+ * via RCON, offset by an origin (world coords of the schematic's local 0,0,0).
+ *
+ * One short-lived TCP connection per command: this server's RCON drops the connection
+ * after 1-2 commands regardless of inter-command delay (tested empirically - a
+ * persistent multi-command session is not reliable here), but a fresh connect+auth+
+ * command+close cycle (what the single-shot `mc` CLI already does successfully every
+ * time) is fast and 100% reliable. Never assume success without checking the response.
  *
  *   bun tools/execute_placements.mjs <placements.json> <originX> <originY> <originZ>
  */
@@ -32,7 +36,41 @@ function frame(id, type, body) {
     return buf;
 }
 
-fs.appendFileSync('/tmp/exec_debug.log', `START argv=${JSON.stringify(process.argv)}\n`);
+function runCommand(command, pw) {
+    return new Promise((resolve, reject) => {
+        const sock = net.connect(PORT, HOST);
+        let acc = Buffer.alloc(0);
+        let stage = 'auth';
+        let out = '';
+        const timer = setTimeout(() => { sock.destroy(); reject(new Error('timeout')); }, 8000);
+        sock.on('error', (e) => { clearTimeout(timer); reject(e); });
+        sock.on('connect', () => sock.write(frame(1, 3, pw)));
+        sock.on('data', (chunk) => {
+            acc = Buffer.concat([acc, chunk]);
+            while (acc.length >= 4) {
+                const len = acc.readInt32LE(0);
+                if (acc.length < 4 + len) break;
+                const id = acc.readInt32LE(4);
+                const body = acc.toString('utf8', 12, 4 + len - 2);
+                acc = acc.subarray(4 + len);
+                if (id === -1) { clearTimeout(timer); reject(new Error('auth failed')); sock.end(); return; }
+                if (stage === 'auth') {
+                    if (id !== 1) continue;
+                    stage = 'cmd';
+                    sock.write(frame(2, 2, command));
+                    sock.write(frame(3, 2, ''));
+                } else if (id === 2) {
+                    out += body;
+                } else if (id === 3) {
+                    clearTimeout(timer);
+                    resolve(out.replace(/§./g, '').trim());
+                    sock.end();
+                }
+            }
+        });
+    });
+}
+
 const [, , placementsPath, ox, oy, oz] = process.argv;
 if (!placementsPath || ox === undefined) {
     console.error('Usage: execute_placements.mjs <placements.json> <originX> <originY> <originZ>');
@@ -40,6 +78,7 @@ if (!placementsPath || ox === undefined) {
 }
 const origin = { x: Number(ox), y: Number(oy), z: Number(oz) };
 const { placements } = JSON.parse(fs.readFileSync(placementsPath, 'utf8'));
+const pw = loadPassword();
 
 function blockCommand(p) {
     const wx = origin.x + p.x, wy = origin.y + p.y, wz = origin.z + p.z;
@@ -48,82 +87,37 @@ function blockCommand(p) {
     return `setblock ${wx} ${wy} ${wz} minecraft:${p.name}${propStr} replace`;
 }
 
-const sock = net.connect(PORT, HOST);
-let stage = 'auth';
-let acc = Buffer.alloc(0);
-let out = '';
-let idx = 0;
-let nextReqId = 100;
-let ok = 0, failed = [];
-const startTime = Bun.nanoseconds();
+console.log(`${placements.length} blocks to place at origin ${origin.x},${origin.y},${origin.z}`);
+const startTime = Date.now();
+let ok = 0;
+const failed = [];
 
-sock.setTimeout(120000, () => { console.error('rcon: timeout'); process.exit(1); });
-sock.on('error', (e) => { console.error(`rcon: ${e.message}`); process.exit(1); });
-sock.on('connect', () => {
-    fs.appendFileSync('/tmp/exec_debug.log', 'connected\n');
-    try {
-        const pw = loadPassword();
-        fs.appendFileSync('/tmp/exec_debug.log', `pw loaded len=${pw.length}\n`);
-        sock.write(frame(1, 3, pw));
-        fs.appendFileSync('/tmp/exec_debug.log', 'auth frame written\n');
-    } catch (e) {
-        fs.appendFileSync('/tmp/exec_debug.log', `THROW: ${e.stack}\n`);
-    }
-});
-sock.on('close', (hadError) => fs.appendFileSync('/tmp/exec_debug.log', `closed hadError=${hadError}\n`));
-
-function sendNext() {
-    if (idx >= placements.length) {
-        const secs = ((Bun.nanoseconds() - startTime) / 1e9).toFixed(1);
-        console.log(`\nDone in ${secs}s: ${ok}/${placements.length} placed.`);
-        if (failed.length) {
-            console.log(`${failed.length} FAILED:`);
-            for (const f of failed.slice(0, 50)) console.log(`  ${f.cmd} => ${f.resp}`);
-            if (failed.length > 50) console.log(`  ...and ${failed.length - 50} more`);
-            fs.writeFileSync(placementsPath + '.failed.json', JSON.stringify(failed, null, 2));
+async function attempt(cmd) {
+    for (let tries = 0; tries < 3; tries++) {
+        try {
+            const resp = await runCommand(cmd, pw);
+            if (/^Changed the block|^Block placed/i.test(resp)) return { ok: true, resp };
+            if (/not loaded/i.test(resp)) return { ok: false, resp }; // won't fix itself by retrying
+            return { ok: false, resp }; // real error (bad property etc) - don't retry either
+        } catch (e) {
+            if (tries === 2) return { ok: false, resp: `EXCEPTION: ${e.message}` };
+            await new Promise(r => setTimeout(r, 200)); // only retry on connection-level exceptions (timeouts)
         }
-        sock.end();
-        process.exit(failed.length ? 1 : 0);
     }
-    out = '';
-    const cmdId = nextReqId++;
-    const sentinelId = nextReqId++;
-    sock.write(frame(cmdId, 2, blockCommand(placements[idx])));
-    sock.write(frame(sentinelId, 2, ''));
-    sock._cmdId = cmdId;
-    sock._sentinelId = sentinelId;
 }
 
-sock.on('data', (chunk) => {
-    fs.appendFileSync('/tmp/exec_debug.log', `data chunk len=${chunk.length} hex=${chunk.subarray(0,32).toString('hex')}\n`);
-    try {
-    acc = Buffer.concat([acc, chunk]);
-    while (acc.length >= 4) {
-        const len = acc.readInt32LE(0);
-        if (acc.length < 4 + len) break;
-        const id = acc.readInt32LE(4);
-        const body = acc.toString('utf8', 12, 4 + len - 2);
-        acc = acc.subarray(4 + len);
-        if (id === -1) { console.error('rcon: auth failed'); process.exit(1); }
-        if (stage === 'auth') {
-            if (id !== 1) continue;
-            stage = 'cmd';
-            sendNext();
-        } else if (id === sock._cmdId) {
-            out += body;
-        } else if (id === sock._sentinelId) {
-            const resp = out.replace(/§./g, '').trim();
-            if (/^Changed the block|^Block placed/i.test(resp)) {
-                ok++;
-            } else {
-                failed.push({ cmd: blockCommand(placements[idx]), resp });
-            }
-            idx++;
-            if (idx % 250 === 0) console.log(`... ${idx}/${placements.length} (${ok} ok, ${failed.length} failed)`);
-            sendNext();
-        }
-    }
-    } catch (e) {
-        fs.appendFileSync('/tmp/exec_debug.log', `DATA THROW: ${e.stack}\n`);
-    }
-});
+for (let i = 0; i < placements.length; i++) {
+    const cmd = blockCommand(placements[i]);
+    const { ok: success, resp } = await attempt(cmd);
+    if (success) ok++; else failed.push({ cmd, resp });
+    if ((i + 1) % 250 === 0) console.log(`... ${i + 1}/${placements.length} (${ok} ok, ${failed.length} failed)`);
+}
+
+const secs = ((Date.now() - startTime) / 1000).toFixed(1);
+console.log(`\nDone in ${secs}s: ${ok}/${placements.length} placed.`);
+if (failed.length) {
+    console.log(`${failed.length} FAILED (showing up to 50):`);
+    for (const f of failed.slice(0, 50)) console.log(`  ${f.cmd} => ${f.resp}`);
+    fs.writeFileSync(placementsPath + '.failed.json', JSON.stringify(failed, null, 2));
+    process.exitCode = 1;
+}

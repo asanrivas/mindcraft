@@ -15,16 +15,26 @@
             }
         }
     },
-    "backup_model": {
-        "api": "fireworks",
-        "model": "deepseek-v4-flash-0731",
-        "params": {
-            "max_tokens": 1024,
-            "reasoning_effort": "low",
-            "temperature": 0.7
+    "backup_model": [
+        {
+            "api": "openrouter",
+            "model": "stealth/ox-alpha",
+            "params": {
+                "max_tokens": 2048,
+                "temperature": 0.7
+            }
         },
-        "url": "https://api.fireworks.ai/inference/v1"
-    },
+        {
+            "api": "fireworks",
+            "model": "deepseek-v4-flash-0731",
+            "params": {
+                "max_tokens": 1024,
+                "reasoning_effort": "low",
+                "temperature": 0.7
+            },
+            "url": "https://api.fireworks.ai/inference/v1"
+        }
+    ],
     "backup_cooldown_secs": 60,
     "vision_model": {
         "api": "google",

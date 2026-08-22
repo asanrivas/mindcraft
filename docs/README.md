@@ -14,6 +14,7 @@ thing is built the way it is, what was measured, and which bugs are still open.
 | Doc | What it covers |
 |---|---|
 | [NAVIGATION_REBUILD.md](NAVIGATION_REBUILD.md) | Why mineflayer-pathfinder was replaced: the protocol-775 mismatch, the broken `onGround`, the A\* planner and lookahead executor, the cost model, 12 bugs, and the 1018-block verification journey |
+| [CLIENT_REPLACEMENT.md](CLIENT_REPLACEMENT.md) | Replacing mineflayer itself: the `src/mc/` seam, the borrow-vs-build call per layer, the milestone ladder, and the corrected prismarine-chunk claim |
 | [SWIMMING.md](SWIMMING.md) | Swimming, diving, sprint-swimming and oxygen. Measured swim speeds, the `waterCost` correction, SwimAssist, the `drowning` mode, and one still-open failure mode |
 | [WORLD_TOOLS.md](WORLD_TOOLS.md) | Seed lookup, `/locate biome`, operator teleport/gamemode/spawnpoint, block states, and placing blocks next to the bot |
 

@@ -276,7 +276,7 @@
 }
 
 .stat-item {
-    padding: var(--space-sm);
+    padding: var(--space-xs) var(--space-sm);
     background: #8B8B8B; /* Darker slot bg */
     border: 2px solid #FFF; /* Highlight bottom/right */
     border-top-color: #373737;
@@ -289,6 +289,8 @@
     text-shadow: 2px 2px 0 #000;
     min-width: 0; /* let long unbreakable stat text wrap instead of blowing out the grid track */
     overflow-wrap: break-word;
+    font-size: var(--font-size-xs);
+    line-height: 1.25;
 }
 
 .stat-label {

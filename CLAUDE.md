@@ -27,6 +27,7 @@ each rule, and what is still open — lives in **[docs/README.md](docs/README.md
 | Doc | When you need it |
 |---|---|
 | [docs/NAVIGATION_REBUILD.md](docs/NAVIGATION_REBUILD.md) | Anything about movement, the A\* planner, or the cost model |
+| [docs/CLIENT_REPLACEMENT.md](docs/CLIENT_REPLACEMENT.md) | Why/how we're replacing mineflayer with an owned client, `src/mc/`, `settings.mc_client` |
 | [docs/SWIMMING.md](docs/SWIMMING.md) | Water, diving, oxygen, SwimAssist, the `drowning` mode |
 | [docs/LLM_FAILOVER.md](docs/LLM_FAILOVER.md) | The backup brain and the circuit breaker |
 | [docs/WORLD_TOOLS.md](docs/WORLD_TOOLS.md) | Seed/biome lookup, operator teleport, gamemode, block states |
@@ -137,25 +138,40 @@ Tests: `bun tests/fallback.test.mjs` (fakes, no network). Verified live against 
 dead local server, and recovery verified with real sockets: down -> backup, back up but inside
 cooldown -> still backup, after cooldown -> primary.
 
-## Movement (IMPORTANT: do not "fix" by upgrading mineflayer)
+## Movement (we own the client; see docs/CLIENT_REPLACEMENT.md)
 
 Full story, measurements and bug list: **[docs/NAVIGATION_REBUILD.md](docs/NAVIGATION_REBUILD.md)**.
+Replacement-client plan: **[docs/CLIENT_REPLACEMENT.md](docs/CLIENT_REPLACEMENT.md)**.
 
 **The server is Minecraft 26.1 (protocol 775).** Its ping *name* string lies and says
-`Purpur 1.21.11`, and `mcserver.js` regex-extracts the version from that name while ignoring
-the protocol number. mineflayer caps at 1.21.11 (protocol 774), so the bot runs
-one-version-stale collision data against a 26.x world.
+`Purpur 1.21.11`, and `mcserver.js` used to regex-extract the version from that name while
+ignoring the protocol number - it now also reads `response.version.protocol` and logs the
+mismatch, but the value used to connect is still the name-derived one (see below).
 
-**Upstream is blocked, not lazy.** Patching mineflayer's version gate works, but
-`prismarine-chunk` has no 26.x chunk implementation in any release (latest checked: 1.41.0,
-which ships only '1.0', '1.10', '1.20'). Do not sink more time into the version bump.
+**Corrected 2026-08-23: the "prismarine-chunk has no 26.x" claim below was wrong.** Verified by
+loading the installed packages at runtime: `prismarine-chunk@1.41.0` (root) maps
+`26.1: require('./pc/1.18/chunk')` and instantiates; `minecraft-data@3.113.2` ships a full
+`pc/26.1/` dataset including `blockCollisionShapes.json`; `minecraft-protocol@1.67.0` lists
+`26.1` in `supportedVersions`; `prismarine-registry('26.1')` resolves 1168 blocks, 1506 items,
+protocol 775. The whole stack **below** mineflayer already speaks 775. The only real gates are
+policy, not capability: mineflayer bundles its own `prismarine-chunk@1.39.0` (no `26.1` key,
+shadowing the working root copy), and mineflayer's `testedVersions`
+(`node_modules/mineflayer/lib/version.js`) ends at `1.21.11`. **We are not chasing that bump** -
+we're building an owned client instead (`src/mc/`, `settings.mc_client`), because the goal is
+independence from upstream's release pace, not just this one version. See
+`docs/CLIENT_REPLACEMENT.md` for the staged plan, and its "riskiest assumptions" section for
+why the bump alone might not even fix the symptom below - Purpur/Paper server-side movement
+validation is an equally good explanation, and `swim_assist.js`'s `forcedMove` valve (disables
+its boost after 3 server corrections in 10s) is direct evidence the server *does* correct this
+client.
 
 **`onGround` cannot be trusted here.** Traced directly: it reads false for seconds at a time
 while the bot is provably standing (constant y, zero velocity), so prismarine-physics applies
 no ground acceleration and the bot sits at `vel=(0,0)` with forward held. **Anything that
 waits for `onGround` waits forever.** `followPath` pulses jump when progress stalls, because
 airborne acceleration still works - that is what actually moves the bot. `mineflayer-pathfinder`
-will not even *plan* a route over a 1-block step, so it simply stands still.
+will not even *plan* a route over a 1-block step, so it simply stands still. This is the symptom
+we are hunting; per the correction above, its cause is not yet established.
 
 ### The stack we run instead
 
@@ -242,6 +258,12 @@ Each of these cost real debugging time and each produced a *totally stuck* bot, 
   cross; pillaring cannot work while floating - there is nowhere to place a block underneath.
 
 ### Swimming, diving and oxygen
+
+*(The `prismarine-physics` internals cited throughout this section - `simulatePlayer`,
+`applyHeading`, `liquidAcceleration` - describe the layer `docs/CLIENT_REPLACEMENT.md`'s
+`src/mc/physics/` is taking ownership of. Each behavior below must be reproduced or
+deliberately diverged from there; `liquidAcceleration` in particular must stay a mutable field,
+not a computed one - see that doc's "riskiest assumptions".)*
 
 **Water is the one part of this server's physics that is NOT broken**, and the whole codebase
 was built on the opposite assumption. Everything else here works around `bot.entity.onGround`

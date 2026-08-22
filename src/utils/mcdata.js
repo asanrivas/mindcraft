@@ -1,13 +1,7 @@
 import minecraftData from 'minecraft-data';
 import settings from '../agent/settings.js';
-import { createBot } from 'mineflayer';
 import prismarine_items from 'prismarine-item';
-import { pathfinder } from 'mineflayer-pathfinder';
-import { plugin as pvp } from 'mineflayer-pvp';
-import { plugin as collectblock } from 'mineflayer-collectblock';
-import { plugin as autoEat } from 'mineflayer-auto-eat';
-import plugin from 'mineflayer-armor-manager';
-const armorManager = plugin;
+import { createClient } from '../mc/index.js';
 let mc_version = null; // Will be set dynamically in initBot()
 let mcdata = null;
 let Item = null;
@@ -103,68 +97,18 @@ export function initBot(username) {
 
     console.log(`[mcdata] Creating bot with version: ${options.version || 'auto-detect'}`)
 
-    const bot = createBot(options);
-
-    // Throttle position packets to avoid kicks on Paper/Spigot servers
-    // Paper enforces stricter packet rate limits than vanilla, causing ECONNRESET
-    // when mineflayer sends position updates faster than 50ms apart
-    let lastPositionUpdate = 0;
-    let pendingPositionPacket = null;
-    const POSITION_THROTTLE_MS = 50;
-    const originalWrite = bot._client.write.bind(bot._client);
-    bot._client.write = function(name, data) {
-        if (name === 'position' || name === 'position_look' || name === 'look') {
-            const now = Date.now();
-            if (now - lastPositionUpdate < POSITION_THROTTLE_MS) {
-                // Queue this packet so the last position update is never lost
-                if (!pendingPositionPacket) {
-                    pendingPositionPacket = setTimeout(() => {
-                        pendingPositionPacket = null;
-                        lastPositionUpdate = Date.now();
-                        originalWrite(name, data);
-                    }, POSITION_THROTTLE_MS - (now - lastPositionUpdate));
-                }
-                return;
-            }
-            lastPositionUpdate = now;
-            if (pendingPositionPacket) {
-                clearTimeout(pendingPositionPacket);
-                pendingPositionPacket = null;
-            }
-        }
-        return originalWrite(name, data);
-    };
-
-    // Suppress PartialReadError for non-critical packets
-    // Paper servers sometimes send packets that node-minecraft-protocol
-    // can't fully parse (scoreboard, resource_pack, custom_payload, etc.)
-    // These errors crash the bot but the packets aren't needed for gameplay
-    const originalEmit = bot._client.emit.bind(bot._client);
-    bot._client.emit = function(event, ...args) {
-        if (event === 'error' && args[0]) {
-            const err = args[0];
-            const errStr = err instanceof Error ? err.message : String(err);
-            if (errStr.includes('PartialReadError')) {
-                console.warn('[mcdata] Suppressed PartialReadError:', errStr.substring(0, 120));
-                return true; // Swallow the error
-            }
-        }
-        return originalEmit(event, ...args);
-    };
-
-    bot.loadPlugin(pathfinder);
-    bot.loadPlugin(pvp);
-    bot.loadPlugin(collectblock);
-    bot.loadPlugin(autoEat);
-    bot.loadPlugin(armorManager); // auto equip armor
-    bot.once('resourcePack', () => {
-        bot.acceptResourcePack();
-    });
-
-    bot.once('login', () => {
-        mc_version = bot.version;
-        mcdata = minecraftData(mc_version);
-        Item = prismarine_items(mc_version);
+    // The construction seam: settings.mc_client picks the backend
+    // ('mineflayer' today, 'native' once docs/CLIENT_REPLACEMENT.md milestone
+    // M2+ lands). Every bot.* call site elsewhere in src/ is unaffected by
+    // this switch - see src/mc/contract.js for the shared shape both
+    // backends must satisfy.
+    const bot = createClient(options, {
+        backend: settings.mc_client || 'mineflayer',
+        onVersionKnown: (version) => {
+            mc_version = version;
+            mcdata = minecraftData(mc_version);
+            Item = prismarine_items(mc_version);
+        },
     });
 
     return bot;

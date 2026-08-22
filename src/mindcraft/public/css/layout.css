@@ -120,7 +120,10 @@
     gap: var(--space-md);
 }
 
-@media (min-width: 640px) {
+/* Large phones (S26 Ultra etc.) report a wider CSS viewport than the 640px
+   tablet breakpoint assumes - use the extra room for a denser 3-column grid
+   instead of stretching 2 columns across it. */
+@media (min-width: 460px) {
     .agent-grid {
         grid-template-columns: repeat(3, 1fr);
     }

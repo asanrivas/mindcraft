@@ -408,6 +408,26 @@ export const queryList = [
         }
     },
     {
+        name: '!buildStatus',
+        description: 'Diff the world against a blueprint placements JSON: how much is built, and the nearest blocks still wrong, as concrete Place/Replace fixes.',
+        params: {
+            'file': { type: 'string', description: 'Placements JSON path relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
+            'x': { type: 'int', description: 'World X of the blueprint origin.' },
+            'y': { type: 'int', description: 'World Y of the blueprint origin.' },
+            'z': { type: 'int', description: 'World Z of the blueprint origin.' },
+            'limit': { type: 'int', description: 'Max fixes to list (default 10).', optional: true }
+        },
+        perform: async function (agent, file, x, y, z, limit = 10) {
+            const { blueprintStatus } = await import('../library/blueprint_builder.js');
+            try {
+                return pad(blueprintStatus(agent, file,
+                    new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)), Math.floor(limit)));
+            } catch (e) {
+                return `buildStatus failed: ${e.message}`;
+            }
+        }
+    },
+    {
         name: '!scanArea',
         description: 'Scan a rectangular area and report what blocks are present. Useful for understanding surroundings before building or planting.',
         params: {

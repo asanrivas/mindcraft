@@ -275,6 +275,60 @@ async function placeOne(bot, P, p) {
     return { ok: !!finalBlock && finalBlock.name === p.name, why: finalBlock ? `got ${finalBlock.name}` : 'unloaded' };
 }
 
+// Orientation props worth showing the LLM; connection/auto-computed states (shape,
+// waterlogged, powered, occupied...) are noise it can neither set nor fix.
+const REPORTABLE_PROPS = ['facing', 'half', 'axis', 'hanging', 'open', 'rotation'];
+
+function propSummary(p) {
+    const props = p.properties || {};
+    const parts = REPORTABLE_PROPS.filter(k => props[k] !== undefined).map(k => `${k}=${props[k]}`);
+    return parts.length ? ` [${parts.join(',')}]` : '';
+}
+
+/**
+ * Diff the world against a placements JSON: the LLM-friendly view of a build.
+ * Instead of a voxel dump (which a small model cannot reason over), returns a short
+ * imperative fix-list of the nearest mismatches, plus an honest total. Same output
+ * philosophy as construction_tasks.js explainLevelDifference.
+ */
+export function blueprintStatus(agent, filePath, origin, limit = 10) {
+    const bot = agent.bot;
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+    const all = (raw.placements || raw).filter(p => !isImplicitHalf(p));
+
+    let match = 0, unloaded = 0;
+    const mismatches = [];
+    const here = bot.entity.position;
+    for (const p of all) {
+        const P = new Vec3(origin.x + p.x, origin.y + p.y, origin.z + p.z);
+        const b = bot.blockAt(P);
+        if (!b) { unloaded++; continue; }
+        if (b.name === p.name) { match++; continue; }
+        mismatches.push({ p, P, existing: b.name, d: here.distanceTo(P) });
+    }
+    mismatches.sort((a, b) => a.d - b.d);
+
+    const checked = all.length - unloaded;
+    const pct = checked > 0 ? ((match / checked) * 100).toFixed(1) : '0.0';
+    let out = `BUILD STATUS (${filePath} at ${origin.x},${origin.y},${origin.z}):\n`;
+    out += `${match}/${checked} checked blocks correct (${pct}%).`;
+    if (unloaded) out += ` ${unloaded} cells unloaded - move closer to check those.`;
+    if (mismatches.length === 0) {
+        out += unloaded ? '' : '\nBuild is COMPLETE.';
+        return out;
+    }
+    out += `\n${mismatches.length} blocks need fixing. Nearest ${Math.min(limit, mismatches.length)}:`;
+    for (const m of mismatches.slice(0, limit)) {
+        const what = `${m.p.name}${propSummary(m.p)}`;
+        if (m.existing === 'air' || REPLACEABLE.has(m.existing)) {
+            out += `\n- Place ${what} at (${m.P.x}, ${m.P.y}, ${m.P.z})`;
+        } else {
+            out += `\n- Replace the ${m.existing} with ${what} at (${m.P.x}, ${m.P.y}, ${m.P.z})`;
+        }
+    }
+    return out;
+}
+
 const PAUSABLE_MODES = ['unstuck', 'cowardice', 'self_defense', 'night_safety', 'hunting',
     'item_collecting', 'torch_placing', 'elbow_room', 'idle_staring'];
 

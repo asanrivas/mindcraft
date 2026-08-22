@@ -1,5 +1,6 @@
 import { Vec3 } from 'vec3';
 import * as mc from '../../utils/mcdata.js';
+import * as nav from './nav.js';
 import fs from 'fs';
 
 /**
@@ -88,57 +89,32 @@ function isSolidRef(block) {
     return block && block.boundingBox === 'block';
 }
 
-// Pick a hover position (feet) from which the clicked point is reachable and the bot
-// does not occupy the destination cell.
-function findHover(bot, P, faceName) {
-    const candidates = [];
-    const n = FACE[faceName] || FACE.up;
-    if (faceName === 'down') {
-        candidates.push(P.offset(0, -3, 0), P.offset(0, -2, 0), P.offset(1, -2, 0), P.offset(-1, -2, 0));
-    } else if (faceName === 'up') {
-        candidates.push(P.offset(0, 2, 0), P.offset(0, 3, 0), P.offset(1, 2, 0), P.offset(-1, 2, 0),
-            P.offset(0, 2, 1), P.offset(0, 2, -1), P.offset(2, 1, 0), P.offset(-2, 1, 0),
-            P.offset(0, 1, 2), P.offset(0, 1, -2));
-    } else {
-        const s = n.scaled(2), s3 = n.scaled(3);
-        candidates.push(P.plus(s), P.plus(s).offset(0, 1, 0), P.plus(s3), P.plus(s).offset(0, -1, 0),
-            P.plus(s3).offset(0, 1, 0), P.offset(0, 2, 0), P.offset(0, 3, 0));
-    }
-    for (const feet of candidates) {
-        if (feet.equals(P)) continue;
-        const head = feet.offset(0, 1, 0);
-        if (head.equals(P)) continue;
-        if (isPassable(bot.blockAt(feet)) && isPassable(bot.blockAt(head))) return feet;
-    }
-    return null;
+// GROUND-BASED movement. Client-driven creative flight is dead on this server: measured
+// 1,870 forcedMove corrections in one run - the server rejects every flown movement packet
+// and pins the player, after which all placements fail from range. Walking is the one
+// movement mode with a 1,000-block proven record here (see NAVIGATION_REBUILD.md), so the
+// builder walks: to each column via the A* navigator, standing on the structure's own
+// lower layers as they rise. Cells out of reach fail into the retry pass and usually
+// become reachable as later layers add floor to stand on.
+async function goNear(bot, P, reach = 3.0) {
+    const eyeDist = () => bot.entity.position.offset(0, 1.62, 0).distanceTo(P.offset(0.5, 0.5, 0.5));
+    if (eyeDist() <= reach + 1.2) return true;
+    await nav.navigateTo(bot, { x: P.x, y: P.y, z: P.z },
+        { arriveDist: reach, arriveY: 3, maxReplans: 3 });
+    return eyeDist() <= 4.6;
 }
 
-// Own flight loop instead of bot.creative.flyTo: that one cannot be cancelled, so racing
-// it against a timeout leaks a background loop that keeps steering the bot toward a stale
-// destination forever. This version is bounded and leaves no orphan.
-//
-// Server agreement is NOT guaranteed: this mutates the client's belief, and a server that
-// rejects the moves (e.g. the bot is embedded in blocks it dug) silently pins the player
-// while the client "flies" away - every later placement then fails with a blockUpdate
-// timeout because it is issued from 100+ blocks off. Hence: declare flying via the
-// abilities packet (mineflayer never sends it, making hover technically illegal), keep the
-// step under ~7 m/s, and let forcedMove corrections stand (d is recomputed from
-// bot.entity.position each tick, which a correction overwrites).
-let declaredFlying = false;
-async function flyToWithTimeout(bot, dest, ms = 12000) {
-    bot.creative.startFlying();
-    if (!declaredFlying) {
-        try { bot._client.write('abilities', { flags: 2 }); declaredFlying = true; } catch (e) { /* older proto */ }
-    }
-    const start = Date.now();
-    while (Date.now() - start < ms) {
-        const d = dest.minus(bot.entity.position);
-        const mag = Math.sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
-        if (mag < 0.6) break;
-        bot.physics.gravity = 0;
-        bot.entity.velocity.set(0, 0, 0);
-        bot.entity.position.add(d.scaled(Math.min(0.35, mag) / mag));
-        await new Promise(r => setTimeout(r, 50));
+// Placement fails server-side if the bot's body occupies the destination cell - step aside.
+async function stepOff(bot, P) {
+    const feet = bot.entity.position.floored();
+    if (!feet.equals(P) && !feet.offset(0, 1, 0).equals(P)) return;
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1]]) {
+        const t = feet.offset(dx, 0, dz);
+        const b = bot.blockAt(t), head = bot.blockAt(t.offset(0, 1, 0)), below = bot.blockAt(t.offset(0, -1, 0));
+        if (b?.boundingBox === 'empty' && head?.boundingBox === 'empty' && below?.boundingBox === 'block') {
+            await nav.navigateTo(bot, { x: t.x, y: t.y, z: t.z }, { arriveDist: 0.5, maxReplans: 1 });
+            return;
+        }
     }
 }
 
@@ -225,16 +201,16 @@ function chooseFace(bot, P, p) {
 async function placeOne(bot, P, p) {
     let existing = bot.blockAt(P);
     if (!existing) {
-        await flyToWithTimeout(bot, P.offset(0.5, 3, 0.5));
+        await goNear(bot, P);
         existing = await waitForBlock(bot, P);
         if (!existing) return { ok: false, why: 'chunk not loaded' };
     }
     if (existing.name === p.name) return { ok: true, skipped: true };
     if (!REPLACEABLE.has(existing.name)) {
         // clear whatever occupies the cell first (instant in creative)
-        const feet = findHover(bot, P, 'up');
-        if (feet) await flyToWithTimeout(bot, feet.offset(0.5, 0, 0.5));
-        try { await bot.dig(existing, true); } catch (e) { /* keep going; place may still fail */ }
+        if (await goNear(bot, P)) {
+            try { await bot.dig(existing, true); } catch (e) { /* keep going; place may still fail */ }
+        }
     }
 
     const choice = chooseFace(bot, P, p);
@@ -243,9 +219,8 @@ async function placeOne(bot, P, p) {
         return { ok: false, why: `no solid neighbor (self=${bot.blockAt(P)?.name} below=${nb(0,-1,0)} above=${nb(0,1,0)} n=${nb(0,0,-1)} s=${nb(0,0,1)} w=${nb(-1,0,0)} e=${nb(1,0,0)})` };
     }
 
-    const feet = findHover(bot, P, choice.faceName);
-    if (!feet) return { ok: false, why: 'no hover spot' };
-    await flyToWithTimeout(bot, feet.offset(0.5, 0, 0.5));
+    if (!(await goNear(bot, P))) return { ok: false, why: 'out of reach (no walkable route)' };
+    await stepOff(bot, P);
 
     const itemName = itemNameFor(p.name);
     if (!(await equip(bot, itemName))) return { ok: false, why: `no item ${itemName}` };
@@ -370,15 +345,15 @@ export async function buildBlueprint(agent, filePath, origin) {
     const pass2 = buildable.filter(needsSupport).sort((a, b) => a.y - b.y || a.x - b.x || a.z - b.z);
 
     for (const m of PAUSABLE_MODES) { try { bot.modes.pause(m); } catch (e) { /* mode absent */ } }
-    bot.creative.startFlying();
 
     let placed = 0, skipped = 0;
     const failures = [];
     const started = Date.now();
     try {
-        // fly to site first so chunks stream in, then WAIT for them - flight outpaces
-        // chunk packets, and a blockAt against a not-yet-received column reads null
-        await flyToWithTimeout(bot, new Vec3(origin.x + 16, origin.y + 12, origin.z + 16), 60000);
+        // walk to the site first so chunks stream in, then WAIT for them - a blockAt
+        // against a not-yet-received column reads null
+        await nav.navigateTo(bot, { x: origin.x + 16, y: origin.y, z: origin.z + 16 },
+            { arriveDist: 12, arriveY: 8, maxReplans: 8 });
         const probe = await waitForBlock(bot, new Vec3(origin.x + 16, origin.y - 1, origin.z + 16), 20000);
         if (!probe) throw new Error('chunks at the build site never loaded');
 
@@ -397,8 +372,7 @@ export async function buildBlueprint(agent, filePath, origin) {
                         const P = new Vec3(origin.x + x, origin.y + y, origin.z + z);
                         const b = bot.blockAt(P);
                         if (b && NATURAL_TERRAIN.has(b.name)) {
-                            const feet = findHover(bot, P, 'up');
-                            if (feet) await flyToWithTimeout(bot, feet.offset(0.5, 0, 0.5));
+                            if (!(await goNear(bot, P))) continue; // unreachable bump; skip
                             try { await bot.dig(b, true); } catch (e) { /* skip stubborn */ }
                             // heartbeat per DIG: a dig-dense row outlasts every staleness
                             // threshold, and a "stale" live build gets killed by its own watchdog
@@ -467,8 +441,9 @@ export async function buildBlueprint(agent, filePath, origin) {
         }
     } finally {
         try { bot.modes.unPauseAll(); } catch (e) { /* best effort */ }
-        // restore gravity or the bot floats forever after the action ends
-        try { bot.creative.stopFlying(); } catch (e) { /* best effort */ }
+        // NOTE: no stopFlying here - we never startFlying now, and calling stopFlying
+        // without a prior startFlying sets bot.physics.gravity to null (creative.js
+        // captures normalGravity lazily), which breaks walking physics entirely.
     }
 
     // verification against the world, never against our own bookkeeping

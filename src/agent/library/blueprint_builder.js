@@ -321,8 +321,11 @@ export async function buildBlueprint(agent, filePath, origin) {
             const occupied = new Set(all.map(p => `${p.x},${p.y},${p.z}`));
             for (let y = 0; y < Math.min(6, meta.size.height); y++) {
                 console.log(`[builder] clearing terrain layer ${y}`);
-                writeStatus(agent, { phase: 'clear', layer: y, total: buildable.length });
                 for (let x = 0; x < meta.size.width; x++) {
+                    // heartbeat per ROW, not per layer: a layer of digging can take
+                    // minutes, and a stale heartbeat makes the watchdog re-send the
+                    // command - which interrupts the very build it is guarding
+                    writeStatus(agent, { phase: 'clear', layer: y, row: x, total: buildable.length });
                     for (let z = 0; z < meta.size.length; z++) {
                         if (occupied.has(`${x},${y},${z}`)) continue;
                         const P = new Vec3(origin.x + x, origin.y + y, origin.z + z);
@@ -363,11 +366,13 @@ export async function buildBlueprint(agent, filePath, origin) {
         // But if MOST blocks failed the problem is systemic (bad chunks, wrong origin) and
         // retrying thousands of 20s fly-and-wait attempts would pin the agent for days.
         const retry = failures.length < buildable.length / 4 ? failures.splice(0, failures.length) : [];
+        let retried = 0;
         for (const p of retry) {
             const P = new Vec3(origin.x + p.x, origin.y + p.y, origin.z + p.z);
             const res = await placeOne(bot, P, p);
             if (res.ok) placed++;
             else failures.push(p);
+            if (++retried % 10 === 0) writeStatus(agent, { phase: 'retry', done: retried, total: retry.length });
         }
     } finally {
         try { bot.modes.unPauseAll(); } catch (e) { /* best effort */ }

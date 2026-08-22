@@ -388,6 +388,9 @@ export async function buildBlueprint(agent, filePath, origin) {
                             const feet = findHover(bot, P, 'up');
                             if (feet) await flyToWithTimeout(bot, feet.offset(0.5, 0, 0.5));
                             try { await bot.dig(b, true); } catch (e) { /* skip stubborn */ }
+                            // heartbeat per DIG: a dig-dense row outlasts every staleness
+                            // threshold, and a "stale" live build gets killed by its own watchdog
+                            writeStatus(agent, { phase: 'clear', layer: y, row: x, digging: true, total: buildable.length });
                         }
                     }
                 }

@@ -363,7 +363,9 @@ export const actionsList = [
                 range = 32;
             }
             await skills.goToNearestBlock(agent.bot, block_type, 4, range);
-        })
+        }, false, 3)   // bounded: this routes through mineflayer-pathfinder, which cannot move
+                       // the bot here, so without a ceiling it pins currentActionLabel until
+                       // something else forces a stop (observed: 5 minutes frozen mid-igloo)
     },
     {
         name: '!searchForEntity',
@@ -1045,8 +1047,23 @@ export const actionsList = [
         name: '!goToBed',
         description: 'Go to the nearest bed and sleep.',
         perform: runAsAction(async (agent) => {
-            await skills.goToBed(agent.bot);
-        })
+            // Stand down if the mode already owns this job. Both sides of the livelock fence:
+            // the guard here, "action:goToBed" in night_safety's excludeFromInterrupt.
+            if (agent.bot.modes.exists('night_safety') && agent.bot.modes.isActive('night_safety'))
+                return 'Night safety is already handling bed/shelter - leaving it to finish.';
+            const r = await skills.goToBed(agent.bot);
+            return r.slept ? 'Slept.' : `Did not sleep: ${r.reason}.`;
+        }, false, 3)   // 3 min ceiling - the default -1 is the pin-forever hazard
+    },
+    {
+        name: '!shelter',
+        description: 'Dig in and seal a one-block shelter for the night. Use when there is no bed.',
+        perform: runAsAction(async (agent) => {
+            if (agent.bot.modes.exists('night_safety') && agent.bot.modes.isActive('night_safety'))
+                return 'Night safety is already handling bed/shelter - leaving it to finish.';
+            const r = await skills.emergencyShelter(agent.bot);
+            return r.sheltered ? `VERIFIED SHELTER: sealed.` : `Could not shelter: ${r.reason}.`;
+        }, false, 3)
     },
     {
         name: '!stay',

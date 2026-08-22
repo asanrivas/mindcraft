@@ -1,6 +1,7 @@
 import * as skills from "./library/skills.js";
 import { isFallingBlockName } from "./library/tools.js";
 import * as swim from "./library/swim.js";
+import * as night from "./library/night.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
 import settings from "./settings.js";
@@ -181,7 +182,7 @@ const modes_list = [
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 20);
                 }, 1);
-            } else if (agent.isIdle() && !swim.inWater(bot)) {
+            } else if (agent.isIdle() && !swim.inWater(bot) && !bot.isSleeping) {
                 // Not while wet: SwimAssist holds jump to keep the head above water, and
                 // clearing it here every idle tick would quietly sink the bot.
                 bot.clearControlStates();
@@ -197,7 +198,8 @@ const modes_list = [
         // travel pauses to mine through obstructions, which looks like being stuck;
         // it has its own stall detection and a hard deadline, so let it run.
         excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:travel", "action:navTo",
-            "action:swimTo", "action:dive", "action:surface", "action:swimProbe", "mode:drowning"],
+            "action:swimTo", "action:dive", "action:surface", "action:swimProbe", "mode:drowning",
+            "action:goToBed", "action:shelter", "mode:night_safety"],
         on: true,
         active: false,
         prev_location: null,
@@ -327,6 +329,65 @@ const modes_list = [
                     await skills.defendSelf(agent.bot, 8);
                 });
             }
+        },
+    },
+    {
+        // Positioned AFTER self_defense and BEFORE hunting, deliberately. Everything above keeps
+        // updating while this is active - a creeper at the bedside still triggers self_defense,
+        // low air still triggers drowning. Everything below goes quiet, which is what we want:
+        // chasing a pig at dusk is how you meet a skeleton.
+        name: "night_safety",
+        description: "At dusk, sleep in a bed (or place one), or dig in when there is none.",
+        interrupts: ["all"],
+        // Never interrupt the survival modes above us, nor the commands doing this same job -
+        // that mutual-interrupt livelock cost the bot 2 hearts of drowning damage once already
+        // (!surface vs mode:drowning, docs/SWIMMING.md 5.2).
+        excludeFromInterrupt: [
+            "mode:drowning", "mode:self_preservation", "mode:self_defense",
+            "action:goToBed", "action:shelter", "action:surface",
+            "action:fill", "action:plantTrees", "action:!stay",
+        ],
+        on: true,
+        active: false,
+        cooldownUntil: 0,
+        sheltered: null,
+        update: async function (agent) {
+            const bot = agent.bot;
+            if (Date.now() < this.cooldownUntil) return;
+            if (bot.isSleeping) return;
+
+            const t = bot.time.timeOfDay;
+
+            // Dawn: break out of last night's hole.
+            if (!night.isNight(t) && this.sheltered) {
+                const seal = this.sheltered;
+                this.sheltered = null;
+                execute(this, agent, async () => { await skills.digOut(bot, seal); }, 1);
+                return;
+            }
+            if (!night.isDuskApproaching(t) && !(bot.thunderState > 0)) return;
+
+            // Water belongs to the drowning mode; never contest the jump key with SwimAssist.
+            if (swim.inWater(bot)) return;
+
+            // Stand off while something is trying to kill us: self_defense owns that tick. The
+            // cooldown below means we retry after the fight instead of fighting IT for control.
+            const hostile = world.getNearbyEntities(bot, 12)
+                .find(e => e && mc.isHostile(e));
+            if (hostile) { this.cooldownUntil = Date.now() + 8000; return; }
+
+            execute(this, agent, async () => {
+                const outcome = await skills.nightRoutine(bot, this);
+                say(agent, outcome);
+                if (/could not|cannot/i.test(outcome)) {
+                    // Hopeless right now (no bed, nothing to dig, bare stone): back off rather
+                    // than re-firing every tick and pinning currentActionLabel.
+                    this.cooldownUntil = Date.now() + 20000;
+                }
+            }, 3);   // 3 minutes, never -1
+        },
+        unpause: function () {
+            this.cooldownUntil = 0;
         },
     },
     {

@@ -3517,36 +3517,195 @@ export async function useDoor(bot, door_pos=null) {
     return true;
 }
 
+/**
+ * Sleep in the nearest bed.
+ *
+ * Repaired from a version with three separate faults, none of which had ever run successfully:
+ *   1. `block.name.includes('bed')` also matched **bedrock**, so the bot walked to a stone
+ *      floor and tried to sleep in it.
+ *   2. It travelled with `goToPosition`, i.e. mineflayer-pathfinder, which cannot move this bot
+ *      at all (protocol 775; see NAVIGATION_REBUILD.md).
+ *   3. `bot.sleep()` was uncaught. Daytime, monsters-nearby and occupied-bed all throw, and the
+ *      `while (bot.isSleeping)` wait was unbounded and ignored interrupts, while
+ *      `pause('unstuck')` was never released on the throw path.
+ *
+ * @returns {Promise<{slept:boolean, reason:string, pos?:object}>}
+ */
 export async function goToBed(bot) {
-    /**
-     * Sleep in the nearest bed.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @returns {Promise<boolean>} true if the bed was found, false otherwise.
-     * @example
-     * await skills.goToBed(bot);
-     **/
+    const nav = await import('./nav.js');
+    const night = await import('./night.js');
+
+    if (bot.game.dimension !== 'overworld') {
+        log(bot, `Not sleeping in ${bot.game.dimension} - beds explode outside the overworld.`);
+        return { slept: false, reason: 'wrong_dimension' };
+    }
+
     const beds = bot.findBlocks({
-        matching: (block) => {
-            return block.name.includes('bed');
-        },
-        maxDistance: 32,
-        count: 1
+        matching: (block) => night.isBedName(block.name),   // exact suffix, never 'bedrock'
+        maxDistance: 48,
+        count: 4,
     });
     if (beds.length === 0) {
         log(bot, `Could not find a bed to sleep in.`);
-        return false;
+        return { slept: false, reason: 'no_bed' };
     }
-    let loc = beds[0];
-    await goToPosition(bot, loc.x, loc.y, loc.z);
-    const bed = bot.blockAt(loc);
-    await bot.sleep(bed);
-    log(bot, `You are in bed.`);
-    bot.modes.pause('unstuck');
-    while (bot.isSleeping) {
-        await new Promise(resolve => setTimeout(resolve, 500));
+
+    for (const loc of beds) {
+        if (bot.interrupt_code) return { slept: false, reason: 'interrupted' };
+
+        const res = await nav.navigateTo(bot, new Vec3(loc.x, loc.y, loc.z), { arriveDist: 2 });
+        if (!res.arrived) {
+            log(bot, `Could not reach the bed at (${loc.x}, ${loc.y}, ${loc.z}).`);
+            continue;
+        }
+
+        const bed = bot.blockAt(loc);
+        if (!bed || !night.isBedName(bed.name)) continue;
+
+        try {
+            await bot.sleep(bed);
+        } catch (err) {
+            const msg = String(err.message || err);
+            if (/monster|mob/i.test(msg)) {
+                log(bot, `Cannot sleep: monsters nearby.`);
+                return { slept: false, reason: 'monsters' };
+            }
+            if (/not sleeping|day|night|time/i.test(msg)) {
+                log(bot, `Cannot sleep yet: it is not night.`);
+                return { slept: false, reason: 'daytime' };
+            }
+            log(bot, `Could not sleep in that bed: ${msg}`);
+            continue;   // occupied or out of reach - try the next one
+        }
+
+        bot.modes.pause('unstuck');
+        try {
+            const woke = await sleepUntilMorning(bot, 90000);
+            const p = bot.entity.position;
+            log(bot, `VERIFIED SLEEP: slept at (${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}), `
+                + `${woke ? 'woke naturally' : 'still in bed'} at timeOfDay=${bot.time.timeOfDay}.`);
+        } finally {
+            bot.modes.unpause('unstuck');   // released even when the wait throws
+        }
+        return { slept: true, reason: 'slept', pos: loc };
     }
-    log(bot, `You have woken up.`);
+    return { slept: false, reason: 'unreachable' };
+}
+
+/**
+ * Wait out the night in bed, but never hold the action open forever.
+ *
+ * If every player sleeps the server skips to dawn in seconds. If a human stays awake it does
+ * not, and holding `currentActionLabel` for a seven-minute real-time night would block every
+ * other action - the pin-forever failure this codebase has hit before. Give up holding, leave
+ * the bot asleep, and let the mode's dawn path finish the job.
+ */
+async function sleepUntilMorning(bot, timeoutMs = 90000) {
+    const t0 = Date.now();
+    while (bot.isSleeping && Date.now() - t0 < timeoutMs) {
+        if (bot.interrupt_code) break;
+        await new Promise(r => setTimeout(r, 500));
+    }
+    return !bot.isSleeping;
+}
+
+/**
+ * Dig in for the night when there is no bed: a 2-deep hole with a block pulled over the top.
+ * Built only on primitives that work here - mining and placing.
+ *
+ * @returns {Promise<{sheltered:boolean, reason:string, seal?:object}>}
+ */
+export async function emergencyShelter(bot, modeState = null) {
+    const night = await import('./night.js');
+    const getName = (x, y, z) => {
+        const b = bot.blockAt(new Vec3(x, y, z));
+        return b ? b.name : null;
+    };
+    const origin = bot.entity.position.floored();
+    const spot = night.pickShelterSpot(getName, origin, 2);
+    if (!spot) {
+        log(bot, `Nowhere safe to dig in around here.`);
+        return { sheltered: false, reason: 'no_spot' };
+    }
+
+    if (spot.x !== origin.x || spot.z !== origin.z) {
+        const nav = await import('./nav.js');
+        await nav.navigateTo(bot, new Vec3(spot.x, spot.y, spot.z), { arriveDist: 1.5 });
+    }
+
+    // digDown already refuses to break into lava, water, or over a big drop - keep that.
+    await digDown(bot, 2);
+
+    const p = bot.entity.position.floored();
+    const sealPos = new Vec3(p.x, p.y + 2, p.z);
+    let material = pickBuildMaterial(bot);
+    if (!hasBuildingBlocks(bot)) {
+        // Nothing to seal with: mine one wall of the hole for a block.
+        await breakBlockAt(bot, p.x + 1, p.y, p.z);
+        await pickupNearbyItems(bot);
+        material = pickBuildMaterial(bot);
+    }
+
+    await placeBlock(bot, material, sealPos.x, sealPos.y, sealPos.z, 'bottom');
+    const sealed = bot.blockAt(sealPos);
+    const ok = !!sealed && sealed.boundingBox === 'block';
+    if (ok && modeState) modeState.sheltered = sealPos;
+    log(bot, ok
+        ? `VERIFIED SHELTER: sealed at (${sealPos.x}, ${sealPos.y}, ${sealPos.z}) with ${sealed.name}.`
+        : `Dug in at y=${p.y} but could not seal the roof.`);
+    return { sheltered: ok, reason: ok ? 'sealed' : 'unsealed', seal: sealPos };
+}
+
+/** Break out of the overnight shelter at dawn. */
+export async function digOut(bot, sealPos) {
+    if (!sealPos) return false;
+    await breakBlockAt(bot, sealPos.x, sealPos.y, sealPos.z);
+    await pillarUp(bot, 1);
+    log(bot, `Dug out of the shelter at dawn.`);
     return true;
+}
+
+/**
+ * The whole nightfall decision, in one place. Called by the night_safety mode.
+ * @returns {Promise<string>} an outcome line
+ */
+export async function nightRoutine(bot, modeState = null) {
+    const night = await import('./night.js');
+
+    const bedNearby = bot.findBlocks({
+        matching: (b) => night.isBedName(b.name), maxDistance: 48, count: 1,
+    }).length > 0;
+
+    const action = night.decideNightAction({
+        timeOfDay: bot.time.timeOfDay,
+        thundering: bot.thunderState > 0,
+        inWater: swim.inWater(bot),
+        hostileNear: false,          // the mode checks this before calling us
+        bedNearby,
+        bedInInv: !!night.bedInInventory(bot.inventory.items()),
+        dimension: bot.game.dimension,
+        isSleeping: bot.isSleeping,
+    });
+
+    if (action === 'none' || action === 'wait') return `Night routine: ${action}.`;
+
+    if (action === 'sleep') {
+        const r = await goToBed(bot);
+        if (r.slept) return `Slept through the night.`;
+        if (r.reason === 'monsters') return `Could not sleep: monsters nearby.`;
+        // fall through to shelter - a bed we cannot reach is no use tonight
+    }
+
+    if (action === 'place_bed') {
+        const bedItem = night.bedInInventory(bot.inventory.items());
+        if (bedItem && await placeNearby(bot, bedItem.name)) {
+            const r = await goToBed(bot);
+            if (r.slept) return `Placed a bed and slept through the night.`;
+        }
+    }
+
+    const s = await emergencyShelter(bot, modeState);
+    return s.sheltered ? `Dug in for the night.` : `Could not shelter: ${s.reason}.`;
 }
 
 export async function tillAndSow(bot, x, y, z, seedType=null) {

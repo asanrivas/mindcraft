@@ -112,7 +112,11 @@ export function blacklistCommands(commands) {
             continue;
         }
         delete commandMap[command_name];
-        delete commandList.find(command => command.name === command_name);
+        // `delete commandList.find(...)` deleted a property off the found object rather
+        // than removing the element, so blacklisted commands stayed in commandList (and
+        // therefore in getCommandDocs). Splice the element out instead.
+        const idx = commandList.findIndex(command => command.name === command_name);
+        if (idx !== -1) commandList.splice(idx, 1);
     }
 }
 
@@ -121,6 +125,31 @@ const argRegex = /-?\d+(?:\.\d+)?|true|false|"[^"]*"/g;
 
 // Regex for space-separated format: !command "arg1" arg2 or !command arg1 arg2
 const spaceSeparatedRegex = /^!(\w+)\s+(.+)$/;
+
+/**
+ * Find the command invocation to act on, preferring one that actually carries arguments.
+ * Models routinely name a command in prose first ("I'll use the correct syntax for
+ * `!fill`:") and only then call it properly on the next line. Taking the plain first
+ * regex match grabs the bare mention, which makes a valid call report "given 0 args"
+ * and - via truncCommandMessage - discards the real invocation entirely.
+ * Only a later match of the SAME command is preferred, so an unrelated command later in
+ * the message is never run in place of the first one.
+ * @param {string} message
+ * @returns {RegExpMatchArray | null}
+ */
+function findCommandMatch(message) {
+    let best = null;
+    const globalCommandRegex = new RegExp(commandRegex.source, 'g');
+    for (const m of message.matchAll(globalCommandRegex)) {
+        if (!best) {
+            best = m; // fall back to the first mention
+            if (m[2]) break; // already has args, nothing better to find
+            continue;
+        }
+        if (m[2] && m[1] === best[1]) { best = m; break; }
+    }
+    return best;
+}
 
 /**
  * Normalize various quote characters to standard ASCII double quotes
@@ -337,7 +366,7 @@ export function parseCommandMessage(message) {
     // Normalize space-separated format to parenthesis format
     message = normalizeCommandFormat(message);
     
-    const commandMatch = message.match(commandRegex);
+    const commandMatch = findCommandMatch(message);
     if (!commandMatch) return `Command is incorrectly formatted`;
 
     const commandName = "!"+commandMatch[1];
@@ -423,7 +452,9 @@ export function parseCommandMessage(message) {
 export function truncCommandMessage(message) {
     // Normalize space-separated format first
     const normalized = normalizeCommandFormat(message);
-    const commandMatch = normalized.match(commandRegex);
+    // Must use the same selection as parseCommandMessage: truncating at a bare prose
+    // mention would cut off the real invocation that follows it.
+    const commandMatch = findCommandMatch(normalized);
     if (commandMatch) {
         return normalized.substring(0, commandMatch.index + commandMatch[0].length);
     }

@@ -11,7 +11,7 @@ export class VisionInterpreter {
         this.camera_disabled = false;
         if (allow_vision) {
             try {
-                this.camera = new Camera(agent.bot, this.fp);
+                this.camera = new Camera(agent.bot, this.fp, 3000 + (agent.count_id || 0));
                 this.camera.on('error', (err) => {
                     console.warn('Camera error:', err.message);
                     this.camera_disabled = true;

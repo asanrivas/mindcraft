@@ -1,4 +1,5 @@
 import { History } from './history.js';
+import { getBudget, applyContextBudget } from '../utils/context_budget.js';
 import { Coder } from './coder.js';
 import { VisionInterpreter } from './vision/vision_interpreter.js';
 import { Prompter } from '../models/prompter.js';
@@ -8,10 +9,12 @@ import { containsCommand, commandExists, executeCommand, truncCommandMessage, is
 import { ActionManager } from './action_manager.js';
 import { NPCContoller } from './npc/controller.js';
 import { MemoryBank } from './memory_bank.js';
+import { Steering } from './steering.js';
 import { SelfPrompter } from './self_prompter.js';
 import convoManager from './conversation.js';
 import { handleTranslation, handleEnglishTranslation } from '../utils/translator.js';
 import { addBrowserViewer } from './vision/browser_viewer.js';
+import { AutoJump } from './library/auto_jump.js';
 import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
@@ -40,10 +43,19 @@ export class Agent {
             return;
         }
         
+        // Probe the model's real context window and derive every context-sensitive limit from
+        // it before anything reads those limits. History in particular caches max_messages at
+        // construction, so this has to happen first.
+        await applyContextBudget(settings, settings.profile);
+
         this.history = new History(this);
         this.coder = new Coder(this);
         this.npc = new NPCContoller(this);
         this.memory_bank = new MemoryBank();
+        // User-authored standing instructions. Loaded here, before any prompt is built, so the
+        // very first reply after a restart is already steered.
+        this.steering = new Steering(this);
+        this.steering.load();
         this.self_prompter = new SelfPrompter(this);
         this.idle_behavior = new IdleBehavior(this);
         convoManager.initAgent(this);
@@ -118,6 +130,12 @@ export class Agent {
             try {
                 clearTimeout(spawnTimeout);
                 addBrowserViewer(this.bot, count_id);
+
+                // The pathfinder's own jump does not carry momentum on this server (see
+                // auto_jump.js), leaving the bot unable to climb 1-block steps. This presses
+                // jump early enough that the bot is still moving when it leaves the ground.
+                this.auto_jump = new AutoJump(this.bot);
+                this.auto_jump.enable();
                 console.log('Initializing vision intepreter...');
                 this.vision_interpreter = new VisionInterpreter(this, settings.allow_vision);
 
@@ -341,7 +359,7 @@ export class Agent {
 
         let behavior_log = this.bot.modes.flushBehaviorLog().trim();
         if (behavior_log.length > 0) {
-            const MAX_LOG = 500;
+            const MAX_LOG = getBudget().behavior_log_chars;
             if (behavior_log.length > MAX_LOG) {
                 behavior_log = '...' + behavior_log.substring(behavior_log.length - MAX_LOG);
             }

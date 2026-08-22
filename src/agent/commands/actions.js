@@ -1,4 +1,5 @@
 import * as skills from '../library/skills.js';
+import fs from 'fs';
 import settings from '../settings.js';
 import convoManager from '../conversation.js';
 
@@ -14,11 +15,18 @@ function runAsAction (actionFn, resume = false, timeout = -1) {
         }
 
         const actionFnWithAgent = async () => {
-            await actionFn(agent, ...args);
+            return await actionFn(agent, ...args);
         };
         const code_return = await agent.actions.runAction(`action:${actionLabel}`, actionFnWithAgent, { timeout, resume });
         if (code_return.interrupted && !code_return.timedout)
             return;
+        // Surface the command's own return value alongside the bot output log. Commands
+        // report concrete outcomes ("Filled area with 0 sandstone blocks"); dropping them
+        // left the model free to assume success from prose alone.
+        const summary = code_return.result;
+        if (summary !== undefined && summary !== null && summary !== '') {
+            return code_return.message ? `${code_return.message}\n${summary}` : String(summary);
+        }
         return code_return.message;
     }
 
@@ -48,6 +56,91 @@ export const actionsList = [
             };
             await agent.actions.runAction('action:newAction', actionFn, {timeout: settings.code_timeout_mins});
             return result;
+        }
+    },
+    {
+        name: '!travel',
+        description: 'Travel a long distance in a compass direction (west/east/north/south). Walks and mines through obstructions; does not rely on jumping. Reports VERIFIED distance actually covered.',
+        params: {
+            'direction': { type: 'string', description: 'One of: west, east, north, south.' },
+            'distance': { type: 'int', description: 'How many blocks to travel.', domain: [1, 100000] }
+        },
+        perform: runAsAction(async (agent, direction, distance) => {
+            const dirs = { west: [-1, 0], east: [1, 0], north: [0, -1], south: [0, 1] };
+            const d = dirs[String(direction).toLowerCase()];
+            if (!d) return `Unknown direction "${direction}". Use west, east, north or south.`;
+            return await skills.travelDirection(agent.bot, d[0], d[1], distance);
+        }, true, 45)  // resume=true so it can be continued; 45 min ceiling
+    },
+    {
+        name: '!navTo',
+        description: 'Go to x y z using the built-in navigator (own A* + raw movement, does not use mineflayer-pathfinder).',
+        params: {
+            'x': { type: 'int', description: 'target x' },
+            'y': { type: 'int', description: 'target y' },
+            'z': { type: 'int', description: 'target z' }
+        },
+        perform: runAsAction(async (agent, x, y, z) => {
+            const nav = await import('../library/nav.js');
+            const { Vec3 } = await import('vec3');
+            const start = agent.bot.entity.position.clone();
+            const t0 = Date.now();
+            const probe = nav.planPath(agent.bot, new Vec3(x, y, z));
+            console.warn(`[navTo] plan took ${Date.now() - t0}ms length=${probe ? probe.length : 'null'} first=${probe && probe[1] ? JSON.stringify(probe[1]) : '-'} last=${probe && probe.length ? JSON.stringify(probe[probe.length-1]) : '-'}`);
+            const res = await nav.navigateTo(agent.bot, new Vec3(x, y, z), {});
+            const p = agent.bot.entity.position;
+            return `NAV: arrived=${res.arrived} covered=${res.covered.toFixed(1)} replans=${res.replans} `
+                + `from=(${start.x.toFixed(0)},${start.y.toFixed(0)},${start.z.toFixed(0)}) `
+                + `to=(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`;
+        }, true, 10)
+    },
+    {
+        name: '!climbOut',
+        description: 'Cut a staircase up to the surface. Use when stuck underground in a cave or tunnel.',
+        perform: runAsAction(async (agent) => {
+            const before = agent.bot.entity.position.y;
+            const gained = await skills.climbToSurface(agent.bot);
+            const p = agent.bot.entity.position;
+            return `CLIMB: gained ${gained.toFixed(0)} blocks, y ${before.toFixed(0)} -> ${p.y.toFixed(0)}.`;
+        }, true, 15)
+    },
+    {
+        // Steering is rendered verbatim into every prompt and is never round-tripped through the
+        // model the way `history.memory` is - that channel is model-written and has already
+        // corrupted itself once in this project, rewriting a command signature until the bot
+        // acted on its own bad note. Directives change only when a user asks; the guard below
+        // stops an autonomous loop from rewriting its own instructions.
+        name: '!steer',
+        description: 'Give me a standing instruction that shapes how I talk and act. Persists across restarts. Example: !steer("be brief, no questions")',
+        params: {
+            'instruction': { type: 'string', description: 'The standing instruction, kept short.' }
+        },
+        perform: async function (agent, instruction) {
+            // Refuse while self-prompting. Relaying what a user just asked for is the point of
+            // this command, but an autonomous loop editing its own standing instructions is the
+            // same self-corruption that wrecked `history.memory` in this project.
+            if (agent.self_prompter && agent.self_prompter.isActive())
+                return 'I will not change my own standing instructions while running autonomously. Ask me directly.';
+            return agent.steering.add(instruction).message;
+        }
+    },
+    {
+        name: '!steering',
+        description: 'List the standing instructions currently steering me, numbered.',
+        perform: async function (agent) {
+            return agent.steering.list();
+        }
+    },
+    {
+        name: '!unsteer',
+        description: 'Remove a standing instruction by its number from !steering, or "all" to clear them.',
+        params: {
+            'which': { type: 'string', description: 'The number shown by !steering, or "all".' }
+        },
+        perform: async function (agent, which) {
+            if (agent.self_prompter && agent.self_prompter.isActive())
+                return 'I will not remove my own standing instructions while running autonomously. Ask me directly.';
+            return agent.steering.remove(which).message;
         }
     },
     {
@@ -515,7 +608,7 @@ export const actionsList = [
     },
     {
         name: '!fill',
-        description: 'Fill a rectangular area with blocks. Can build floors (height=1) or walls (height=5+). Like Minecraft /fill command.',
+        description: 'Manually walk and place blocks (slow, can fail on rough terrain - prefer !serverFill). Takes only X/Z corners then a SINGLE y and a height: (blockType, x1, z1, x2, z2, y, height). This is NOT the vanilla /fill order.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "dirt", "cobblestone").' },
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
@@ -526,13 +619,14 @@ export const actionsList = [
             'height': { type: 'int', description: 'How many levels high to build (default 1). Use 5 for standard walls.', optional: true }
         },
         perform: runAsAction(async (agent, blockType, x1, z1, x2, z2, y, height = 1) => {
-            const placed = await skills.fill(agent.bot, blockType, x1, z1, x2, z2, y, height);
-            return `Filled area with ${placed} ${blockType} blocks.`;
+            // skills.fill returns a VERIFIED summary read back from world state, not a
+            // self-reported count - pass it through unchanged.
+            return await skills.fill(agent.bot, blockType, x1, z1, x2, z2, y, height);
         }, true, 600)  // resume=true allows resuming after interruption
     },
     {
         name: '!serverFill',
-        description: 'FAST fill using server /fill command - places thousands of blocks INSTANTLY. Requires operator permissions. Use this for large builds instead of !fill.',
+        description: 'PREFERRED for building. Instant server /fill - thousands of blocks at once, no walking. Takes BOTH corners in full 3D: (blockType, x1, y1, z1, x2, y2, z2). Note this is a DIFFERENT argument order from !fill.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "stone_bricks", "cobblestone").' },
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
@@ -550,13 +644,22 @@ export const actionsList = [
             const command = `/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} ${mode}`;
             agent.bot.chat(command);
 
-            // Calculate approximate blocks
+            // Give the server a moment to apply, then read the region back. Reporting the
+            // requested block count would claim success even when the command silently
+            // failed (no operator permission, unloaded chunks, bad block name).
+            await new Promise(r => setTimeout(r, 600));
+            if (mode === 'replace' || mode === 'keep') {
+                const check = skills.verifyRegion(agent.bot,
+                    Math.min(Math.floor(x1), Math.floor(x2)), Math.min(Math.floor(z1), Math.floor(z2)),
+                    Math.max(Math.floor(x1), Math.floor(x2)), Math.max(Math.floor(z1), Math.floor(z2)),
+                    Math.min(Math.floor(y1), Math.floor(y2)),
+                    Math.abs(Math.floor(y2) - Math.floor(y1)) + 1, blockType);
+                return `Ran ${command}\n${check.summary}`;
+            }
             const dx = Math.abs(x2 - x1) + 1;
             const dy = Math.abs(y2 - y1) + 1;
             const dz = Math.abs(z2 - z1) + 1;
-            const totalBlocks = dx * dy * dz;
-
-            return `Server fill executed: ${totalBlocks} blocks of ${blockType} (${mode} mode). Command: ${command}`;
+            return `Ran ${command} (${mode} mode, ${dx * dy * dz} blocks in region).`;
         }
     },
     {
@@ -578,6 +681,31 @@ export const actionsList = [
             agent.bot.chat(command);
 
             return `Summoned ${entityType} at (${spawnX}, ${spawnY}, ${spawnZ})`;
+        }
+    },
+    {
+        // Rescue hatch, not a travel shortcut. Terrain edits made while testing have several
+        // times dropped the bot into a pit or sealed it underground with no reachable way out,
+        // and nothing in the normal movement stack can recover from that. This teleports it
+        // clear - but ONLY while an operator-created marker file exists on disk, so the model
+        // can never invoke it to skip a journey it is supposed to walk.
+        name: '!serverTp',
+        description: 'Operator rescue only. Disabled unless a marker file is present; not usable for travel.',
+        params: {
+            'x': { type: 'int', description: 'X coordinate.' },
+            'y': { type: 'int', description: 'Y coordinate.' },
+            'z': { type: 'int', description: 'Z coordinate.' }
+        },
+        perform: async (agent, x, y, z) => {
+            const marker = './bots/' + agent.name + '/ALLOW_RESCUE_TP';
+            if (!fs.existsSync(marker))
+                return 'Refused: rescue teleport is disabled. Walk there instead.';
+            fs.unlinkSync(marker); // single use - re-arm deliberately, never by accident
+            agent.bot.chat(`/tp ${agent.name} ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)}`);
+            await new Promise(r => setTimeout(r, 1200));
+            const p = agent.bot.entity.position;
+            return `Rescue teleport used (one-shot, now disarmed). Now at ` +
+                `(${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}).`;
         }
     },
     {
@@ -687,8 +815,18 @@ export const actionsList = [
     },
     {
         name: '!endGoal',
-        description: 'Call when you have accomplished your goal. It will stop self-prompting and the current action. ',
+        description: 'Call when you have accomplished your goal. It will stop self-prompting and the current action. Refused if the last build verification showed the work is incomplete.',
         perform: async function (agent) {
+            // Guard against declaring victory the world does not support. Prompt rules alone
+            // do not prevent this (the model will assert completion regardless), so the check
+            // is made against the last verified region read rather than against intent.
+            const v = agent.bot.last_verification;
+            const RECENT_MS = 5 * 60 * 1000;
+            if (v && !v.complete && (Date.now() - v.at) < RECENT_MS) {
+                return `Refusing to end goal: the last verification found only ${v.correct}/${v.total} `
+                    + `${v.blockType} blocks in place (${v.pct}%). The task is NOT finished. `
+                    + `Fix the missing blocks, then re-run the fill to re-verify.`;
+            }
             agent.self_prompter.stop();
             return 'Self-prompting stopped.';
         }

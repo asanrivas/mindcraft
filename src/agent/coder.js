@@ -6,6 +6,7 @@ import * as skills from './library/skills.js';
 import * as world from './library/world.js';
 import { Vec3 } from 'vec3';
 import {ESLint} from "eslint";
+import { LearnedSkills } from './library/learned_skills.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -16,6 +17,7 @@ export class Coder {
         this.fp = '/bots/'+agent.name+'/action-code/';
         this.code_template = '';
         this.code_lint_template = '';
+        this.learned = new LearnedSkills(agent.name);
 
         readFile(path.join(__dirname, '../../bots/execTemplate.js'), 'utf8', (err, data) => {
             if (err) throw err;
@@ -26,6 +28,38 @@ export class Coder {
             this.code_lint_template = data;
         });
         mkdirSync('.' + this.fp, { recursive: true });
+    }
+
+    /**
+     * Derive what the code was FOR from the most recent human/system request.
+     *
+     * Voyager keys its skill library on a natural-language description rather than on the
+     * code, because a future query ("build me a wall") looks like the description and nothing
+     * like the source. Using the triggering request keeps that property without spending an
+     * extra LLM call on a 9B model that is not reliable at naming its own work.
+     * @param {History} agent_history
+     * @returns {string|null}
+     */
+    _describeIntent(agent_history) {
+        const turns = agent_history.getHistory();
+        for (let i = turns.length - 1; i >= 0; i--) {
+            const t = turns[i];
+            if (t.role !== 'user' && t.role !== 'system') continue;
+            let text = String(t.content || '').trim();
+            if (!text) continue;
+            // skip the self-prompt scaffolding and command-output echoes
+            if (text.startsWith('You are self-prompting')) continue;
+            if (text.startsWith('Code Output:')) continue;
+            if (text.startsWith('Agent wrote this code')) continue;
+            text = text.replace(/^[^:]{1,20}:\s*/, ''); // strip "player: " prefix
+            // Unwrap !newAction("...") so the stored description is the actual intent -
+            // that string is what gets embedded and matched against future requests.
+            const wrapped = text.match(/^!newAction\(\s*"([\s\S]*?)"\s*\)\s*$/);
+            if (wrapped) text = wrapped[1].trim();
+            if (text.length < 4) continue;
+            return text.slice(0, 200);
+        }
+        return null;
     }
 
     async generateCode(agent_history) {
@@ -89,6 +123,17 @@ export class Coder {
                 await executionModule.main(this.agent.bot);
 
                 const code_output = this.agent.actions.getBotOutputSummary();
+
+                // Verified-write gate: the code ran to completion without throwing, so it is
+                // worth keeping. Anything that errored falls through to the catch below and is
+                // never stored - the store only ever contains code that has actually worked.
+                try {
+                    const intent = this._describeIntent(agent_history);
+                    if (intent) this.learned.add(intent, this._sanitizeCode(code));
+                } catch (storeErr) {
+                    console.warn('[Coder] Could not store learned skill:', storeErr.message);
+                }
+
                 const summary = "Agent wrote this code: \n```" + this._sanitizeCode(code) + "```\nCode Output:\n" + code_output;
                 return summary;
             } catch (e) {

@@ -9,6 +9,7 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { selectAPI, createModel } from './_model_map.js';
+import { FallbackModel } from './fallback.js';
 import Vec3 from 'vec3';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -105,11 +106,34 @@ export class Prompter {
             max_tokens = this.profile.max_tokens;
 
         let chat_model_profile = selectAPI(this.profile.model);
-        this.chat_model = createModel(chat_model_profile);
+
+        // Backup brain(s), used when the primary is unreachable. `backup_model` accepts one
+        // profile or an ordered list. Always wrapped, even with no backups configured, so that
+        // FallbackModel stays the single place that turns a thrown provider error back into the
+        // "My brain disconnected" string the agent loop expects.
+        let backup_profiles = this.profile.backup_model
+            ? (Array.isArray(this.profile.backup_model) ? this.profile.backup_model : [this.profile.backup_model])
+            : [];
+        const buildBackups = (label) => backup_profiles.map(bp => {
+            try {
+                // selectAPI mutates its argument, so give each wrapper its own copy
+                return createModel(selectAPI({ ...bp }));
+            } catch (e) {
+                console.warn(`Failed to create backup ${label} model`, JSON.stringify(bp), '-', e.message);
+                return null;
+            }
+        }).filter(Boolean);
+
+        const fallback_opts = { cooldown_ms: (this.profile.backup_cooldown_secs ?? 60) * 1000 };
+        this.chat_model = new FallbackModel(
+            createModel(chat_model_profile), buildBackups('chat'), { ...fallback_opts, label: 'chat' });
+        if (backup_profiles.length)
+            console.log(`Backup model(s) ready: ${backup_profiles.map(b => b.model || b.api).join(', ')}`);
 
         if (this.profile.code_model) {
             let code_model_profile = selectAPI(this.profile.code_model);
-            this.code_model = createModel(code_model_profile);
+            this.code_model = new FallbackModel(
+                createModel(code_model_profile), buildBackups('code'), { ...fallback_opts, label: 'code' });
         }
         else {
             this.code_model = this.chat_model;
@@ -129,6 +153,10 @@ export class Prompter {
             try {
                 embedding_model_profile = selectAPI(this.profile.embedding);
             } catch (e) {
+                // Don't swallow this silently: falling through to the chat model as the
+                // embedding model breaks skill-doc and example retrieval, and the only
+                // symptom is a vague "Error with embedding model" later on.
+                console.warn('Failed to select embedding model from profile:', JSON.stringify(this.profile.embedding), '-', e.message);
                 embedding_model_profile = null;
             }
         }
@@ -317,15 +345,26 @@ export class Prompter {
                 msg.role !== 'system' && msg.content.includes('!newAction(')
             )?.content?.match(/!newAction\((.*?)\)/)?.[1] || '';
 
-            prompt = prompt.replaceAll(
-                '$CODE_DOCS',
-                await this.skill_libary.getRelevantSkillDocs(code_task_content, settings.relevant_docs_count)
-            );
+            let code_docs = await this.skill_libary.getRelevantSkillDocs(code_task_content, settings.relevant_docs_count);
+            // Append skills this agent has previously gotten to work. These are stored only
+            // after the code ran cleanly, so they represent verified capability rather than
+            // guesses, and they survive restarts.
+            const learned = this.agent.coder?.learned;
+            if (learned && learned.count() > 0) {
+                const learned_docs = learned.getDocs(3);
+                if (learned_docs.length > 0) {
+                    code_docs += '\n\n#### PREVIOUSLY WORKING CODE (yours, reuse or adapt) ###\n'
+                        + learned_docs.join('\n### ');
+                }
+            }
+            prompt = prompt.replaceAll('$CODE_DOCS', code_docs);
         }
         if (prompt.includes('$EXAMPLES') && examples !== null)
             prompt = prompt.replaceAll('$EXAMPLES', await examples.createExampleMessage(messages));
         if (prompt.includes('$MEMORY'))
             prompt = prompt.replaceAll('$MEMORY', this.agent.history.memory);
+        if (prompt.includes('$STEERING'))
+            prompt = prompt.replaceAll('$STEERING', this.agent.steering ? this.agent.steering.render() : '');
         if (prompt.includes('$TO_SUMMARIZE'))
             prompt = prompt.replaceAll('$TO_SUMMARIZE', stringifyTurns(to_summarize));
         if (prompt.includes('$CONVO'))

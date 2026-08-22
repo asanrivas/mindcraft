@@ -4,6 +4,7 @@ import settings from './settings.js';
 import { LocalEmbedding } from '../models/local_embedding.js';
 import { cosineSimilarity } from '../utils/math.js';
 import { getNamedChestsJson } from './library/skills.js';
+import { getBudget } from '../utils/context_budget.js';
 
 /**
  * Clean up old log files, keeping only the most recent ones
@@ -65,11 +66,19 @@ export class History {
         // Natural language memory as a summary of recent messages + previous memory
         this.memory = '';
 
-        // Maximum number of messages to keep in context before saving chunk to memory
-        this.max_messages = settings.max_messages;
+        // Maximum number of messages to keep in context before saving chunk to memory.
+        // Scaled from the model's context window unless explicitly configured.
+        const budget = getBudget();
+        this.max_messages = (settings.max_messages === 'auto' || !settings.max_messages)
+            ? budget.max_messages : settings.max_messages;
 
         // Number of messages to remove from current history and save into memory
-        this.summary_chunk_size = 5;
+        this.summary_chunk_size = budget.summary_chunk_size;
+
+        // Turns waiting to be distilled into memory. Consolidation is an extra LLM call, so
+        // it is deferred to the idle loop instead of blocking a reply (see IdleBehavior).
+        this.pending_summary = [];
+        this.consolidating = false;
         // chunking reduces expensive calls to promptMemSaving and appendFullHistory
         // and improves the quality of the memory summary
     }
@@ -81,9 +90,11 @@ export class History {
     async summarizeMemories(turns) {
         console.log("Storing memories...");
         this.memory = await this.agent.prompter.promptMemSaving(turns);
+        this.memory = stripGroundedFacts(this.memory);
 
-        if (this.memory.length > 1000) {
-            this.memory = this.memory.slice(0, 1000);
+        const memory_cap = getBudget().memory_chars;
+        if (this.memory.length > memory_cap) {
+            this.memory = this.memory.slice(0, memory_cap);
             this.memory += '...(truncated, compress more next time)';
         }
 
@@ -106,6 +117,28 @@ export class History {
             } catch (error) {
                 console.warn('[History] Failed to create memory embedding:', error.message);
             }
+        }
+    }
+
+    /**
+     * Distill any queued turns into memory. Safe to call repeatedly; no-ops when the queue is
+     * empty or a consolidation is already running.
+     * @returns {Promise<boolean>} whether work was done.
+     */
+    async consolidatePending() {
+        if (this.consolidating || this.pending_summary.length === 0) return false;
+        this.consolidating = true;
+        const chunk = this.pending_summary;
+        this.pending_summary = [];
+        try {
+            await this.summarizeMemories(chunk);
+            await this.save();
+            return true;
+        } catch (err) {
+            console.warn('[History] Consolidation failed:', err.message);
+            return false;
+        } finally {
+            this.consolidating = false;
         }
     }
 
@@ -147,7 +180,12 @@ export class History {
             // Check if memory saving is disabled (e.g., when using Letta which has its own memory)
             const useMemorySaving = this.agent.prompter?.profile?.use_memory_saving !== false;
             if (useMemorySaving) {
-                await this.summarizeMemories(chunk);
+                this.pending_summary.push(...chunk);
+                // Safety valve: if the bot never goes idle, don't let the backlog grow
+                // unbounded - fall back to consolidating inline.
+                if (this.pending_summary.length >= this.summary_chunk_size * 4) {
+                    await this.consolidatePending();
+                }
             } else {
                 console.log("[History] Memory saving disabled (external memory system in use)");
             }
@@ -259,4 +297,34 @@ export class History {
         }
         return formatted;
     }
+}
+
+/**
+ * Remove claims the model is not entitled to make in persistent memory.
+ *
+ * Command syntax is machine-derived from the command registry and injected every turn via
+ * $COMMAND_DOCS. When the model also writes its *own* version of that syntax into memory,
+ * the note is re-read and re-summarised each cycle, degrading a little each time - observed
+ * live: the real signature !fill(blockType, x1, z1, x2, z2, y, height) decayed into
+ * "!fill X1 Y1 Z1 X2 Y2 Z2 material" and then into "requires exactly 6 arguments", after
+ * which the bot confidently acted on its own corrupted note.
+ *
+ * Dropping these lines makes that failure structurally impossible: the only syntax the model
+ * ever sees is the generated one.
+ * @param {string} memory
+ * @returns {string}
+ */
+function stripGroundedFacts(memory) {
+    if (!memory) return memory;
+    const isSyntaxClaim = (line) => {
+        const l = line.toLowerCase();
+        const mentionsCallShape = /\b(arg|args|argument|parameter|param|syntax|format|signature)\w*\b/.test(l);
+        if (!mentionsCallShape) return false;
+        // Only strip when it is actually talking about how to CALL something: either it
+        // names a command, or it quantifies the call shape ("uses 6 args", "requires 6-7").
+        // Plain coordinates/counts elsewhere are left alone.
+        return /!\w+/.test(line) || /\d/.test(l);
+    };
+    const kept = memory.split('\n').filter(line => !isSyntaxClaim(line));
+    return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }

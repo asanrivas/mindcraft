@@ -28,9 +28,15 @@
     "node-canvas-webgl": "^0.3.0",
     "open": "^10.2.0",
     "openai": "^6.15.0",
+    "prismarine-block": "^1.23.0",
+    "prismarine-chunk": "^1.41.0",
     "prismarine-item": "^1.15.0",
+    "prismarine-physics": "^1.11.1",
+    "prismarine-registry": "^1.11.0",
     "prismarine-viewer": "^1.32.0",
+    "prismarine-world": "^3.7.0",
     "protodef": "^1.19.0",
+    "puppeteer": "^25.8.0",
     "redis": "^4.7.1",
     "replicate": "^0.29.4",
     "ses": "^1.9.1",
@@ -48,7 +54,8 @@
   },
   "scripts": {
     "postinstall": "patch-package",
-    "start": "command -v bun >/dev/null 2>&1 && bun run main.js || node main.js"
+    "start": "command -v bun >/dev/null 2>&1 && bun run main.js || node main.js",
+    "test": "bun tests/tools.test.mjs && bun tests/steering.test.mjs && bun tests/fallback.test.mjs"
   },
   "devDependencies": {
     "@eslint/js": "^9.13.0",

@@ -53,6 +53,11 @@ export const queryList = [
                 action = 'Idle';
             res += `\- Current Action: ${action}`;
 
+            // Only shown while failed over, so the normal prompt costs nothing. Without it the
+            // only symptom of the local server being down is that Andy suddenly writes differently.
+            if (agent.prompter?.chat_model?.on_backup)
+                res += `\n- Brain: BACKUP (${agent.prompter.chat_model.model_name}) - the local model is unreachable`;
+
 
             let players = world.getNearbyPlayerNames(bot);
             let bots = convoManager.getInGameAgents().filter(b => b !== agent.name);

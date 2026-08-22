@@ -1,4 +1,5 @@
 import * as skills from "./library/skills.js";
+import { isFallingBlockName } from "./library/tools.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
 import settings from "./settings.js";
@@ -29,7 +30,6 @@ const modes_list = [
         interrupts: ["all"],
         on: true,
         active: false,
-        fall_blocks: ["sand", "gravel", "concrete_powder"], // includes matching substrings like 'sandstone' and 'red_sand'
         update: async function (agent) {
             const bot = agent.bot;
             let block = bot.blockAt(bot.entity.position);
@@ -42,11 +42,18 @@ const modes_list = [
                     bot.setControlState("jump", true);
                 }
             } else if (
-                this.fall_blocks.some((name) => blockAbove.name.includes(name))
+                isFallingBlockName(blockAbove.name)
             ) {
+                // Dig it out rather than run from it. Fleeing surrenders the position - and
+                // mid-journey it actively undoes progress - whereas the sand above is a couple
+                // of seconds' work with a shovel. moveAway stays only as the last resort.
+                // Bounded timeout: with -1, a mode that cannot finish pins currentActionLabel
+                // forever and no action can ever start again (observed: the agent stuck on
+                // mode:self_preservation at full health, travel unable to run).
                 execute(this, agent, async () => {
-                    await skills.moveAway(bot, 2);
-                });
+                    const dug = await skills.clearFallingBlocksAbove(bot);
+                    if (!dug) await skills.moveAway(bot, 2);
+                }, 0.5);
             } else if (
                 block.name === "lava" ||
                 block.name === "fire" ||
@@ -120,7 +127,7 @@ const modes_list = [
                 say(agent, "I'm dying!");
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 20);
-                });
+                }, 1);
             } else if (agent.isIdle()) {
                 bot.clearControlStates(); // clear jump if not in danger or doing anything else
             }
@@ -132,7 +139,9 @@ const modes_list = [
             "Attempt to get unstuck when in the same place for a while. Interrupts some actions.",
         interrupts: ["all"],
         // Building operations should not be interrupted - they have their own timeout
-        excludeFromInterrupt: ["action:fill", "action:plantTrees"],
+        // travel pauses to mine through obstructions, which looks like being stuck;
+        // it has its own stall detection and a hard deadline, so let it run.
+        excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:travel", "action:navTo"],
         on: true,
         active: false,
         prev_location: null,

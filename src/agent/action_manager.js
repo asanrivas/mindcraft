@@ -1,3 +1,5 @@
+import { getBudget } from '../utils/context_budget.js';
+
 export class ActionManager {
     constructor(agent) {
         this.agent = agent;
@@ -101,8 +103,11 @@ export class ActionManager {
                 TIMEOUT = this._startTimeout(timeout);
             }
 
-            // start the action
-            await actionFn();
+            // start the action, keeping whatever it returns. Skills return machine-checkable
+            // outcomes (e.g. fill() returns the number of blocks actually placed); these used
+            // to be discarded, leaving the model with only free-text log prose to judge
+            // success by - the direct enabler of hallucinated task completion.
+            const result = await actionFn();
 
             // mark action as finished + cleanup
             this.executing = false;
@@ -116,13 +121,23 @@ export class ActionManager {
             let timedout = this.timedout;
             this.agent.clearBotLogs();
 
+            // Clean completion must not leave resume state behind. The idle handler
+            // re-runs the stored resume action on every idle tick, so a stale,
+            // already-finished action gets re-executed forever (observed: a `!navTo`
+            // to the bot's own position re-ran every second for hours, hammering the
+            // LLM and filling GPU VRAM). Interrupted/timed-out actions keep their
+            // resume state so the intended resume-after-disruption still works.
+            if (!interrupted && !timedout) {
+                this.cancelResume();
+            }
+
             // if not interrupted and not generating, emit idle event
             if (!interrupted) {
                 this.agent.bot.emit('idle');
             }
 
             // return action status report
-            return { success: true, message: output, interrupted, timedout };
+            return { success: true, message: output, result, interrupted, timedout };
         } catch (err) {
             this.executing = false;
             this.currentActionLabel = '';
@@ -153,7 +168,7 @@ export class ActionManager {
         const { bot } = this.agent;
         if (bot.interrupt_code && !this.timedout) return '';
         let output = bot.output;
-        const MAX_OUT = 500;
+        const MAX_OUT = getBudget().action_output_chars;
         if (output.length > MAX_OUT) {
             output = `Action output is very long (${output.length} chars) and has been shortened.\n
           First outputs:\n${output.substring(0, MAX_OUT / 2)}\n...skipping many lines.\nFinal outputs:\n ${output.substring(output.length - MAX_OUT / 2)}`;

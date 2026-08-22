@@ -1,6 +1,7 @@
 import * as mc from "../../utils/mcdata.js";
 import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
+import { digWithTool, equipBestTool, isFallingBlockName, isTreeTrunk } from './tools.js';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { existsSync, readFileSync } from 'fs';
@@ -665,7 +666,7 @@ export async function collectBlock(bot, blockType, num=1, exclude=null) {
             break;
         }
         const block = blocks[0];
-        await bot.tool.equipForBlock(block);
+        await equipBestTool(bot, block);
         if (isLiquid) {
             const bucket = bot.inventory.findInventoryItem('bucket');
             if (!bucket) {
@@ -787,7 +788,7 @@ export async function breakBlockAt(bot, x, y, z) {
             await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
         }
         if (bot.game.gameMode !== 'creative') {
-            await bot.tool.equipForBlock(block);
+            await equipBestTool(bot, block);
             const itemId = bot.heldItem ? bot.heldItem.type : null
             if (!block.canHarvest(itemId)) {
                 log(bot, `Don't have right tools to break ${block.name}.`);
@@ -804,6 +805,37 @@ export async function breakBlockAt(bot, x, y, z) {
     return true;
 }
 
+
+async function gotoWithTimeout(bot, goal, label, timeoutMs = 15000) {
+    /**
+     * Run a pathfinder goto bounded by a timeout. mineflayer-pathfinder's goto() never
+     * resolves when no route exists (e.g. the bot would need to step/jump up terrain it
+     * won't path over), which would otherwise hang block placement indefinitely.
+     * @returns {Promise<boolean>} true if the goal was reached, false on timeout/failure.
+     */
+    let timer;
+    const timeout = new Promise((resolve) => {
+        timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    });
+    try {
+        const result = await Promise.race([
+            bot.pathfinder.goto(goal).then(() => 'ok', (e) => e),
+            timeout
+        ]);
+        if (result === 'timeout') {
+            bot.pathfinder.stop();
+            console.warn(`[placeBlock] pathfinder goto timed out after ${timeoutMs}ms (${label})`);
+            return false;
+        }
+        if (result !== 'ok') {
+            console.warn(`[placeBlock] pathfinder goto failed (${label}): ${result?.message || result}`);
+            return false;
+        }
+        return true;
+    } finally {
+        clearTimeout(timer);
+    }
+}
 
 export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dontCheat=false) {
     /**
@@ -953,12 +985,10 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         'powered_rail', 'activator_rail', 'tripwire_hook', 'tripwire', 'water_bucket', 'string'];
     if (!dont_move_for.includes(item_name) && (pos.distanceTo(targetBlock.position) < 1.1 || pos_above.distanceTo(targetBlock.position) < 1.1)) {
         // too close - try to move away, but don't fail if pathfinding has issues
-        try {
-            let goal = new pf.goals.GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2);
-            let inverted_goal = new pf.goals.GoalInvert(goal);
-            bot.pathfinder.setMovements(new pf.Movements(bot));
-            await bot.pathfinder.goto(inverted_goal);
-        } catch (pathErr) {
+        let goal = new pf.goals.GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2);
+        let inverted_goal = new pf.goals.GoalInvert(goal);
+        bot.pathfinder.setMovements(new pf.Movements(bot));
+        if (!await gotoWithTimeout(bot, inverted_goal, 'move away from target')) {
             // Pathfinding failed, but we can still try to place from current position
             log(bot, `Couldn't move away from target, trying to place anyway.`);
         }
@@ -969,7 +999,9 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
             let pos = targetBlock.position;
             let movements = createSafeMovements(bot);
             bot.pathfinder.setMovements(movements);
-            await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
+            // Generous but bounded: goToGoal spends up to ~2s on path planning before it
+            // starts walking, so a tight budget starves the actual movement.
+            await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4), 15000);
         } catch (pathErr) {
             // Pathfinding failed, check if we're close enough to place anyway
             if (bot.entity.position.distanceTo(targetBlock.position) > 6) {
@@ -977,6 +1009,22 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
                 return false;
             }
             log(bot, `Pathfinding partial, attempting placement from current position.`);
+        }
+    }
+
+    // Re-check proximity AFTER moving closer. Walking to the target can leave the bot
+    // standing in the very cell it needs to fill - which is the normal case for a floor at
+    // foot level - and the earlier check ran before this move, so nothing caught it.
+    if (!dont_move_for.includes(item_name)) {
+        const now = bot.entity.position;
+        const now_above = now.plus(Vec3(0, 1, 0));
+        if (now.distanceTo(targetBlock.position) < 1.1 || now_above.distanceTo(targetBlock.position) < 1.1) {
+            const stand_clear = new pf.goals.GoalInvert(
+                new pf.goals.GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2));
+            bot.pathfinder.setMovements(new pf.Movements(bot));
+            if (!await gotoWithTimeout(bot, stand_clear, 'step off target cell')) {
+                log(bot, `Standing on ${target_dest} and could not step clear.`);
+            }
         }
     }
 
@@ -989,14 +1037,66 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
             await bot.equip(block_item, 'hand');
             await bot.lookAt(buildOffBlock.position.offset(0.5, 0.5, 0.5));
             await bot.placeBlock(buildOffBlock, faceVec);
-            log(bot, `Placed ${blockType} at ${target_dest}.`);
             await new Promise(resolve => setTimeout(resolve, 200));
+            // Confirm against world state rather than trusting the API call. bot.placeBlock
+            // can resolve without the block landing, so reporting success here unverified
+            // let bogus placement counts propagate up through fill().
+            if (!verifyBlockPlaced(bot, target_dest, blockType)) {
+                log(bot, `Tried to place ${blockType} at ${target_dest} but the block is not there.`);
+                return false;
+            }
+            log(bot, `Placed ${blockType} at ${target_dest}.`);
             return true;
         }
     } catch (err) {
-        log(bot, `Failed to place ${blockType} at ${target_dest}.`);
+        // The API also throws *after* a successful placement, so re-read before believing
+        // the error - otherwise fill() undercounts and retries blocks that already exist.
+        await new Promise(resolve => setTimeout(resolve, 200));
+        if (verifyBlockPlaced(bot, target_dest, blockType)) {
+            log(bot, `Placed ${blockType} at ${target_dest}.`);
+            return true;
+        }
+        log(bot, `Failed to place ${blockType} at ${target_dest}: ${err.message}`);
+        console.warn(`[placeBlock] ${blockType} at ${target_dest} failed:`, err.message,
+            '| bot at', bot.entity.position.floored(), '| buildOff', buildOffBlock?.name, buildOffBlock?.position, '| face', faceVec);
         return false;
     }
+}
+
+/**
+ * Check that the block at a position actually matches what was meant to be placed.
+ * @param {MinecraftBot} bot
+ * @param {Vec3} pos
+ * @param {string} blockType
+ * @returns {boolean}
+ */
+function verifyBlockPlaced(bot, pos, blockType) {
+    const placed = bot.blockAt(pos);
+    if (!placed) return false;
+    if (placed.name === blockType) return true;
+    // dirt placed on grass reports as grass_block; accept the known equivalence
+    if (blockType === 'dirt' && placed.name === 'grass_block') return true;
+    return false;
+}
+
+async function placeBlockWithTimeout(bot, blockType, x, y, z, placeOn, timeoutMs = 25000) {
+    // fill() is excluded from the "unstuck" mode's rescue interrupt (it stands still on
+    // purpose while placing nearby blocks), so a hung pathfinder.goto() inside placeBlock
+    // would otherwise never be recovered from. Race it against a timeout instead.
+    let timedOut = false;
+    const timeout = new Promise((resolve) => {
+        setTimeout(() => { timedOut = true; resolve(false); }, timeoutMs);
+    });
+    const result = await Promise.race([
+        placeBlock(bot, blockType, x, y, z, placeOn).catch(() => false),
+        timeout
+    ]);
+    if (timedOut) {
+        bot.pathfinder.stop();
+        log(bot, `Timed out trying to place ${blockType} at (${x}, ${y}, ${z}), skipping.`);
+        return false;
+    }
+    return result;
 }
 
 export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
@@ -1061,8 +1161,9 @@ export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
 
             for (let z = zStart; goingForward ? z <= zEnd : z >= zEnd; z += zStep) {
                 if (bot.interrupt_code) {
-                    log(bot, `Fill interrupted at level ${level + 1}. Placed ${totalPlaced + levelPlaced}/${totalBlocks} total. Run same command to resume.`);
-                    return totalPlaced + levelPlaced;
+                    const msg = `Fill INTERRUPTED at level ${level + 1}. Placed ${totalPlaced + levelPlaced}/${totalBlocks} so far - the area is NOT complete. Run the same command to resume.`;
+                    log(bot, msg);
+                    return msg;
                 }
 
                 // Check if block already exists
@@ -1077,7 +1178,7 @@ export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
                 }
 
                 // Place the block
-                const success = await placeBlock(bot, blockType, x, currentY, z, 'bottom');
+                const success = await placeBlockWithTimeout(bot, blockType, x, currentY, z, 'bottom');
                 if (success) {
                     levelPlaced++;
 
@@ -1096,8 +1197,57 @@ export async function fill(bot, blockType, x1, z1, x2, z2, y, height = 1) {
         }
     }
 
+    // Verify against world state before reporting. The placement counters above track what
+    // the bot *believed* it did; this re-reads the region and reports what is actually there,
+    // so a build that silently failed cannot be reported as complete.
+    const check = verifyRegion(bot, minX, minZ, maxX, maxZ, baseY, buildHeight, blockType);
     log(bot, `Fill complete! Placed ${totalPlaced} ${blockType} blocks. (${totalSkipped} already existed)`);
-    return totalPlaced;
+    log(bot, check.summary);
+    return check.summary;
+}
+
+/**
+ * Re-read a region and compare it against the block type that was supposed to fill it.
+ * This is the generic outcome check: it trusts the world, not the action's own bookkeeping.
+ * @param {MinecraftBot} bot, reference to the minecraft bot.
+ * @param {number} minX @param {number} minZ @param {number} maxX @param {number} maxZ
+ * @param {number} baseY, lowest y level of the region.
+ * @param {number} height, number of y levels.
+ * @param {string} blockType, the block that should be present.
+ * @returns {{total:number, correct:number, missing:number, pct:number, complete:boolean, summary:string, mismatches:Array}}
+ */
+export function verifyRegion(bot, minX, minZ, maxX, maxZ, baseY, height, blockType) {
+    let total = 0, correct = 0;
+    const mismatches = [];
+    for (let level = 0; level < height; level++) {
+        const y = baseY + level;
+        for (let x = minX; x <= maxX; x++) {
+            for (let z = minZ; z <= maxZ; z++) {
+                total++;
+                const block = bot.blockAt(new Vec3(x, y, z));
+                if (block && block.name === blockType) {
+                    correct++;
+                } else if (mismatches.length < 5) {
+                    mismatches.push({ x, y, z, actual: block ? block.name : 'unloaded' });
+                }
+            }
+        }
+    }
+    const missing = total - correct;
+    const pct = total === 0 ? 100 : Math.round((correct / total) * 1000) / 10;
+    const complete = missing === 0;
+    // Record the latest outcome so !endGoal can refuse a completion claim that the world
+    // does not support (see actions.js '!endGoal').
+    bot.last_verification = { complete, correct, total, pct, blockType, at: Date.now() };
+    let summary = `VERIFIED: ${correct}/${total} blocks are ${blockType} (${pct}%).`;
+    if (!complete) {
+        const examples = mismatches
+            .map(m => `(${m.x},${m.y},${m.z})=${m.actual}`)
+            .join(', ');
+        summary += ` NOT COMPLETE - ${missing} block(s) wrong or missing, e.g. ${examples}.`
+            + ` Do NOT report this as finished; fix the remaining blocks.`;
+    }
+    return { total, correct, missing, pct, complete, summary, mismatches };
 }
 
 // Keep coverArea as alias for backward compatibility
@@ -1211,7 +1361,7 @@ export async function plantTreeGrid(bot, saplingType, x1, z1, x2, z2, spacing = 
             return plantedCount;
         }
 
-        const success = await placeBlock(bot, sapling, pos.x, pos.y, pos.z, 'bottom');
+        const success = await placeBlockWithTimeout(bot, sapling, pos.x, pos.y, pos.z, 'bottom');
         if (success) {
             plantedCount++;
         }
@@ -2466,11 +2616,14 @@ export async function giveToPlayer(bot, itemType, username, num=1) {
     return false;
 }
 
-export async function goToGoal(bot, goal) {
+export async function goToGoal(bot, goal, timeoutMs = 0) {
     /**
      * Navigate to the given goal. Use doors and attempt minimally destructive movements.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
      * @param {pf.goals.Goal} goal, the goal to navigate to.
+     * @param {number} timeoutMs, optional cap on the walk itself (0 = unbounded).
+     *   Callers on a per-block budget (e.g. placeBlock) should pass one, since goto()
+     *   never resolves when no route exists.
      **/
 
     const nonDestructiveMovements = new pf.Movements(bot);
@@ -2514,8 +2667,12 @@ export async function goToGoal(bot, goal) {
 
     const doorCheckInterval = startDoorInterval(bot);
 
+
     bot.pathfinder.setMovements(final_movements);
     try {
+        if (timeoutMs > 0) {
+            return await gotoWithTimeout(bot, goal, 'goToGoal', timeoutMs);
+        }
         await bot.pathfinder.goto(goal);
         clearInterval(doorCheckInterval);
         return true;
@@ -2523,6 +2680,8 @@ export async function goToGoal(bot, goal) {
         clearInterval(doorCheckInterval);
         // we need to catch so we can clean up the door check interval, then rethrow the error
         throw err;
+    } finally {
+        clearInterval(doorCheckInterval);
     }
 }
 
@@ -3153,7 +3312,22 @@ export async function moveAway(bot, distance) {
         }
     }
 
-    await goToGoal(bot, inverted_goal);
+    // mineflayer-pathfinder cannot move this bot on this server, so goToGoal here never
+    // returned - and because modes call this with no timeout, one trigger pinned the agent on
+    // mode:self_preservation permanently. Use our own navigator and bound the whole thing.
+    const nav = await import('./nav.js');
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1], [1, -1], [-1, 1]];
+    const deadline = Date.now() + 15000;
+    for (const [dx, dz] of dirs) {
+        if (Date.now() > deadline || bot.interrupt_code) break;
+        const target = new Vec3(Math.floor(pos.x + dx * distance), Math.floor(pos.y),
+                                Math.floor(pos.z + dz * distance));
+        await nav.navigateTo(bot, target, {
+            arriveDist: 2, maxReplans: 2, goalXZOnly: true, planRange: 32,
+        });
+        if (bot.entity.position.distanceTo(pos) >= distance * 0.6) break;
+    }
+
     let new_pos = bot.entity.position;
     log(bot, `Moved away from ${pos.floored()} to ${new_pos.floored()}.`);
     return true;
@@ -3904,3 +4078,584 @@ export async function useToolOn(bot, toolName, targetName) {
     log(bot, `Used ${toolName} on ${block.name}.`);
     return true;
  }
+
+/**
+ * Travel a long distance in a compass direction without relying on jumping.
+ *
+ * Why this exists: on this server (1.21.11) the bot's pathfinder jump does not carry any
+ * horizontal momentum, so it can never mount a 1-block step - it bunny-hops in place against
+ * the obstruction until the unstuck mode drags it backwards. Walking, descending, 0.5-high
+ * step-ups (stepHeight 0.6) and mining all work normally, so this routine gets there using
+ * only those: walk toward the next waypoint, and when something blocks the way, mine the two
+ * blocks at head/feet height and step through.
+ *
+ * @param {MinecraftBot} bot
+ * @param {number} dx unit direction on X (-1 west, +1 east, 0 none)
+ * @param {number} dz unit direction on Z (-1 north, +1 south, 0 none)
+ * @param {number} distance total blocks to cover
+ * @param {number} step how far to attempt per leg
+ * @returns {Promise<string>} verified travel summary
+ */
+/**
+ * Cut a staircase upward until the bot is back at the surface.
+ *
+ * Falling into a cave used to end a journey: from underground every onward route is also
+ * underground, so the bot just kept travelling in the dark and ended 30+ blocks below where it
+ * started. Digging straight up does not help - that leaves a 1-wide shaft the bot cannot climb
+ * without blocks to pillar on. A diagonal staircase needs nothing but the ability to mine.
+ *
+ * @returns {Promise<number>} how many blocks of height were gained.
+ */
+/**
+ * Dig out the column of gravity blocks sitting on top of the bot.
+ *
+ * self_preservation used to answer sand-above by running away, which surrenders the position
+ * and, mid-journey, undoes progress the bot just made. Breaking the column is a couple of
+ * seconds with a shovel and leaves the bot where it wanted to be. Each removed block lets the
+ * one above fall into its place, so re-read the same cell rather than walking up the column.
+ *
+ * @returns {Promise<number>} how many blocks were removed.
+ */
+export async function clearFallingBlocksAbove(bot, maxBlocks = 8) {
+    let removed = 0;
+    for (let i = 0; i < maxBlocks; i++) {
+        if (bot.interrupt_code) break;
+        const above = bot.blockAt(bot.entity.position.offset(0, 1, 0));
+        if (!above || !isFallingBlockName(above.name)) break;
+        if (!(await digWithTool(bot, above))) break;
+        removed++;
+        await new Promise(r => setTimeout(r, 250)); // let the stack above settle down one
+    }
+    if (removed) log(bot, `Dug out ${removed} falling block(s) above me.`);
+    return removed;
+}
+
+export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
+    const { preferDir = null, targetY = null } = opts;
+    const nav = await import('./nav.js');
+    const startY = bot.entity.position.y;
+    // Cutting stairs in the direction we actually want to travel turns the climb into progress
+    // rather than a detour; the other headings stay as fallbacks for when it dead-ends.
+    const base = [[1, 0], [0, 1], [-1, 0], [0, -1]];
+    const dirs = preferDir
+        ? [preferDir, ...base.filter(d => d[0] !== preferDir[0] || d[1] !== preferDir[1])]
+        : base;
+    let dir = 0;
+
+    for (let i = 0; i < maxSteps; i++) {
+        if (bot.interrupt_code) break;
+        const p = bot.entity.position.floored();
+        if (targetY !== null) {
+            if (p.y >= targetY - 1) break;
+        } else {
+            const surf = nav.surfaceY(bot, p.x, p.z, 140, p.y + 1);
+            if (surf === null || p.y >= surf - 1) break;
+        }
+
+        const [dx, dz] = dirs[dir % dirs.length];
+        const ahead = new Vec3(p.x + dx, p.y, p.z + dz);
+
+        // The block we will step onto has to exist. After mining its way along, the bot is often
+        // standing in an open chamber of its own making with no wall in any direction - stairs
+        // are impossible there, so pillar straight up instead of spinning on the spot.
+        const stepBlock = bot.blockAt(ahead);
+        if (!stepBlock || stepBlock.boundingBox !== 'block') {
+            if (++dir % dirs.length === 0) {
+                const lifted = await pillarUp(bot, 4);
+                if (lifted < 0.5) break;   // out of blocks or boxed in; nothing more to try
+            }
+            continue;
+        }
+
+        let mined = 0;
+        for (const target of [ahead.offset(0, 1, 0), ahead.offset(0, 2, 0), new Vec3(p.x, p.y + 2, p.z)]) {
+            if (await digWithTool(bot, bot.blockAt(target))) mined++;
+        }
+        if (mined === 0 && stepBlock.boundingBox === 'block') { dir++; continue; }
+
+        const gained = await hopForward(bot, dx, dz, 1600);
+        if (gained < 0.5) dir++;   // no height gained: stairing into a wall, so turn
+    }
+
+    const climbed = bot.entity.position.y - startY;
+    log(bot, `Climbed ${climbed.toFixed(0)} blocks toward the surface (now y=${bot.entity.position.y.toFixed(0)}).`);
+    return climbed;
+}
+
+export async function travelDirection(bot, dx, dz, distance, step = 48) {
+    const startPos = bot.entity.position.clone();
+    const targetX = Math.floor(startPos.x + dx * distance);
+    const targetZ = Math.floor(startPos.z + dz * distance);
+    log(bot, `Travelling ${distance} blocks to (${targetX}, ${targetZ}). This may take a while.`);
+
+    let legs = 0, dug = 0, stalls = 0;
+    const deadline = Date.now() + 30 * 60 * 1000; // hard cap so this can never run forever
+
+    // Surface travel only. If a previous leg ended in a cave, climb out before going further -
+    // otherwise every route the planner can see from down there is also underground.
+    const navMod = await import('./nav.js');
+    let preferY = navMod.surfaceY(bot, startPos.x, startPos.z, 140, Math.floor(startPos.y) + 1);
+    if (preferY !== null && preferY - startPos.y > 20) {
+        log(bot, `Underground (${Math.round(preferY - startPos.y)} blocks below the surface); climbing out first.`);
+        await climbToSurface(bot);
+    }
+    preferY = Math.floor(bot.entity.position.y);
+
+    while (Date.now() < deadline) {
+        if (bot.interrupt_code) return `Travel interrupted. ${travelReport(bot, startPos, dx, dz, distance, dug)}`;
+
+        const pos = bot.entity.position;
+        const covered = Math.abs(dx) * Math.abs(pos.x - startPos.x) + Math.abs(dz) * Math.abs(pos.z - startPos.z);
+        if (covered >= distance - 2) break;
+
+        const before = pos.clone();
+        const wx = Math.floor(pos.x + dx * step);
+        const wz = Math.floor(pos.z + dz * step);
+
+        try {
+            // Use our own navigator (nav.js). mineflayer-pathfinder will not plan a route over
+            // a 1-block step on this server, so it simply refuses to move; ours plans the step
+            // and AutoJump executes it.
+            const nav = await import('./nav.js');
+            // Aim at a COLUMN, not a point: the surface height 48 blocks away is unknown, so a
+            // y-aware goal would never match and the planner would waste its budget. goalXZOnly
+            // plus the wide planRange is what lets it route around a dune instead of mining
+            // through one - tunnelling measured ~12s per block, walking around costs seconds.
+            await nav.navigateTo(bot, new Vec3(wx, Math.floor(pos.y), wz), {
+                arriveDist: 3, maxReplans: 3, goalXZOnly: true, planRange: 96, horizon: 10,
+                preferY,
+            });
+        } catch (err) {
+            // fall through to the obstruction check
+        }
+
+        // Progress must be measured ALONG THE TRAVEL AXIS, not as total distance moved. When
+        // the planner can only find a partial route it often heads the wrong way around an
+        // obstacle; counting that as progress meant the "we are stuck, dig through" fallback
+        // never fired and the bot wandered sideways for a quarter of an hour.
+        const after = bot.entity.position;
+        let moved = (after.x - before.x) * dx + (after.z - before.z) * dz;
+        legs++;
+        if (moved < 1.0) {
+            // The pathfinder refuses to PLAN a route over a 1-block step on this server, so it
+            // just stands still. Walking manually gets the bot moving, and AutoJump (see
+            // auto_jump.js) then carries it over the step - measured: 9.4 blocks covered and a
+            // step cleared where pathfinding moved 0.
+            const beforeWalk = bot.entity.position.clone();
+            await walkForward(bot, dx, dz, 4000);
+            const afterWalk = bot.entity.position;
+            const walkedOver = (afterWalk.x - beforeWalk.x) * dx + (afterWalk.z - beforeWalk.z) * dz;
+            if (walkedOver > 1.0) { stalls = 0; continue; }
+        }
+        if (moved < 1.0) {
+            stalls++;
+            // Look 10 blocks ahead BEFORE touching the terrain. A ridge we can walk around is
+            // far cheaper to walk around than to mine through, and mining a dune drops the sand
+            // above straight onto the bot. Only fall through to digging if the detour fails.
+            const nav = await import('./nav.js');
+
+            // Never tunnel while underground. Mining forward at depth is exactly how the bot
+            // ended up 31 blocks below the surface: once down there, every route the planner
+            // can see is also underground, so it kept boring west in the dark. Climb out and
+            // resume on the surface instead.
+            const hereNow = bot.entity.position;
+            const surfNow = nav.surfaceY(bot, Math.floor(hereNow.x), Math.floor(hereNow.z),
+                                         140, Math.floor(hereNow.y) + 1);
+            // 20, not 8: cutting through a ridge legitimately puts the bot "below the surface"
+            // for a while, and a tighter threshold made this fight the tunnel it needed to dig.
+            if (surfNow !== null && surfNow - hereNow.y > 20) {
+                log(bot, `${Math.round(surfNow - hereNow.y)} blocks below the surface; climbing out rather than tunnelling.`);
+                await climbToSurface(bot);
+                preferY = Math.floor(bot.entity.position.y);
+                stalls = 0;
+                continue;
+            }
+
+            // Standing in water stops this bot dead - it barely moves while swimming, so it
+            // oscillates on the spot instead of crossing. Get onto dry land first; everything
+            // downstream (detour, trench, bridge) assumes the bot can actually walk.
+            if (inWater(bot)) {
+                log(bot, `In water; heading for the nearest bank before continuing.`);
+                if (await escapeWater(bot)) { stalls = 0; continue; }
+            }
+
+            const ahead = nav.scanAhead(bot, dx, dz, 10);
+            if (ahead.kind === 'wall' && stalls <= 2) {
+                const side = (stalls % 2) ? 1 : -1;
+                const here = bot.entity.position.floored();
+                const sx = here.x + (-dz) * side * 10 + dx * 10;
+                const sz = here.z + (dx) * side * 10 + dz * 10;
+                log(bot, `Ridge ${ahead.distance} blocks ahead; trying to walk around it.`);
+                const det = await nav.navigateTo(bot, new Vec3(sx, here.y, sz), {
+                    arriveDist: 3, maxReplans: 2, goalXZOnly: true, planRange: 64,
+                });
+                if (det.covered > 2.0) { continue; }
+            }
+
+            // A cliff is far cheaper to climb than to tunnel through. Boring west through this
+            // sandstone plateau ran at ~1.5 blocks/min; walking over the top runs at ~25. Only
+            // worth it when the top is close enough to stair up to.
+            if (ahead.kind === 'wall') {
+                const here2 = bot.entity.position;
+                const topY = nav.surfaceY(bot, Math.floor(here2.x) + dx * 4,
+                                          Math.floor(here2.z) + dz * 4, 140, Math.floor(here2.y));
+                const rise = topY === null ? null : topY - here2.y;
+                if (rise !== null && rise >= 2 && rise <= 14) {
+                    // Build first, dig second. Placing blocks leaves the terrain intact; cutting
+                    // stairs into the cliff does not. Falls through to digging when there is
+                    // nothing in the inventory to build with.
+                    const built = await climbLedgeByPlacing(bot, dx, dz, rise);
+                    if (built > 0.5) { stalls = 0; continue; }
+
+                    log(bot, `Cliff ahead and nothing to build with; cutting stairs ${Math.round(rise)} blocks up.`);
+                    const gained = await climbToSurface(bot, 40, { preferDir: [dx, dz], targetY: topY });
+                    if (gained > 0.5) { stalls = 0; continue; }
+                }
+            }
+
+            let cleared = await clearWayAhead(bot, dx, dz, stalls > 3);
+            // Water and gaps stop this bot as hard as walls do (it barely moves while
+            // swimming), so lay a walkable surface across them rather than trying to swim.
+            cleared += await bridgeWayAhead(bot, dx, dz);
+            dug += cleared;
+            if (cleared === 0 && stalls > 1 && lastClearHitBuild) {
+                // Something we refuse to mine is in the way - a player build, or a tree we
+                // would rather not fell. Step around it instead of grinding against it.
+                log(bot, `Obstruction ahead I won't mine; stepping around it.`);
+                const side = (stalls % 4 < 2) ? 1 : -1;   // alternate sides if the first fails
+                const here3 = bot.entity.position.floored();
+                // Step sideways AND forward, so going around still makes progress toward the
+                // goal. Uses our navigator: goToGoal here relied on mineflayer-pathfinder,
+                // which cannot move this bot at all.
+                const sx = here3.x + (-dz) * side * 5 + dx * 3;
+                const sz = here3.z + (dx) * side * 5 + dz * 3;
+                try {
+                    await nav.navigateTo(bot, new Vec3(sx, here3.y, sz), {
+                        arriveDist: 2, maxReplans: 2, goalXZOnly: true, planRange: 48,
+                    });
+                } catch (err) { /* try the other side next time */ }
+            } else if (cleared === 0 && stalls > 3) {
+                // Nothing to mine and still not moving - sidestep to break the deadlock.
+                await moveAway(bot, 4);
+                stalls = 0;
+            }
+        } else {
+            stalls = 0;
+        }
+    }
+    return travelReport(bot, startPos, dx, dz, distance, dug);
+}
+
+function travelReport(bot, startPos, dx, dz, distance, dug) {
+    const p = bot.entity.position;
+    const covered = Math.abs(dx) * Math.abs(p.x - startPos.x) + Math.abs(dz) * Math.abs(p.z - startPos.z);
+    const pct = Math.round((covered / distance) * 1000) / 10;
+    return `VERIFIED TRAVEL: moved ${covered.toFixed(0)}/${distance} blocks (${pct}%). `
+        + `Now at (${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}). Mined ${dug} block(s) to get through.`
+        + (covered >= distance - 2 ? ' Arrived.' : ' NOT finished - run the same command again to continue.');
+}
+
+/**
+ * Mine whatever is directly ahead at head and feet height so the bot can walk on.
+ * Only removes what actually blocks the path, and refuses to touch player-made blocks.
+ * @returns {Promise<number>} how many blocks were removed.
+ */
+async function clearWayAhead(bot, dx, dz, allowTrees = false) {
+    const p = bot.entity.position.floored();
+    let removed = 0;
+    let blockedByBuild = false;
+    // Cut an OPEN TRENCH, not a tunnel. Deserts are sand and gravel - gravity blocks - so
+    // boring a 2-high hole through a dune drops everything above straight onto the bot and
+    // buries it (observed: 32 minutes entombed at y=55 with sand on every side). Clearing
+    // well above head height lets the column collapse once and then stay clear.
+    const heights = [0, 1, 2, 3, 4];
+    for (const ahead of [1, 2]) {
+        for (const dy of heights) {
+            const target = new Vec3(p.x + dx * ahead, p.y + dy, p.z + dz * ahead);
+            const block = bot.blockAt(target);
+            if (!block || block.name === 'air' || block.name === 'water') continue;
+            if (isPlayerMade(block.name)) {
+                log(bot, `Not mining ${block.name} at ${target} (looks player-made).`);
+                blockedByBuild = true;
+                continue;
+            }
+            // Walk around trees, do not fell them. A trunk is 1-2 blocks wide, so stepping
+            // round it is trivial, whereas chopping is slower and destroys the landscape the
+            // bot is only passing through. `allowTrees` releases this once we are properly
+            // stuck, so a bot boxed in by a jungle cannot deadlock.
+            if (!allowTrees && isTreeTrunk(block.name)) {
+                blockedByBuild = true;
+                continue;
+            }
+            try {
+                if (await breakBlockAt(bot, target.x, target.y, target.z)) removed++;
+            } catch (err) { /* keep going; the next leg will retry */ }
+        }
+    }
+    if (removed) {
+        log(bot, `Cleared ${removed} block(s) blocking the way.`);
+        // Let gravity blocks finish falling before we try to walk through.
+        await new Promise(r => setTimeout(r, 700));
+    }
+    lastClearHitBuild = blockedByBuild && removed === 0;
+    return removed;
+}
+
+/**
+ * Put a walkable surface across water or a gap directly ahead.
+ * @returns {Promise<number>} blocks placed.
+ */
+async function bridgeWayAhead(bot, dx, dz) {
+    const p = bot.entity.position.floored();
+    const material = pickBuildMaterial(bot);
+    let placed = 0;
+    // Start 2 blocks out, never 1. placeBlock treats a target within 1.1 blocks as "too close"
+    // and tries to walk AWAY first; that reposition pathfind repeatedly burned its full 12s
+    // timeout, so bridging a block at the bot's feet cost ~12s per attempt and stalled travel.
+    for (const ahead of [2, 3]) {
+        const footing = new Vec3(p.x + dx * ahead, p.y - 1, p.z + dz * ahead);
+        const stand = new Vec3(p.x + dx * ahead, p.y, p.z + dz * ahead);
+        const below = bot.blockAt(footing);
+        const at = bot.blockAt(stand);
+        const needsFooting = below && (below.name === 'air' || below.name.includes('water'));
+        const standBlocked = at && at.name.includes('water');
+        if (!needsFooting && !standBlocked) continue;
+        try {
+            if (standBlocked) await breakBlockAt(bot, stand.x, stand.y, stand.z);
+            if (needsFooting && await placeBlock(bot, material, footing.x, footing.y, footing.z, 'top')) placed++;
+        } catch (err) { /* next leg retries */ }
+    }
+    if (placed) log(bot, `Bridged ${placed} block(s) across water/gap.`);
+    return placed;
+}
+
+/** Pick something sensible to bridge with from inventory, else a common block. */
+function pickBuildMaterial(bot) {
+    const preferred = ['dirt', 'cobblestone', 'sandstone', 'sand', 'stone', 'netherrack', 'andesite'];
+    const counts = world.getInventoryCounts(bot);
+    for (const name of preferred) {
+        if (counts[name] > 0) return name;
+    }
+    return 'sandstone'; // creative mode fills the hotbar on demand
+}
+
+/** Set when the last clear attempt was stopped solely by player-made blocks. */
+let lastClearHitBuild = false;
+
+/**
+ * Decide whether a block looks player-placed and should be left alone while travelling.
+ *
+ * Matching is by exact name or block family, deliberately NOT by substring. A substring test
+ * on "brick" also matches stone_bricks / mud_bricks / brick_stairs, which occur in ordinary
+ * terrain and structures - that made the bot refuse to clear its own path and strand itself
+ * (observed: 97 minutes stalled against a stone_bricks wall it was forbidden to mine).
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isPlayerMade(name) {
+    const exact = new Set([
+        'chest', 'trapped_chest', 'ender_chest', 'barrel', 'furnace', 'blast_furnace', 'smoker',
+        'crafting_table', 'anvil', 'chipped_anvil', 'damaged_anvil', 'beacon', 'conduit',
+        'enchanting_table', 'brewing_stand', 'cauldron', 'lodestone', 'respawn_anchor',
+        'jukebox', 'note_block', 'bookshelf', 'lectern', 'composter', 'loom', 'grindstone',
+        'smithing_table', 'cartography_table', 'fletching_table', 'stonecutter', 'bell',
+        'hopper', 'dispenser', 'dropper', 'observer', 'piston', 'sticky_piston', 'tnt',
+        'torch', 'wall_torch', 'soul_torch', 'lantern', 'soul_lantern', 'campfire', 'ladder',
+        'scaffolding', 'item_frame', 'painting', 'flower_pot', 'armor_stand',
+    ]);
+    if (exact.has(name)) return true;
+    // Whole families that only exist because somebody placed them.
+    const families = ['_bed', '_door', '_trapdoor', '_sign', '_banner', '_shulker_box',
+        '_glazed_terracotta', '_wool', '_carpet', '_concrete', '_glass_pane', '_candle'];
+    if (families.some(suffix => name.endsWith(suffix))) return true;
+    // Bare glass and planks are strong build signals; stone/mud bricks are not.
+    if (name === 'glass' || name.endsWith('_planks')) return true;
+    return false;
+}
+
+/**
+ * Walk forward under raw control for a while, letting AutoJump handle 1-block steps.
+ * Used when the pathfinder declines to plan a route (it will not path over a step on this
+ * server), which otherwise leaves the bot standing still indefinitely.
+ * @returns {Promise<number>} blocks actually covered.
+ */
+/**
+ * Get out of water by heading for the closest dry bank.
+ *
+ * Pillaring does not work here - the bot floats in the water cell, so there is nowhere to place
+ * a block under itself. And steering at the distant travel goal just pushes it further into the
+ * river, where it barely moves at all. Aim at the nearest bank instead.
+ * @returns {Promise<boolean>} true if the bot is out of the water.
+ */
+export async function escapeWater(bot, tries = 8) {
+    const nav = await import('./nav.js');
+    for (let i = 0; i < tries && inWater(bot); i++) {
+        if (bot.interrupt_code) break;
+        const land = nav.nearestDryLand(bot, 8);
+        if (!land) break;
+        const p = bot.entity.position;
+        await hopForward(bot, land.x - p.x, land.z - p.z, 1500);
+    }
+    const out = !inWater(bot);
+    log(bot, out ? `Out of the water at y=${bot.entity.position.y.toFixed(0)}.` : `Still in water.`);
+    return out;
+}
+
+/** Is the bot's body in water? */
+function inWater(bot) {
+    const p = bot.entity.position.floored();
+    for (const dy of [0, 1]) {
+        const b = bot.blockAt(p.offset(0, dy, 0));
+        if (b && b.name.includes('water')) return true;
+    }
+    return false;
+}
+
+// Blocks worth spending to build with, cheapest-to-lose first. Deliberately excludes anything
+// with value or gravity: sand would fall out from under the bot as it climbed.
+const STACKABLE = [
+    'dirt', 'cobblestone', 'stone', 'netherrack', 'red_terracotta', 'terracotta',
+    'sandstone', 'andesite', 'diorite', 'granite', 'deepslate', 'tuff', 'cut_sandstone',
+];
+
+/** Is there anything in the inventory we can build a climb out of? */
+export function hasBuildingBlocks(bot) {
+    return STACKABLE.some(n => bot.inventory.items().some(it => it.name === n));
+}
+
+/**
+ * Climb a ledge the bot cannot jump, by PLACING blocks rather than mining.
+ *
+ * AutoJump clears exactly one block (`maxRise: 1`), so anything taller stops travel dead. The
+ * alternative already in the code was to cut stairs *into* the cliff, which works but chews up
+ * the landscape. Pillaring up and stepping across leaves the terrain intact.
+ *
+ * Pillar-then-step, not a forward ramp: the cell ahead at foot height IS the cliff face, so
+ * there is nowhere in front to place a tread. The block has to go underneath the bot.
+ *
+ * @returns {Promise<number>} height actually gained.
+ */
+export async function climbLedgeByPlacing(bot, dx, dz, rise) {
+    const startY = bot.entity.position.y;
+    if (!hasBuildingBlocks(bot)) return 0;
+
+    // Pillar in rounds rather than one shot: a single pass regularly gained less than asked
+    // (jump height is inconsistent on this server), which left the bot stranded partway up a
+    // wall it then could not step over.
+    const want = Math.ceil(rise);
+    for (let round = 0; round < 4; round++) {
+        if (bot.entity.position.y - startY >= want - 0.1) break;
+        const before = bot.entity.position.y;
+        await pillarUp(bot, want - Math.round(bot.entity.position.y - startY));
+        if (bot.entity.position.y - before < 0.5) break;   // made no headway this round
+    }
+
+    const lifted = bot.entity.position.y - startY;
+    if (lifted < 0.5) return 0;
+
+    // Now level with the top, step across onto it. Without this the bot is stranded on its
+    // own tower and the next replan just walks it back off.
+    await hopForward(bot, dx, dz, 1800);
+
+    const gained = bot.entity.position.y - startY;
+    if (gained >= 0.5) log(bot, `Placed blocks to climb ${gained.toFixed(0)} blocks up (no digging).`);
+    return gained;
+}
+
+/**
+ * Classic pillar jump: jump, and place a block underneath at the apex so the bot lands one
+ * block higher. This is the only way up out of an open excavated chamber, where there is no
+ * wall to cut a staircase into.
+ * @returns {Promise<number>} height actually gained.
+ */
+async function pillarUp(bot, blocks = 1) {
+    const { Vec3 } = await import('vec3');
+    const stackable = STACKABLE;
+    const startY = bot.entity.position.y;
+
+    for (let i = 0; i < blocks; i++) {
+        if (bot.interrupt_code) break;
+        const mat = stackable.map(n => bot.inventory.items().find(it => it.name === n)).find(Boolean);
+        if (!mat) break;
+        try { await bot.equip(mat, 'hand'); } catch (err) { break; }
+
+        const below = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+        if (!below || below.boundingBox !== 'block') break;
+
+        // Wait for actual clearance instead of guessing a delay. A fixed sleep placed the block
+        // while the bot was still inside the target cell, which silently fails - measured as
+        // "climbed 0 blocks" against a wall it should have cleared. Jump height also varies
+        // here because the physics is running on stale collision data.
+        const baseY = bot.entity.position.y;
+        bot.setControlState('forward', false);   // drifting off the pillar loses the gain
+        try {
+            await bot.look(bot.entity.yaw, Math.PI / 2, true);   // face straight down
+            bot.setControlState('jump', true);
+            const deadline = Date.now() + 900;
+            while (Date.now() < deadline) {
+                await new Promise(r => setTimeout(r, 40));
+                if (bot.entity.position.y - baseY < 0.5) continue;
+                try { await bot.placeBlock(below, new Vec3(0, 1, 0)); } catch (err) { /* retry next block */ }
+                break;
+            }
+        } catch (err) {
+            // look/jump failed; the next iteration retries
+        } finally {
+            bot.setControlState('jump', false);
+        }
+        await new Promise(r => setTimeout(r, 400));
+        if (bot.entity.position.y - baseY < 0.5) break;   // not rising: out of room or blocked
+    }
+    return bot.entity.position.y - startY;
+}
+
+/**
+ * Walk forward while pulsing jump, and report the HEIGHT gained.
+ *
+ * walkForward relies on AutoJump to clear a step, but AutoJump gates on `onGround`, which this
+ * server reports as false for seconds at a time while the bot is provably standing. Driving the
+ * jump directly is the only thing that reliably lifts the bot onto a stair tread here.
+ */
+async function hopForward(bot, dx, dz, ms = 1600) {
+    const { Vec3 } = await import('vec3');
+    const start = bot.entity.position.clone();
+    try {
+        bot.pathfinder.setGoal(null);
+        bot.pathfinder.stop();
+    } catch (err) { /* plugin may be absent */ }
+    await bot.lookAt(new Vec3(start.x + dx * 6, start.y, start.z + dz * 6), true);
+    bot.setControlState('forward', true);
+    const end = Date.now() + ms;
+    try {
+        while (Date.now() < end && !bot.interrupt_code) {
+            bot.setControlState('jump', true);
+            await new Promise(r => setTimeout(r, 200));
+            bot.setControlState('jump', false);
+            await new Promise(r => setTimeout(r, 200));
+        }
+    } finally {
+        bot.setControlState('forward', false);
+        bot.setControlState('jump', false);
+    }
+    await new Promise(r => setTimeout(r, 250));
+    return bot.entity.position.y - start.y;
+}
+
+async function walkForward(bot, dx, dz, ms = 4000) {
+    const { Vec3 } = await import('vec3');
+    const start = bot.entity.position.clone();
+    try {
+        bot.pathfinder.setGoal(null);
+        bot.pathfinder.stop();
+        const look = start.offset(dx * 6, 0, dz * 6);
+        await bot.lookAt(new Vec3(look.x, start.y, look.z), true);
+        bot.setControlState('forward', true);
+        await new Promise(r => setTimeout(r, ms));
+    } catch (err) {
+        // fall through and clean up
+    } finally {
+        bot.setControlState('forward', false);
+    }
+    await new Promise(r => setTimeout(r, 300));
+    return bot.entity.position.distanceTo(start);
+}

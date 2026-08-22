@@ -1,99 +1,110 @@
-import { Viewer } from 'prismarine-viewer/viewer/lib/viewer.js';
-import { WorldView } from 'prismarine-viewer/viewer/lib/worldView.js';
-import { getBufferFromStream } from 'prismarine-viewer/viewer/lib/simpleUtils.js';
-
-import THREE from 'three';
+import puppeteer from 'puppeteer';
 import fs from 'fs/promises';
-import { Vec3 } from 'vec3';
 import { EventEmitter } from 'events';
-import { createRequire } from 'module';
 
-const require = createRequire(import.meta.url);
-let createCanvas;
-try {
-    const canvasModule = require('node-canvas-webgl/lib/index.js');
-    createCanvas = canvasModule.createCanvas;
-} catch (e) {
-    console.warn('Failed to load node-canvas-webgl:', e.message);
-}
-
-import worker_threads from 'worker_threads';
-global.Worker = worker_threads.Worker;
-
+const BLANK = 'about:blank';
+// How long to keep the viewer loaded after a capture, in case more follow.
+const KEEP_WARM_MS = 30000;
+// Time for the viewer's socket.io connection to pull chunks before the first shot.
+const WARMUP_MS = 2500;
 
 export class Camera extends EventEmitter {
-    constructor (bot, fp) {
+    constructor (bot, fp, port = 3000) {
         super();
         this.bot = bot;
         this.fp = fp;
-        this.viewDistance = 12;
+        this.port = port;
         this.width = 800;
         this.height = 512;
-        try {
-            this.canvas = createCanvas(this.width, this.height);
-            this.renderer = new THREE.WebGLRenderer({ canvas: this.canvas });
-            this.viewer = new Viewer(this.renderer);
-            this._init().then(() => {
-                this.emit('ready');
-            }).catch((err) => {
-                console.warn('Camera initialization failed:', err.message);
-                this.emit('error', err);
-            });
-        } catch (err) {
-            console.warn('WebGL not available in this environment. Camera disabled.');
-            this.disabled = true;
+        this.disabled = false;
+        this.loaded = false;      // is the viewer page currently rendering?
+        this._idleTimer = null;
+        this._launch().then(() => {
             this.emit('ready');
-        }
-    }
-  
-    async _init () {
-        const botPos = this.bot.entity.position;
-        const center = new Vec3(botPos.x, botPos.y+this.bot.entity.height, botPos.z);
-        this.viewer.setVersion(this.bot.version);
-        // Load world
-        const worldView = new WorldView(this.bot.world, this.viewDistance, center);
-        this.viewer.listen(worldView);
-        worldView.listenToBot(this.bot);
-        await worldView.init(center);
-        this.worldView = worldView;
-    }
-  
-    async capture() {
-        if (this.disabled) {
-            throw new Error('Camera is disabled - WebGL not available in headless environment');
-        }
-        const center = new Vec3(this.bot.entity.position.x, this.bot.entity.position.y+this.bot.entity.height, this.bot.entity.position.z);
-        this.viewer.camera.position.set(center.x, center.y, center.z);
-        await this.worldView.updatePosition(center);
-        this.viewer.setFirstPersonCamera(this.bot.entity.position, this.bot.entity.yaw, this.bot.entity.pitch);
-        this.viewer.update();
-        this.renderer.render(this.viewer.scene, this.viewer.camera);
-
-        const imageStream = this.canvas.createJPEGStream({
-            bufsize: 4096,
-            quality: 100,
-            progressive: false
+        }).catch((err) => {
+            console.warn('Camera initialization failed:', err.message);
+            this.disabled = true;
+            this.emit('error', err);
         });
-        
+    }
+
+    async _launch () {
+        this.browser = await puppeteer.launch({
+            headless: true,
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        });
+        this.page = await this.browser.newPage();
+        await this.page.setViewport({ width: this.width, height: this.height });
+        // Deliberately do NOT load the viewer here. Headless Chromium has no GPU, so WebGL
+        // runs through SwiftShader on the CPU; leaving the prismarine-viewer scene loaded
+        // keeps a three.js render loop software-rasterising a 3D world forever. Measured at
+        // ~670% CPU (about 6.7 cores) sustained, for screenshots taken minutes apart.
+        await this.page.goto(BLANK);
+    }
+
+    /** Bring the viewer up only when we actually need pixels. */
+    async _ensureLoaded () {
+        if (this.loaded) return;
+        await this.page.goto(`http://localhost:${this.port}`, { waitUntil: 'load', timeout: 15000 });
+        await new Promise((resolve) => setTimeout(resolve, WARMUP_MS));
+        this.loaded = true;
+    }
+
+    /** Drop back to a blank page so nothing renders while idle. */
+    async _unload () {
+        if (!this.loaded) return;
+        this.loaded = false;
+        try {
+            await this.page.goto(BLANK);
+        } catch (err) {
+            console.warn('Camera unload failed:', err.message);
+        }
+    }
+
+    _scheduleUnload () {
+        if (this._idleTimer) clearTimeout(this._idleTimer);
+        this._idleTimer = setTimeout(() => {
+            this._idleTimer = null;
+            this._unload();
+        }, KEEP_WARM_MS);
+        if (this._idleTimer.unref) this._idleTimer.unref();
+    }
+
+    async capture () {
+        if (this.disabled) {
+            throw new Error('Camera is disabled - headless browser not available');
+        }
+        if (this._idleTimer) { clearTimeout(this._idleTimer); this._idleTimer = null; }
+
+        await this._ensureLoaded();
+        // let the viewer catch up to the bot's latest position/orientation
+        await new Promise((resolve) => setTimeout(resolve, 300));
+
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const filename = `screenshot_${timestamp}`;
 
-        const buf = await getBufferFromStream(imageStream);
         await this._ensureScreenshotDirectory();
+        const buf = await this.page.screenshot({ type: 'jpeg', quality: 90 });
         await fs.writeFile(`${this.fp}/${filename}.jpg`, buf);
         console.log('saved', filename);
+
+        this._scheduleUnload();
         return filename;
     }
 
-    async _ensureScreenshotDirectory() {
-        let stats;
+    async close () {
+        if (this._idleTimer) { clearTimeout(this._idleTimer); this._idleTimer = null; }
+        if (this.browser) {
+            try { await this.browser.close(); } catch { /* already gone */ }
+            this.browser = null;
+        }
+    }
+
+    async _ensureScreenshotDirectory () {
         try {
-            stats = await fs.stat(this.fp);
+            await fs.access(this.fp);
         } catch (e) {
-            if (!stats?.isDirectory()) {
-                await fs.mkdir(this.fp);
-            }
+            await fs.mkdir(this.fp, { recursive: true });
         }
     }
 }
-  

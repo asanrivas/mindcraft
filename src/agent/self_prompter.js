@@ -63,8 +63,16 @@ export class SelfPrompter {
         let no_command_count = 0;
         const MAX_NO_COMMAND = 3;
         while (!this.interrupt) {
+            // Wait for any in-flight action to finish before prompting again. Long actions
+            // (e.g. !fill on a large area) would otherwise be interrupted and restarted from
+            // scratch by the next self-prompt, livelocking the goal so it never completes.
+            while (!this.interrupt && !this.agent.isIdle()) {
+                await new Promise(r => setTimeout(r, 500));
+            }
+            if (this.interrupt) break;
+
             const msg = `You are self-prompting with the goal: '${this.prompt}'. Your next response MUST contain a command with this syntax: !commandName. Respond:`;
-            
+
             let used_command = await this.agent.handleMessage('system', msg, -1);
             if (!used_command) {
                 no_command_count++;

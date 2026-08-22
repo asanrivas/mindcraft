@@ -41,6 +41,17 @@ export class IdleBehavior {
 
         this.idleTime += delta;
 
+        // Distill queued conversation into memory while nothing else is happening. This is an
+        // extra LLM call, so doing it here keeps it off the reply path where it would add
+        // latency to every 30th message.
+        if (this.idleTime >= 5000 && this.agent.history.pending_summary?.length > 0) {
+            const did = await this.agent.history.consolidatePending();
+            if (did) {
+                console.log('[IdleBehavior] Consolidated pending memory while idle.');
+                return; // give the bot a tick before considering a scan
+            }
+        }
+
         // Check if we should scan
         const now = Date.now();
         const timeSinceLastScan = now - this.lastScanTime;

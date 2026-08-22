@@ -414,6 +414,31 @@ in-flight leg - which reads as "the bot is stuck" when it is not. Also avoid lar
 `!serverFill` operations near the bot: those repeatedly dropped it into pits, buried it in
 sand, and opened a cave under it.
 
+## World-edit guards (do not route around these)
+
+`!serverFill` / `!serverSetblock` refuse edits that would:
+- **destroy an irreplaceable block** - beds, chests, furnaces, spawners, doors, signs... (`world_guard.js` `PROTECTED_*`)
+- **entomb the bot** - a solid fill over the cells its own body occupies
+- **overwrite its respawn point**
+
+Escape hatches exist and are separately named: `!forceFill`, `!forceSetblock`. They report what
+the guard would have said, so an override is never silent.
+
+**Why this exists.** One night, two unguarded edits cost everything:
+
+```
+11:40:25  !serverSetblock("snow_block", -2572, 63, 5269)   <- its own bed, "making a path to the bed"
+11:44:51  !serverFill snow_block -2573 63 5268 -> -2571 65 5270   <- solid, over itself
+```
+
+Losing the bed silently moved the respawn to world spawn. The next death teleported the bot
+**7000 blocks away** at night, where it died again and lost its inventory. A model cannot see
+that the cell it is overwriting holds the thing its life depends on - **so the edit has to
+notice, not the prompt.**
+
+`bot.spawnPoint` is `(0,0,0)` until a `spawn_position` packet arrives; the guard treats that
+placeholder as "unknown" rather than refusing every edit near world origin.
+
 ## Modes System
 
 `modes.js`: drowning (air), self_preservation (health/hunger), unstuck (pathfinding), cowardice,

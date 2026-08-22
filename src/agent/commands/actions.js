@@ -1,6 +1,7 @@
 import * as skills from '../library/skills.js';
 import * as swim from '../library/swim.js';
 import { measureSwim, formatProbe } from '../library/swim_probe.js';
+import * as worldGuard from '../library/world_guard.js';
 import { Vec3 } from 'vec3';
 import fs from 'fs';
 import settings from '../settings.js';
@@ -756,6 +757,16 @@ export const actionsList = [
             const validModes = ['replace', 'hollow', 'outline', 'destroy', 'keep'];
             if (!validModes.includes(mode)) mode = 'replace';
 
+            // Refuse edits that destroy something irreplaceable or bury the bot. A model cannot
+            // see that the cell it is about to overwrite holds its own bed; the edit itself has
+            // to notice. See world_guard.js for the night this cost.
+            const guard = worldGuard.checkEditForBot(agent.bot,
+                { x: x1, y: y1, z: z1 }, { x: x2, y: y2, z: z2 },
+                mode === 'hollow' ? 'air' : blockType);
+            if (!guard.ok) {
+                return `REFUSED: ${guard.reason} Move it, or use !forceFill if you really mean it.`;
+            }
+
             const command = `/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} ${mode}`;
             agent.bot.chat(command);
 
@@ -918,6 +929,43 @@ export const actionsList = [
         }
     },
     {
+        // The escape hatches. A guard with no override becomes an obstacle people route around
+        // by other means; an explicit, separately-named command keeps the refusal meaningful
+        // while leaving the operator (and a model that has been told why) a way through.
+        name: '!forceFill',
+        description: 'Like !serverFill but ignores the protection guard. Only for edits you have checked yourself.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x1': { type: 'int', description: 'X of first corner.' },
+            'y1': { type: 'int', description: 'Y of first corner.' },
+            'z1': { type: 'int', description: 'Z of first corner.' },
+            'x2': { type: 'int', description: 'X of second corner.' },
+            'y2': { type: 'int', description: 'Y of second corner.' },
+            'z2': { type: 'int', description: 'Z of second corner.' }
+        },
+        perform: async (agent, blockType, x1, y1, z1, x2, y2, z2) => {
+            const g = worldGuard.checkEditForBot(agent.bot, { x: x1, y: y1, z: z1 }, { x: x2, y: y2, z: z2 }, blockType);
+            agent.bot.chat(`/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} replace`);
+            await new Promise(r => setTimeout(r, 600));
+            return `FORCED FILL done${g.ok ? '' : ` (guard had warned: ${g.reason})`}`;
+        }
+    },
+    {
+        name: '!forceSetblock',
+        description: 'Like !serverSetblock but ignores the protection guard.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x': { type: 'int', description: 'X coordinate.' },
+            'y': { type: 'int', description: 'Y coordinate.' },
+            'z': { type: 'int', description: 'Z coordinate.' }
+        },
+        perform: async (agent, blockType, x, y, z) => {
+            const g = worldGuard.checkEditForBot(agent.bot, { x, y, z }, { x, y, z }, blockType);
+            agent.bot.chat(`/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}`);
+            return `FORCED setblock ${blockType} at (${x}, ${y}, ${z})${g.ok ? '' : ` (guard had warned: ${g.reason})`}`;
+        }
+    },
+    {
         name: '!serverSetblock',
         description: 'INSTANT setblock using server /setblock command. Places a single block immediately.',
         params: {
@@ -932,6 +980,10 @@ export const actionsList = [
             'state': { type: 'string', description: 'Optional block state, e.g. "facing=east,part=foot". Use "none" for no state.' }
         },
         perform: async (agent, blockType, x, y, z, state) => {
+            // Same guard as !serverFill, and this is the command that actually did the damage:
+            // a single setblock landed on the bot's own bed.
+            const g = worldGuard.checkEditForBot(agent.bot, { x, y, z }, { x, y, z }, blockType);
+            if (!g.ok) return `REFUSED: ${g.reason} Use !forceSetblock if you really mean it.`;
             const clean = String(state ?? '').trim().replace(/^\[|\]$/g, '');
             const suffix = (!clean || clean.toLowerCase() === 'none') ? '' : `[${clean}]`;
             const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}${suffix}`;

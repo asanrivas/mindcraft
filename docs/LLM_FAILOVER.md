@@ -37,10 +37,21 @@ throw; `FallbackModel` classifies the error, routes, and guarantees the caller's
 - **`sendRequest` always resolves to a string, never rejects.** `promptCoding` and
   `promptMemSaving` in `prompter.js` have **no try/catch**, so a rejection there propagates into
   the agent loop.
-- **A plain circuit breaker.** An *availability* error (ECONNREFUSED, timeout, 5xx, socket
-  hangup) opens it, so the next 60 s of turns skip the dead primary instead of paying a connect
-  timeout every turn. After the cooldown the primary is tried first again — recovery is
-  automatic.
+- **A circuit breaker with exponential backoff.** An *availability* error (ECONNREFUSED,
+  timeout, 5xx, socket hangup) opens it, and the window doubles with each consecutive failure:
+  60s → 120s → 240s → 480s → capped at 15 min.
+
+  This is a response to measurement, not premature generality. The first version used a flat
+  60 s cooldown, and a real **16-hour outage produced 178 trips and ZERO recoveries** — roughly
+  950 re-dials of a dead socket, every one on the critical path of a user's turn. The same
+  outage under backoff costs fewer than 80 attempts.
+- **A background health probe takes recovery off the critical path.** While the breaker is
+  open, `LlamaCpp.healthCheck()` does a bare `GET /v1/models` (2.5 s timeout, no generation)
+  every 30 s; a success closes the breaker immediately. Previously the bot only learned the
+  server was back when a real request happened to be routed at it after a cooldown, so the
+  first turn after every recovery paid a full connect attempt. Verified live:
+  `[fallback] primary chat model recovered after 5.5 min and 1 failed attempt(s).` — with no
+  user request involved. Providers without a `healthCheck()` simply skip the probe.
 - **Other errors fail over but do not open the breaker.** A 400 or an empty completion means the
   server is still reachable, so keep using it.
 - **Last resort.** If every backup fails, the primary gets one more attempt before giving up.
@@ -63,8 +74,11 @@ tunnel hangs the request forever and the backup is never reached.
 `!stats` grows a line **only while failed over**, so the normal prompt costs nothing:
 
 ```
-- Brain: BACKUP (deepseek-v4-flash-0731) - the local model is unreachable
+- Brain: BACKUP (deepseek-v4-flash-0731) - local model unreachable for 5 min, 1 failed attempt(s), next retry in 0s
 ```
+
+The duration and retry cadence matter: without them a multi-hour outage reads as "the bot is
+being weird today" rather than as an outage.
 
 Without it, the only symptom of an outage is that Andy suddenly writes differently.
 

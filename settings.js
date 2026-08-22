@@ -12,6 +12,7 @@ const settings = {
     base_profile: "assistant", // survival, assistant, creative, or god_mode
     profiles: [
         "./andy.json",
+        "./bob.json", // builder/redstone test-subject bot
         // "./rosetta.json", // Letta-powered agent with persistent memory (requires ~/letta running)
         // "./profiles/andy-4-reasoning.json",
         // "./profiles/claude.json",

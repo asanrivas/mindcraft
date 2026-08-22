@@ -70,8 +70,13 @@ export const queryList = [
 
             // Only shown while failed over, so the normal prompt costs nothing. Without it the
             // only symptom of the local server being down is that Andy suddenly writes differently.
-            if (agent.prompter?.chat_model?.on_backup)
-                res += `\n- Brain: BACKUP (${agent.prompter.chat_model.model_name}) - the local model is unreachable`;
+            if (agent.prompter?.chat_model?.on_backup) {
+                const st = agent.prompter.chat_model.status;
+                res += `\n- Brain: BACKUP (${agent.prompter.chat_model.model_name}) - local model unreachable`;
+                // Duration and retry cadence, so a multi-hour outage reads as an outage rather
+                // than as "the bot is being weird today".
+                if (st) res += ` for ${st.downMinutes.toFixed(0)} min, ${st.failures} failed attempt(s), next retry in ${st.retryInSec}s`;
+            }
 
 
             let players = world.getNearbyPlayerNames(bot);

@@ -2,6 +2,7 @@ import * as skills from "./library/skills.js";
 import { isFallingBlockName } from "./library/tools.js";
 import * as swim from "./library/swim.js";
 import * as night from "./library/night.js";
+import * as nav from "./library/nav.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
 import settings from "./settings.js";
@@ -369,6 +370,16 @@ const modes_list = [
 
             // Water belongs to the drowning mode; never contest the jump key with SwimAssist.
             if (swim.inWater(bot)) return;
+
+            // Already underground = already sheltered. Observed live: the mode fired while the
+            // bot was mining at y=25, dug a hole in the floor and sealed itself in at y=9 -
+            // 50 blocks of stone overhead was strictly better cover than anything it built,
+            // and it abandoned the job it was sent to do. Mobs underground are a self_defense
+            // problem, not a nightfall one.
+            const surf = nav.surfaceY(bot, Math.floor(bot.entity.position.x),
+                                      Math.floor(bot.entity.position.z), 140,
+                                      Math.floor(bot.entity.position.y));
+            if (surf !== null && surf - bot.entity.position.y > 8) return;
 
             // Stand off while something is trying to kill us: self_defense owns that tick. The
             // cooldown below means we retry after the fight instead of fighting IT for control.

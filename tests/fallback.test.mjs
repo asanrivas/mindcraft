@@ -8,7 +8,7 @@
  *   2. A primary that fails at the socket is skipped for `cooldown_ms` instead of being
  *      re-dialled every turn, and is re-tried once the cooldown expires.
  */
-import { FallbackModel, isAvailabilityError } from '../src/models/fallback.js';
+import { FallbackModel, isAvailabilityError, backoffFor } from '../src/models/fallback.js';
 
 let failures = 0;
 const check = (name, cond) => {
@@ -110,6 +110,73 @@ check('null is NOT availability', !isAvailabilityError(null));
     const fb = new FallbackModel(primary, [b1, b2]);
     check('tries backups in order', await fb.sendRequest([], '') === 'from cloud2');
     check('first backup was attempted', b1.calls === 1);
+}
+
+// --- exponential backoff ------------------------------------------------------------------------
+// Measured motivation: a 16-hour outage on a flat 60s cooldown produced 178 trips and ZERO
+// recoveries - ~950 re-dials of a dead socket, each on the critical path of a user turn.
+check('backoff f=1 is the base', backoffFor(1, 60000, 900000) === 60000);
+check('backoff doubles', backoffFor(2, 60000, 900000) === 120000);
+check('backoff f=4', backoffFor(4, 60000, 900000) === 480000);
+check('backoff clamps at max', backoffFor(9, 60000, 900000) === 900000);
+check('backoff f=0 is zero', backoffFor(0, 60000, 900000) === 0);
+// 16 hours of retries: flat-60s would be ~960 attempts, backoff is under 80.
+{
+    let t = 0, attempts = 0;
+    while (t < 16 * 3600 * 1000) { attempts++; t += backoffFor(attempts, 60000, 900000); }
+    check('16h outage costs <80 attempts, not ~960', attempts < 80);
+}
+
+{
+    // The breaker widens its window with each consecutive failure...
+    const primary = fake('local', connErr());
+    const backup = fake('cloud', 'from cloud');
+    const fb = new FallbackModel(primary, [backup], { cooldown_ms: 1000, max_cooldown_ms: 8000 });
+    await fb.sendRequest([], '');
+    check('first failure counted', fb.consecutiveFailures === 1);
+    const firstWindow = fb.down_until - Date.now();
+    fb.down_until = 0;                      // expire it so the next call retries the primary
+    await fb.sendRequest([], '');
+    check('second failure counted', fb.consecutiveFailures === 2);
+    check('window grew', (fb.down_until - Date.now()) > firstWindow);
+    check('outage start recorded', fb.downSince !== null);
+    check('status reports it open', fb.status.open === true);
+    fb.stop();
+}
+{
+    // ...and forgets the whole outage on recovery.
+    const primary = fake('local', n => (n === 1 ? connErr() : 'from local'));
+    const fb = new FallbackModel(primary, [fake('cloud', 'from cloud')], { cooldown_ms: 0 });
+    await fb.sendRequest([], '');
+    check('failures counted before recovery', fb.consecutiveFailures === 1);
+    await fb.sendRequest([], '');
+    check('failures reset on recovery', fb.consecutiveFailures === 0);
+    check('downSince cleared', fb.downSince === null);
+    check('breaker closed', fb.status.open === false);
+    fb.stop();
+}
+{
+    // A background health probe closes the breaker with NO user request at all - recovery
+    // should never cost somebody a turn.
+    let healthy = false;
+    const primary = fake('local', connErr());
+    primary.healthCheck = async () => healthy;
+    const fb = new FallbackModel(primary, [fake('cloud', 'from cloud')],
+                                 { cooldown_ms: 60000, probe_ms: 20 });
+    await fb.sendRequest([], '');
+    check('probe: breaker open', fb.status.open === true);
+    healthy = true;
+    await new Promise(r => setTimeout(r, 120));
+    check('probe closed the breaker unaided', fb.status.open === false);
+    check('probe reset the failure count', fb.consecutiveFailures === 0);
+    fb.stop();
+}
+{
+    // A provider with no healthCheck must still work - no timer, no crash.
+    const fb = new FallbackModel(fake('local', connErr()), [fake('cloud', 'ok')], { cooldown_ms: 50 });
+    await fb.sendRequest([], '');
+    check('no healthCheck: no probe timer', fb._probeTimer === null);
+    fb.stop();
 }
 
 if (failures) {

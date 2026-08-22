@@ -18,12 +18,38 @@ export class LlamaCpp {
         this.params = { ...(params || {}) };
         const timeout = this.params.timeout ?? DEFAULT_TIMEOUT_MS;
         delete this.params.timeout; // ours, not a completion parameter
+        this.baseURL = (url || "http://127.0.0.1:8000/v1").replace(/\/+$/, '');
         this.openai = new OpenAIApi({
-            baseURL: url || "http://127.0.0.1:8000/v1",
+            baseURL: this.baseURL,
             apiKey: "local",
             timeout,
             maxRetries: 0, // failover is handled by FallbackModel; retrying a dead tunnel wastes time
         });
+    }
+
+    /**
+     * Cheap liveness check for the circuit breaker: a bare GET, no generation, short timeout.
+     *
+     * This exists so recovery costs nobody a turn. Without it the breaker only learned the
+     * server was back when a real user request happened to be routed at it after the cooldown,
+     * so the first turn after every recovery paid a full connect attempt - and during a long
+     * outage, every cooldown expiry paid one too.
+     *
+     * @returns {Promise<boolean>}
+     */
+    async healthCheck() {
+        try {
+            const ctrl = new AbortController();
+            const t = setTimeout(() => ctrl.abort(), 2500);
+            try {
+                const res = await fetch(`${this.baseURL}/models`, { signal: ctrl.signal });
+                return res.ok;
+            } finally {
+                clearTimeout(t);
+            }
+        } catch {
+            return false;
+        }
     }
 
     /**

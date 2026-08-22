@@ -15,6 +15,7 @@ import convoManager from './conversation.js';
 import { handleTranslation, handleEnglishTranslation } from '../utils/translator.js';
 import { addBrowserViewer } from './vision/browser_viewer.js';
 import { AutoJump } from './library/auto_jump.js';
+import { SwimAssist } from './library/swim_assist.js';
 import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
@@ -136,6 +137,14 @@ export class Agent {
                 // jump early enough that the bot is still moving when it leaves the ground.
                 this.auto_jump = new AutoJump(this.bot);
                 this.auto_jump.enable();
+
+                // Owns the jump key while the bot is wet (jump is buoyancy in water, not
+                // propulsion) and restores the sprint-swim speed the physics library omits.
+                // Exposed on the bot so swim.js can reach it without an import cycle.
+                this.swim_assist = new SwimAssist(this.bot);
+                this.swim_assist.enable();
+                this.bot.swimAssist = this.swim_assist;
+
                 console.log('Initializing vision intepreter...');
                 this.vision_interpreter = new VisionInterpreter(this, settings.allow_vision);
 

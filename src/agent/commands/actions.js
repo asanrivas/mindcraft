@@ -1,8 +1,44 @@
 import * as skills from '../library/skills.js';
+import * as swim from '../library/swim.js';
+import { measureSwim, formatProbe } from '../library/swim_probe.js';
+import { Vec3 } from 'vec3';
 import fs from 'fs';
 import settings from '../settings.js';
 import convoManager from '../conversation.js';
 
+
+/**
+ * Send a slash command and wait for the server's reply.
+ *
+ * There is no request/response channel for commands - the answer arrives as an ordinary chat
+ * line - so listen on `messagestr` for something matching `pattern` and give up after
+ * `timeoutMs` rather than hanging if the bot lacks permission and the server says nothing.
+ *
+ * @returns {Promise<string|null>} the matching line, or null on timeout
+ */
+async function runServerCommand(bot, command, pattern, timeoutMs = 8000) {
+    return await new Promise((resolve) => {
+        let done = false;
+        const finish = (val) => {
+            if (done) return;
+            done = true;
+            bot.removeListener('messagestr', onMsg);
+            clearTimeout(timer);
+            resolve(val);
+        };
+        const onMsg = (message) => {
+            // Skip player chat. The agent narrates every command it runs ("*asanrivas used
+            // worldSeed*"), and that echo matched the reply pattern before the real answer
+            // arrived - so the command returned its own announcement as the server's response.
+            if (/^<[^>]+>/.test(message)) return;
+            if (message.includes(bot.username)) return;
+            if (pattern.test(message)) finish(message);
+        };
+        const timer = setTimeout(() => finish(null), timeoutMs);
+        bot.on('messagestr', onMsg);
+        bot.chat(command);
+    });
+}
 
 function runAsAction (actionFn, resume = false, timeout = -1) {
     let actionLabel = null;  // Will be set on first use
@@ -103,6 +139,84 @@ export const actionsList = [
             const p = agent.bot.entity.position;
             return `CLIMB: gained ${gained.toFixed(0)} blocks, y ${before.toFixed(0)} -> ${p.y.toFixed(0)}.`;
         }, true, 15)
+    },
+    {
+        name: '!swimTo',
+        description: 'Swim to a point in or across water. Handles depth automatically and sprint-swims when submerged.',
+        params: {
+            'x': { type: 'float', description: 'x coordinate.' },
+            'y': { type: 'float', description: 'y coordinate.' },
+            'z': { type: 'float', description: 'z coordinate.' }
+        },
+        perform: runAsAction(async (agent, x, y, z) => {
+            const bot = agent.bot;
+            if (!swim.inWater(bot)) return 'Not in water - walk to the water first, then swim.';
+            const r = await swim.swimTo(bot, new Vec3(x, y, z));
+            const p = bot.entity.position;
+            const speed = r.ms > 0 ? (r.covered / (r.ms / 1000)) : 0;
+            return `VERIFIED SWIM: arrived=${r.arrived}, covered ${r.covered.toFixed(1)} blocks in `
+                + `${(r.ms / 1000).toFixed(1)}s (${speed.toFixed(2)} b/s), ${r.remaining.toFixed(1)} to go, `
+                + `oxygen ${r.oxygenStart}->${r.oxygenEnd}, reason=${r.reason}. `
+                + `Now at (${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}).`;
+        }, true, 5)
+    },
+    {
+        name: '!dive',
+        description: 'Dive down underwater by a number of blocks. Surfaces automatically when air runs low.',
+        params: {
+            'depth': { type: 'int', description: 'How many blocks to descend.', domain: [1, 100] }
+        },
+        perform: runAsAction(async (agent, depth) => {
+            const bot = agent.bot;
+            if (!swim.inWater(bot)) return 'Not in water - get in the water first.';
+            // The hunting mode will chase a cod mid-dive and fight the descent for the controls.
+            bot.modes.pause('hunting');
+            try {
+                const startY = bot.entity.position.y;
+                const r = await swim.dive(bot, startY - depth);
+                return `VERIFIED DIVE: y ${startY.toFixed(0)} -> ${r.y.toFixed(0)} `
+                    + `(${r.descended.toFixed(1)}/${depth} blocks in ${(r.ms / 1000).toFixed(1)}s), `
+                    + `oxygen ${r.oxygenStart}->${r.oxygenEnd}, reason=${r.reason}.`;
+            } finally {
+                bot.modes.unpause('hunting');
+            }
+        }, false, 2)
+    },
+    {
+        name: '!surface',
+        description: 'Swim up to the surface for air. Finds another way up if the water above is capped.',
+        perform: runAsAction(async (agent) => {
+            const bot = agent.bot;
+            // The drowning mode does exactly this job and already has the controls. Racing it
+            // starves both: each interrupt aborts the other's climb, and the bot keeps drowning
+            // while the two hand off. Whoever got there first finishes the job.
+            if (bot.modes.exists('drowning') && bot.modes.isActive('drowning')) {
+                return 'The drowning response is already surfacing me - leaving it to finish.';
+            }
+            bot.modes.pause('hunting');
+            try {
+                const r = await swim.surface(bot);
+                if (!r.surfaced) {
+                    return `VERIFIED SURFACE: FAILED, reason=${r.reason}`
+                        + `${r.blocker ? ` (blocked by ${r.blocker})` : ''}, still at y=${r.y.toFixed(0)} `
+                        + `with ${r.oxygenEnd}/20 air.`;
+                }
+                return `VERIFIED SURFACE: y ${(r.y - r.rose).toFixed(0)} -> ${r.y.toFixed(0)} in `
+                    + `${(r.ms / 1000).toFixed(1)}s, oxygen ${r.oxygenStart}->${r.oxygenEnd}, reason=${r.reason}.`;
+            } finally {
+                bot.modes.unpause('hunting');
+            }
+        }, false, 1)
+    },
+    {
+        // Diagnostic. The whole water cost model in nav.js rests on a claim that the bot "barely
+        // moves while swimming"; this is what settles it with numbers instead of a comment.
+        name: '!swimProbe',
+        description: 'Measure how fast this server actually lets you swim. Run while floating in open water.',
+        perform: runAsAction(async (agent) => {
+            const m = await measureSwim(agent.bot);
+            return formatProbe(m);
+        }, false, 3)
     },
     {
         // Steering is rendered verbatim into every prompt and is never round-tripped through the
@@ -599,11 +713,12 @@ export const actionsList = [
     },
         {
         name: '!placeHere',
-        description: 'Place a given block in the current location. Do NOT use to build structures, only use for single blocks/torches.',
+        description: 'Place a given block next to you. Do NOT use to build structures, only use for single blocks/torches/beds.',
         params: {'type': { type: 'BlockOrItemName', description: 'The block type to place.' }},
         perform: runAsAction(async (agent, type) => {
-            let pos = agent.bot.entity.position;
-            await skills.placeBlock(agent.bot, type, pos.x, pos.y, pos.z);
+            // Next to the bot, not inside it - see skills.placeNearby.
+            const ok = await skills.placeNearby(agent.bot, type);
+            return ok ? `Placed ${type}.` : `Could not place ${type} nearby.`;
         })
     },
     {
@@ -689,6 +804,70 @@ export const actionsList = [
         // and nothing in the normal movement stack can recover from that. This teleports it
         // clear - but ONLY while an operator-created marker file exists on disk, so the model
         // can never invoke it to skip a journey it is supposed to walk.
+        // Deliberately NOT a generic "run any server command" passthrough. The model can call
+        // every command in this list, and an unrestricted /-passthrough would hand it /op, /ban
+        // and /kill. Narrow commands keep the blast radius to what they say on the tin.
+        name: '!serverGamemode',
+        description: 'Operator: change this bot\'s gamemode (survival, creative, adventure, spectator).',
+        params: {
+            'mode': { type: 'string', description: 'survival, creative, adventure or spectator.' }
+        },
+        perform: runAsAction(async (agent, mode) => {
+            const m = String(mode).toLowerCase();
+            const allowed = ['survival', 'creative', 'adventure', 'spectator'];
+            if (!allowed.includes(m)) return `Unknown gamemode "${mode}". Use one of: ${allowed.join(', ')}.`;
+            const line = await runServerCommand(agent.bot, `/gamemode ${m} ${agent.name}`,
+                /game ?mode|permission|Unknown/i, 5000);
+            await new Promise(r => setTimeout(r, 600));
+            return `GAMEMODE: now ${agent.bot.game.gameMode}${line ? ` (server said: ${line})` : ''}.`;
+        }, false, 1)
+    },
+    {
+        // Death becomes possible the moment the bot leaves creative, and world spawn here is
+        // thousands of blocks from anywhere it is working. Set this before switching.
+        name: '!serverSpawnpoint',
+        description: 'Operator: set this bot\'s respawn point to its current position.',
+        perform: runAsAction(async (agent) => {
+            const p = agent.bot.entity.position;
+            const x = Math.floor(p.x), y = Math.floor(p.y), z = Math.floor(p.z);
+            const line = await runServerCommand(agent.bot, `/spawnpoint ${agent.name} ${x} ${y} ${z}`,
+                /spawn ?point|permission|Unknown/i, 5000);
+            return `SPAWNPOINT set to (${x}, ${y}, ${z})${line ? `. Server said: ${line}` : ' (no confirmation from server)'}.`;
+        }, false, 1)
+    },
+    {
+        name: '!worldSeed',
+        description: 'Ask the server for the world seed. Requires operator permission.',
+        perform: runAsAction(async (agent) => {
+            const line = await runServerCommand(agent.bot, '/seed', /Seed:\s*\[|^\[?-?\d{6,}|permission|Unknown/i, 6000);
+            if (!line) return 'No reply from the server - /seed may need operator permission.';
+            const m = line.match(/(-?\d{4,})/);
+            return m ? `WORLD SEED: ${m[1]}` : `Server said: ${line}`;
+        }, false, 1)
+    },
+    {
+        // Uses the SERVER's own world generator, so the answer is exact for this seed - which
+        // beats reproducing the biome maths against a stale minecraft-data copy, especially on
+        // a 26.1 server the local stack does not fully understand.
+        name: '!locateBiome',
+        description: 'Find the nearest biome of a given type using the server world generator, e.g. "frozen_ocean" or "ice_spikes".',
+        params: {
+            'biome': { type: 'string', description: 'Biome id, with or without the minecraft: prefix.' }
+        },
+        perform: runAsAction(async (agent, biome) => {
+            const id = String(biome).includes(':') ? String(biome) : `minecraft:${biome}`;
+            const line = await runServerCommand(agent.bot, `/locate biome ${id}`, /nearest|could not|unknown|no biome/i, 15000);
+            if (!line) return `No reply from the server for ${id} - /locate may need operator permission.`;
+            // "The nearest minecraft:frozen_ocean is at [1234, ~, -5678] (890 blocks away)"
+            const m = line.match(/\[\s*(-?\d+)\s*,\s*(~|-?\d+)\s*,\s*(-?\d+)\s*\]/);
+            if (!m) return `Server said: ${line}`;
+            const p = agent.bot.entity.position;
+            const dist = Math.hypot(Number(m[1]) - p.x, Number(m[3]) - p.z);
+            return `BIOME ${id} at x=${m[1]} z=${m[3]} (y=${m[2]}), ${dist.toFixed(0)} blocks away. `
+                + `Server said: ${line}`;
+        }, false, 2)
+    },
+    {
         name: '!serverTp',
         description: 'Operator rescue only. Disabled unless a marker file is present; not usable for travel.',
         params: {
@@ -715,12 +894,19 @@ export const actionsList = [
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
             'x': { type: 'int', description: 'X coordinate.' },
             'y': { type: 'int', description: 'Y coordinate.' },
-            'z': { type: 'int', description: 'Z coordinate.' }
+            'z': { type: 'int', description: 'Z coordinate.' },
+            // Block states have to be a SEPARATE argument: the BlockOrItemName validator checks
+            // the name against the registry, so "red_bed[part=foot]" is rejected outright. Some
+            // blocks are unusable without one - a bed placed with no part/facing is half a bed,
+            // which pops straight off and cannot set a respawn point.
+            'state': { type: 'string', description: 'Optional block state, e.g. "facing=east,part=foot". Use "none" for no state.' }
         },
-        perform: async (agent, blockType, x, y, z) => {
-            const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}`;
+        perform: async (agent, blockType, x, y, z, state) => {
+            const clean = String(state ?? '').trim().replace(/^\[|\]$/g, '');
+            const suffix = (!clean || clean.toLowerCase() === 'none') ? '' : `[${clean}]`;
+            const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}${suffix}`;
             agent.bot.chat(command);
-            return `Set block ${blockType} at (${x}, ${y}, ${z})`;
+            return `Set block ${blockType}${suffix} at (${x}, ${y}, ${z})`;
         }
     },
     {

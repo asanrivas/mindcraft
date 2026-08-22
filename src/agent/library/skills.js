@@ -1,7 +1,8 @@
 import * as mc from "../../utils/mcdata.js";
 import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
-import { digWithTool, equipBestTool, isFallingBlockName, isTreeTrunk } from './tools.js';
+import { digWithTool, equipBestTool, isFallingBlockName, isTreeTrunk, isWaterName } from './tools.js';
+import * as swim from './swim.js';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { existsSync, readFileSync } from 'fs';
@@ -469,8 +470,10 @@ export async function attackNearest(bot, mobType, kill=true) {
      * await skills.attackNearest(bot, "zombie", true);
      **/
     bot.modes.pause('cowardice');
-    if (mobType === 'drowned' || mobType === 'cod' || mobType === 'salmon' || mobType === 'tropical_fish' || mobType === 'squid')
-        bot.modes.pause('self_preservation'); // so it can go underwater. TODO: have an drowning mode so we don't turn off all self_preservation
+    // Hunting a fish used to pause ALL of self_preservation - which also disabled falling-block
+    // digging, fire response and low-health flight - purely so the bot could put its head under
+    // water. Drowning is its own mode now, so nothing needs disabling here, and that mode stays
+    // ON during the fight: the bot should still come up for air mid-hunt.
     const mob = world.getNearbyEntities(bot, 24).find(entity => entity.name === mobType);
     if (mob) {
         return await attackEntity(bot, mob, kill);
@@ -4224,6 +4227,11 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
             await nav.navigateTo(bot, new Vec3(wx, Math.floor(pos.y), wz), {
                 arriveDist: 3, maxReplans: 3, goalXZOnly: true, planRange: 96, horizon: 10,
                 preferY,
+                // Long-distance travel is the only caller that gets the measured water costs.
+                // !navTo, moveAway and every mode-driven move stay on the land-only model that
+                // has a 1018-block journey behind it: a cheaper river changes which nodes win
+                // the whole A* frontier, not just the wet ones.
+                swimEnabled: true,
             });
         } catch (err) {
             // fall through to the obstruction check
@@ -4271,15 +4279,36 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
                 continue;
             }
 
-            // Standing in water stops this bot dead - it barely moves while swimming, so it
-            // oscillates on the spot instead of crossing. Get onto dry land first; everything
-            // downstream (detour, trench, bridge) assumes the bot can actually walk.
+            // Being in water used to be treated as a stall to escape from, on the belief that
+            // the bot "barely moves while swimming". Measured: 1.96 blocks/s, about 4x its
+            // overland speed through real terrain. So swim the crossing rather than retreating
+            // to the bank - but only while the far side is close enough to be a crossing and not
+            // an ocean. If the swim itself stalls, fall back to the old bank-first behaviour,
+            // because none of the machinery below (dig, bridge, pillar) works while floating.
             if (inWater(bot)) {
-                log(bot, `In water; heading for the nearest bank before continuing.`);
+                const far = swimCrossingTarget(bot, dx, dz, MAX_SWIM_LEG);
+                if (far) {
+                    log(bot, `In water; swimming ${far.distance.toFixed(0)} blocks to the far bank.`);
+                    const r = await swim.swimTo(bot, far.pos, { timeoutMs: 25000, arrive: 1.5 });
+                    if (r.arrived || r.reason === 'beached' || r.covered > 2) { stalls = 0; continue; }
+                }
+                log(bot, `In water and cannot cross; heading for the nearest bank.`);
                 if (await escapeWater(bot)) { stalls = 0; continue; }
             }
 
             const ahead = nav.scanAhead(bot, dx, dz, 10);
+
+            // Water ahead that is narrow enough to swim is a crossing, not an obstacle. Doing
+            // this before the wall/cliff/bridge branches stops the bot filling in a river it
+            // could have swum in a couple of seconds.
+            if (ahead.water > 0 && ahead.water <= MAX_SWIM_LEG) {
+                const far = swimCrossingTarget(bot, dx, dz, MAX_SWIM_LEG);
+                if (far) {
+                    log(bot, `Water ${ahead.water} blocks wide ahead; swimming across.`);
+                    const r = await swim.swimTo(bot, far.pos, { timeoutMs: 25000, arrive: 1.5 });
+                    if (r.arrived || r.reason === 'beached' || r.covered > 2) { stalls = 0; continue; }
+                }
+            }
             if (ahead.kind === 'wall' && stalls <= 2) {
                 const side = (stalls % 2) ? 1 : -1;
                 const here = bot.entity.position.floored();
@@ -4314,8 +4343,9 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
             }
 
             let cleared = await clearWayAhead(bot, dx, dz, stalls > 3);
-            // Water and gaps stop this bot as hard as walls do (it barely moves while
-            // swimming), so lay a walkable surface across them rather than trying to swim.
+            // Bridging is for GAPS now. Water wide enough to reach here is water the swim
+            // branch above already declined to cross, so filling it in is the right call; water
+            // narrow enough to swim never gets this far.
             cleared += await bridgeWayAhead(bot, dx, dz);
             dug += cleared;
             if (cleared === 0 && stalls > 1 && lastClearHitBuild) {
@@ -4417,8 +4447,8 @@ async function bridgeWayAhead(bot, dx, dz) {
         const stand = new Vec3(p.x + dx * ahead, p.y, p.z + dz * ahead);
         const below = bot.blockAt(footing);
         const at = bot.blockAt(stand);
-        const needsFooting = below && (below.name === 'air' || below.name.includes('water'));
-        const standBlocked = at && at.name.includes('water');
+        const needsFooting = below && (below.name === 'air' || isWaterName(below.name));
+        const standBlocked = at && isWaterName(at.name);
         if (!needsFooting && !standBlocked) continue;
         try {
             if (standBlocked) await breakBlockAt(bot, stand.x, stand.y, stand.z);
@@ -4484,31 +4514,111 @@ function isPlayerMade(name) {
  *
  * Pillaring does not work here - the bot floats in the water cell, so there is nowhere to place
  * a block under itself. And steering at the distant travel goal just pushes it further into the
- * river, where it barely moves at all. Aim at the nearest bank instead.
+ * river. Aim at the nearest bank instead.
+ *
+ * Now swims properly rather than pulsing jump: `hopForward`'s jump pulse is buoyancy in water,
+ * not propulsion, so it made the bot bob in place instead of crossing.
  * @returns {Promise<boolean>} true if the bot is out of the water.
  */
 export async function escapeWater(bot, tries = 8) {
     const nav = await import('./nav.js');
     for (let i = 0; i < tries && inWater(bot); i++) {
         if (bot.interrupt_code) break;
-        const land = nav.nearestDryLand(bot, 8);
+        const land = nav.nearestDryLand(bot, 16);
         if (!land) break;
-        const p = bot.entity.position;
-        await hopForward(bot, land.x - p.x, land.z - p.z, 1500);
+        const r = await swim.swimTo(bot, land, { timeoutMs: 8000, arrive: 1.2 });
+        if (r.reason === 'lava' || r.reason === 'lava_on_route') break;
     }
     const out = !inWater(bot);
     log(bot, out ? `Out of the water at y=${bot.entity.position.y.toFixed(0)}.` : `Still in water.`);
     return out;
 }
 
-/** Is the bot's body in water? */
-function inWater(bot) {
-    const p = bot.entity.position.floored();
-    for (const dy of [0, 1]) {
-        const b = bot.blockAt(p.offset(0, dy, 0));
-        if (b && b.name.includes('water')) return true;
+/**
+ * Blocks that occupy TWO cells. Placing one needs a free neighbour as well as a free target, and
+ * a half-placed bed is not a bed - it pops straight off and cannot set a respawn point.
+ */
+const TWO_CELL_BLOCKS = /(_bed$|_door$|^tall_grass$|^large_fern$|^sunflower$|^lilac$|^rose_bush$|^peony$)/;
+
+/**
+ * Place a block NEXT TO the bot rather than inside it.
+ *
+ * `!placeHere` used to pass the bot's own position straight to `placeBlock`, which cannot work:
+ * the bot's body occupies that cell. It failed silently-ish behind mineflayer's 500ms
+ * `blockUpdate` timeout, so the error read like the known timeout flake rather than "you asked
+ * me to place a block inside myself". A bed made it obvious, needing two cells instead of one.
+ *
+ * @returns {Promise<boolean>} true if the block is verifiably there
+ */
+export async function placeNearby(bot, blockType, maxRadius = 3) {
+    const needsPair = TWO_CELL_BLOCKS.test(blockType);
+    const origin = bot.entity.position.floored();
+    const free = (v) => {
+        const at = bot.blockAt(v);
+        const below = bot.blockAt(v.offset(0, -1, 0));
+        if (!at || !below) return false;
+        if (at.name !== 'air' && at.name !== 'cave_air') return false;
+        return below.boundingBox === 'block';
+    };
+
+    const dirs = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    for (let r = 1; r <= maxRadius; r++) {
+        for (const [dx, dz] of dirs) {
+            for (const dy of [0, -1, 1]) {
+                const spot = origin.offset(dx * r, dy, dz * r);
+                if (!free(spot)) continue;
+                if (needsPair && !dirs.some(([nx, nz]) => free(spot.offset(nx, 0, nz)))) continue;
+                if (await placeBlock(bot, blockType, spot.x, spot.y, spot.z)) return true;
+            }
+        }
     }
+    log(bot, `No free space near me to place ${blockType}${needsPair ? ' (it needs two blocks of room)' : ''}.`);
     return false;
+}
+
+/** Is the bot's body in water? Canonical test lives in swim.js. */
+function inWater(bot) {
+    return swim.inWater(bot);
+}
+
+/**
+ * How far a single swim leg may be. The guard against the ocean failure mode: beyond this the
+ * bot heads for the nearest bank and the planner routes around instead. Without a ceiling, a
+ * cheap-water cost model plus a goal on the far side of an ocean sends the bot out to sea, where
+ * every recovery behaviour this codebase has (dig, bridge, pillar) is useless.
+ */
+const MAX_SWIM_LEG = 24;
+
+/**
+ * The first standable land straight ahead across the water, or null if there is none within
+ * `maxLeg`. Returns a target for `swim.swimTo`, not just a distance, so the caller aims at dry
+ * ground rather than at a point in open water.
+ *
+ * @returns {{pos:Vec3, distance:number, water:number}|null}
+ */
+function swimCrossingTarget(bot, dx, dz, maxLeg = MAX_SWIM_LEG) {
+    const p = bot.entity.position.floored();
+    let water = 0;
+    for (let i = 1; i <= maxLeg + 4; i++) {
+        const x = p.x + dx * i, z = p.z + dz * i;
+        // Follow the water surface: the bank may be a block up or down from where we float.
+        for (const dy of [0, 1, -1, 2]) {
+            const y = p.y + dy;
+            const feet = bot.blockAt(new Vec3(x, y, z));
+            const head = bot.blockAt(new Vec3(x, y + 1, z));
+            const below = bot.blockAt(new Vec3(x, y - 1, z));
+            if (!feet || !head || !below) continue;
+            const standable = (feet.name === 'air' || feet.name === 'cave_air')
+                && (head.name === 'air' || head.name === 'cave_air')
+                && below.boundingBox === 'block' && !isWaterName(below.name);
+            if (standable && water > 0) {
+                return { pos: new Vec3(x + 0.5, y, z + 0.5), distance: i, water };
+            }
+        }
+        if (isWaterName(bot.blockAt(new Vec3(x, p.y, z))?.name)) water++;
+        if (water > maxLeg) return null; // too wide to be a crossing
+    }
+    return null;
 }
 
 // Blocks worth spending to build with, cheapest-to-lose first. Deliberately excludes anything

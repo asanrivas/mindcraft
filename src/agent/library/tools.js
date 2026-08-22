@@ -90,3 +90,38 @@ const TREE_TRUNK = /(_log$|_wood$|_stem$|_hyphae$|^mangrove_roots$|^bamboo)/;
 export function isTreeTrunk(name) {
     return !!name && TREE_TRUNK.test(name);
 }
+
+/**
+ * Water and lava, matched EXACTLY.
+ *
+ * Same reasoning as isFallingBlockName: nav.js used to classify anything whose name CONTAINED
+ * "water" as swimmable, which makes `water_cauldron` a river the planner will happily route a
+ * path through. `lava_cauldron` is the mirror image - it is not a lava lake, but it is still
+ * not something to walk into, so callers treat it as a hazard by other means.
+ */
+const WATER_BLOCKS = new Set(['water', 'flowing_water']);
+const LAVA_BLOCKS = new Set(['lava', 'flowing_lava']);
+// Plants that grow in water: the cell is still water, and the bot swims straight through them.
+const WATER_PLANTS = new Set(['seagrass', 'tall_seagrass', 'kelp', 'kelp_plant']);
+
+export function isWaterName(name) {
+    return !!name && WATER_BLOCKS.has(name);
+}
+
+export function isLavaName(name) {
+    return !!name && LAVA_BLOCKS.has(name);
+}
+
+/** Water, or a plant standing in it. Waterlogged blocks are NOT swimmable - they are solid. */
+export function isSwimmable(name) {
+    return isWaterName(name) || (!!name && WATER_PLANTS.has(name));
+}
+
+/**
+ * Bubble columns drag an entity up (soul sand) or down (magma) regardless of what it holds.
+ * They have no bounding box, so a naive check reads them as air and the planner routes through
+ * a lift it cannot steer in.
+ */
+export function isBubbleColumn(name) {
+    return name === 'bubble_column';
+}

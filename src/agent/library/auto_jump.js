@@ -56,6 +56,14 @@ export class AutoJump {
     _tick() {
         const bot = this.bot;
 
+        // Water belongs to SwimAssist, which owns the jump key while the bot is wet. A bot
+        // bobbing at a stable surface height satisfies _grounded()'s stable-y test, so without
+        // this the two would fight over the same control state every tick.
+        if (bot.entity?.isInWater) {
+            if (this.holding > 0) { this.holding = 0; this.cooldown = 0; }
+            return;
+        }
+
         // Release the key once the hold window is over, then start the cooldown.
         if (this.holding > 0) {
             if (--this.holding === 0) {

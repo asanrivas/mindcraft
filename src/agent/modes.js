@@ -1,5 +1,6 @@
 import * as skills from "./library/skills.js";
 import { isFallingBlockName } from "./library/tools.js";
+import * as swim from "./library/swim.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
 import settings from "./settings.js";
@@ -24,6 +25,63 @@ function say(agent, message) {
 // to perform longer actions, use the execute function which won't block the update loop
 const modes_list = [
     {
+        // First on purpose: nothing else matters if the bot drowns, and drowning is the one
+        // hazard with a hard clock on it (300 ticks of air, then 1 heart every second).
+        //
+        // Replaces a branch inside self_preservation that read `if (blockAbove.name === "water")
+        // bot.setControlState("jump", true)`. That was wrong in four ways: it bypassed execute()
+        // so it had no timeout and never marked itself active, it NEVER released the jump key,
+        // it was gated on `bot.pathfinder.goal` which this project no longer uses, and it fired
+        // on any submerged head - so it fought every deliberate dive.
+        name: "drowning",
+        description: "Surface for air before oxygen runs out. Interrupts all actions.",
+        interrupts: ["all"],
+        // Drowning outranks builds and travel - but NOT a surface run that is already under way.
+        // Interrupting one is self-defeating: each interruption sets bot.interrupt_code, which
+        // aborts the other's climb mid-rise, and the two then trade interrupts indefinitely.
+        // Observed live at 2 hearts of drowning damage:
+        //   mode:drowning  interrupts  action:surface
+        //   action:surface interrupts  mode:drowning
+        //   mode:drowning  interrupts  action:surface   ...
+        excludeFromInterrupt: ["action:surface"],
+        on: true,
+        active: false,
+        threshold: 8,             // bubbles. One bubble is ~0.75s of air, so this is ~6s.
+        cooldownUntil: 0,
+        failures: 0,
+        update: async function (agent) {
+            const bot = agent.bot;
+            if (Date.now() < this.cooldownUntil) return;
+            // Require BOTH the number and the block read: oxygenLevel arrives by entity
+            // metadata, so a late packet during lag could otherwise trigger a surface run
+            // while the bot is stood on dry land.
+            if (swim.oxygen(bot) > this.threshold) return;
+            if (!swim.isSubmerged(bot)) return;
+
+            execute(this, agent, async () => {
+                const r = await swim.surface(bot, { timeoutMs: 12000 });
+                if (r.surfaced) {
+                    this.failures = 0;
+                    // Air refills over a second or so, so without a short pause the mode
+                    // re-fires every tick while oxygen climbs back past the threshold - observed
+                    // firing four times in ten seconds, each one interrupting the running action.
+                    this.cooldownUntil = Date.now() + 1500;
+                    return;
+                }
+                // Cannot reach air. Back off before retrying, or this mode spins every tick and
+                // pins currentActionLabel exactly like the bug it replaces.
+                this.failures++;
+                this.cooldownUntil = Date.now() + 5000;
+                say(agent, `I can't reach air (${r.reason}${r.blocker ? `: ${r.blocker}` : ''}) `
+                    + `at y=${r.y.toFixed(0)} with ${swim.oxygen(bot)}/20 air.`);
+            }, 0.5);
+        },
+        unpause: function () {
+            this.cooldownUntil = 0;
+            this.failures = 0;
+        },
+    },
+    {
         name: "self_preservation",
         description:
             "Respond to drowning, burning, and damage at low health. Interrupts all actions.",
@@ -36,12 +94,7 @@ const modes_list = [
             let blockAbove = bot.blockAt(bot.entity.position.offset(0, 1, 0));
             if (!block) block = { name: "air" }; // hacky fix when blocks are not loaded
             if (!blockAbove) blockAbove = { name: "air" };
-            if (blockAbove.name === "water") {
-                // does not call execute so does not interrupt other actions
-                if (!bot.pathfinder.goal) {
-                    bot.setControlState("jump", true);
-                }
-            } else if (
+            if (
                 isFallingBlockName(blockAbove.name)
             ) {
                 // Dig it out rather than run from it. Fleeing surrenders the position - and
@@ -128,8 +181,10 @@ const modes_list = [
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 20);
                 }, 1);
-            } else if (agent.isIdle()) {
-                bot.clearControlStates(); // clear jump if not in danger or doing anything else
+            } else if (agent.isIdle() && !swim.inWater(bot)) {
+                // Not while wet: SwimAssist holds jump to keep the head above water, and
+                // clearing it here every idle tick would quietly sink the bot.
+                bot.clearControlStates();
             }
         },
     },
@@ -141,7 +196,8 @@ const modes_list = [
         // Building operations should not be interrupted - they have their own timeout
         // travel pauses to mine through obstructions, which looks like being stuck;
         // it has its own stall detection and a hard deadline, so let it run.
-        excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:travel", "action:navTo"],
+        excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:travel", "action:navTo",
+            "action:swimTo", "action:dive", "action:surface", "action:swimProbe", "mode:drowning"],
         on: true,
         active: false,
         prev_location: null,
@@ -157,6 +213,14 @@ const modes_list = [
                 return; // don't get stuck when idle
             }
             const bot = agent.bot;
+            // Water is the drowning mode's territory. Sinking runs at 0.5 blocks/s and holding
+            // depth is stationary by this test, so a legitimate 20s dive would trip the stuck
+            // timer - and this mode arms a cleanKill 10s after that.
+            if (swim.inWater(bot)) {
+                this.prev_location = null;
+                this.stuck_time = 0;
+                return;
+            }
             const cur_dig_block = bot.targetDigBlock;
             if (cur_dig_block && !this.prev_dig_block) {
                 this.prev_dig_block = cur_dig_block;
@@ -548,6 +612,11 @@ class ModeController {
 
     isOn(mode_name) {
         return modes_map[mode_name].on;
+    }
+
+    /** Is this mode currently mid-action? Lets a command stand down rather than compete. */
+    isActive(mode_name) {
+        return !!modes_map[mode_name]?.active;
     }
 
     pause(mode_name) {

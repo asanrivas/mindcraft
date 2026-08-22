@@ -1,5 +1,5 @@
 import { Vec3 } from 'vec3';
-import { digWithTool, isTreeTrunk } from './tools.js';
+import { digWithTool, isTreeTrunk, isLavaName, isSwimmable, isBubbleColumn } from './tools.js';
 
 /**
  * A self-contained navigator: A* planner + lookahead executor.
@@ -50,9 +50,24 @@ const DEFAULTS = {
     // wide, so a detour is trivial, while chopping is slower and wrecks the landscape. Priced
     // as a strong preference rather than a ban so a bot boxed in by trees cannot deadlock.
     treeDigCost: 60,
-    // Water is priced high, not merely inconvenient: with this server's physics the bot barely
-    // moves while swimming, so a route through a river is far worse than a long detour round it.
-    waterCost: 15,
+    // Water USED to be priced at 15 on the belief that "with this server's physics the bot
+    // barely moves while swimming". That was never measured, and it is false. `!swimProbe` in
+    // 7-block-deep water, repeated across five runs:
+    //
+    //     forward 0.098 b/t = 1.96 blocks/s = ~118 blocks/MINUTE
+    //
+    // against this bot's measured ~25 blocks/min overland through real terrain. Water is the one
+    // part of the physics stack the protocol-775 mismatch does not touch, so swimming is roughly
+    // FOUR TIMES faster than walking here. See docs and CLAUDE.md for the full numbers.
+    //
+    // What actually costs is the transition, not the metres: entering and leaving the water.
+    // Hence a low per-cell cost and a separate one-off entry charge. Never set waterCost to 0 -
+    // free water lets A* burn its whole node budget on open ocean and route the bot out to sea.
+    waterCost: 2,
+    waterEntryCost: 6,
+    // Off by default so !navTo, moveAway and every mode-driven move keep the proven land-only
+    // cost model. travelDirection turns it on. Until then, water is priced at the old 15.
+    swimEnabled: false,
     // Descending is priced well above its raw distance because it is ASYMMETRIC: falling into
     // a trench costs one move, climbing back out costs many or is impossible. At 1.5 the planner
     // cheerfully dived into old excavations and then had to route dozens of blocks the wrong way
@@ -124,14 +139,24 @@ function classify(ctx, x, y, z) {
     else {
         const n = b.name;
         if (n === 'air' || n === 'cave_air' || n === 'void_air') cls = AIR;
-        else if (n.includes('lava') || n === 'fire' || n === 'cactus' || n === 'magma_block'
-                 || n === 'powder_snow' || n === 'sweet_berry_bush') cls = HAZARD;
-        else if (n.includes('water') || n === 'seagrass' || n === 'kelp' || n === 'kelp_plant') cls = WATER;
+        // Exact matching, via the canonical classifiers. The substring test this replaced made
+        // `water_cauldron` a swimmable cell and `lava_cauldron` a lava lake.
+        else if (isLavaName(n) || n === 'lava_cauldron' || n === 'fire' || n === 'cactus'
+                 || n === 'magma_block' || n === 'powder_snow' || n === 'sweet_berry_bush'
+                 || isBubbleColumn(n)) cls = HAZARD;
+        else if (isSwimmable(n)) cls = WATER;
         else if (b.boundingBox) cls = b.boundingBox === 'block' ? SOLID : AIR;
         else cls = SOLID;
     }
     ctx.cache.set(k, cls);
     return cls;
+}
+
+/** Would the bot be in water standing here? Feet, head or the block underfoot. */
+function isWet(ctx, x, y, z) {
+    return classify(ctx, x, y, z) === WATER
+        || classify(ctx, x, y + 1, z) === WATER
+        || classify(ctx, x, y - 1, z) === WATER;
 }
 
 /** Block name at a cell, memoised per plan (classify caches the class, not the name). */
@@ -157,18 +182,35 @@ function standCost(ctx, x, y, z) {
     const head = classify(ctx, x, y + 1, z);
     const below = classify(ctx, x, y - 1, z);
 
+    return swimCostFor({ feet, head, below }, o);
+}
+
+/**
+ * Pure half of `standCost`, split out so the cost model can be unit-tested without a world.
+ *
+ * The water charge is applied ONCE for the whole cell. It used to be applied twice - once for
+ * wet feet-or-head and again for a wet block below - so a cell in the middle of a river cost
+ * 2 x waterCost, i.e. 30 "blocks walked". That was a bug under any reading of how fast the bot
+ * swims, and it is what made even a 6-wide river lose to a 60-block detour.
+ *
+ * @returns {number|null} extra cost, or null if the bot cannot stand there at all
+ */
+export function swimCostFor({ feet, head, below }, o) {
     if (feet === HAZARD || head === HAZARD || below === HAZARD) return null;
     if (feet === SOLID || head === SOLID) return null;
 
-    let c = 0;
-    if (feet === WATER || head === WATER) c += o.waterCost;
+    const waterCost = o.swimEnabled ? o.waterCost : 15;
+    const wet = feet === WATER || head === WATER || below === WATER;
+
+    let c = wet ? waterCost : 0;
     if (feet === UNKNOWN || head === UNKNOWN) c += o.unknownCost;
 
-    if (below === SOLID) return c;
-    if (below === WATER) return c + o.waterCost;
+    if (below === SOLID || below === WATER) return c;
     if (below === UNKNOWN) return c + o.unknownCost;
     return null; // nothing underfoot
 }
+
+export { WATER as WATER_CLASS, SOLID as SOLID_CLASS, AIR as AIR_CLASS, UNKNOWN as UNKNOWN_CLASS, HAZARD as HAZARD_CLASS };
 
 /** Cost of tunnelling into a cell we cannot otherwise occupy, or null if we must not. */
 function digCostAt(ctx, x, y, z) {
@@ -243,6 +285,14 @@ export function planPath(bot, goal, opts = {}) {
         // Stay inside the planning window; beyond it the world data is stale or absent anyway.
         if (Math.abs(cur.x - s.x) > o.planRange || Math.abs(cur.z - s.z) > o.planRange) continue;
 
+        // Charged once, on the dry -> wet transition. What makes a river expensive is getting in
+        // and out of it, not the metres in between: at 0.098 b/t the swimming itself is fast, but
+        // entering costs momentum and leaving needs `outOfLiquidImpulse` to fire against a bank.
+        // Pricing it per-cell instead would make a wide ocean look proportionally reasonable.
+        const curWet = isWet(ctx, cur.x, cur.y, cur.z);
+        const entryFor = (x, y, z) =>
+            (o.swimEnabled && !curWet && isWet(ctx, x, y, z)) ? o.waterEntryCost : 0;
+
         for (const [dx, dz, base] of NEIGHBOURS) {
             const nx = cur.x + dx, nz = cur.z + dz;
             const diagonal = dx !== 0 && dz !== 0;
@@ -255,13 +305,13 @@ export function planPath(bot, goal, opts = {}) {
 
             // same level
             const level = standCost(ctx, nx, cur.y, nz);
-            if (level !== null) { relax(cur, nx, cur.y, nz, base + level); continue; }
+            if (level !== null) { relax(cur, nx, cur.y, nz, base + level + entryFor(nx, cur.y, nz)); continue; }
 
             // step up one (AutoJump does the work); cardinal only, diagonal hops are unreliable
             if (!diagonal && o.stepUp > 0) {
                 const up = standCost(ctx, nx, cur.y + 1, nz);
                 if (up !== null && classify(ctx, cur.x, cur.y + 2, cur.z) !== SOLID) {
-                    relax(cur, nx, cur.y + 1, nz, base + o.climbCost + up);
+                    relax(cur, nx, cur.y + 1, nz, base + o.climbCost + up + entryFor(nx, cur.y + 1, nz));
                     continue;
                 }
             }
@@ -277,7 +327,11 @@ export function planPath(bot, goal, opts = {}) {
             let dropped = false;
             for (let d = 1; !entryBlocked && d <= o.maxDrop; d++) {
                 const down = standCost(ctx, nx, cur.y - d, nz);
-                if (down !== null) { relax(cur, nx, cur.y - d, nz, base + d * o.dropCost + down); dropped = true; break; }
+                if (down !== null) {
+                    relax(cur, nx, cur.y - d, nz, base + d * o.dropCost + down + entryFor(nx, cur.y - d, nz));
+                    dropped = true;
+                    break;
+                }
                 if (classify(ctx, nx, cur.y - d, nz) === SOLID) break; // hit ground we can't stand in
             }
             if (dropped) continue;
@@ -477,11 +531,16 @@ export async function followPath(bot, path, opts = {}) {
             // an XZ-only test discards a "drop down 3" waypoint the moment the bot is standing
             // above it, so the bot then steers at the waypoint *after* the drop and walks
             // straight into the cliff face instead of stepping off it.
+            // Buoyancy carries the bot up and it overshoots, so waypoints need a wider catchment
+            // while swimming than while walking.
+            const wet = bot.entity.isInWater === true;
+            const arriveXZ = wet ? Math.max(o.arriveXZ, 1.2) : o.arriveXZ;
+
             while (i < path.length) {
                 const wp = path[i];
                 const dxz = Math.hypot(wp.x - p.x, wp.z - p.z);
                 const dy = p.y - wp.y;
-                if (dxz <= o.arriveXZ && dy <= 1.2 && dy >= -0.6) { i++; continue; }
+                if (dxz <= arriveXZ && dy <= 1.2 && dy >= -0.6) { i++; continue; }
                 break;
             }
             if (i >= path.length) break;
@@ -505,8 +564,12 @@ export async function followPath(bot, path, opts = {}) {
             // Sprint only when the way ahead is genuinely open; sprinting into a step wastes
             // the jump and bounces the bot backwards.
             if (o.sprint) {
+                // In water there is no step to bounce off, so the "is the way flat" gate does not
+                // apply - just hold sprint. It is a no-op in the library's fluid branch, but it
+                // is what SwimAssist keys the vanilla-parity sprint-swim boost off, and near the
+                // surface the bot spends part of each tick in the air branch where it does apply.
                 const flat = aim > i && Math.hypot(target.x - p.x, target.z - p.z) > 3;
-                bot.setControlState('sprint', flat);
+                bot.setControlState('sprint', wet || flat);
             }
 
             if (o.debug && (Date.now() - dbgAt) > 1000) {
@@ -525,6 +588,13 @@ export async function followPath(bot, path, opts = {}) {
                 hops = 0;
             } else if (Date.now() - stallSince > o.waypointMs) {
                 break; // not converging; let the caller replan
+            } else if (wet) {
+                // No hopping, no digging while afloat. Jump is buoyancy in water, not
+                // propulsion, so pulsing it makes the bot bob instead of advance; and neither
+                // mining nor placing works while floating, for the same reason pillaring does
+                // not. SwimAssist owns the jump key here - followPath must not touch it.
+                // Steering plus held-forward is the whole locomotion story in water.
+                lastProgress = Date.now();
             } else if (o.digWhenPinned && Date.now() - stallSince > o.pinnedMs && hops >= 2) {
                 // Genuinely pinned against a block face: hopping cannot help, and the planner
                 // already priced a dig move here. Mine the obstruction rather than grinding.

@@ -1,5 +1,6 @@
 import * as world from '../library/world.js';
 import * as skills from '../library/skills.js';
+import * as swim from '../library/swim.js';
 import * as mc from '../../utils/mcdata.js';
 import { getCommandDocs } from './index.js';
 import convoManager from '../conversation.js';
@@ -27,6 +28,20 @@ export const queryList = [
             res += `\n- Health: ${Math.round(bot.health)} / 20`;
             res += `\n- Hunger: ${Math.round(bot.food)} / 20`;
             res += `\n- Biome: ${world.getBiomeName(bot)}`;
+            // Only while wet, so the normal prompt costs nothing. Air matters urgently or not
+            // at all, and the model cannot see oxygen any other way.
+            if (swim.inWater(bot)) {
+                res += `\n- In water: ${swim.isSubmerged(bot) ? 'SUBMERGED' : 'at surface'}, Air: ${swim.oxygen(bot)} / 20`;
+                // Buoyancy state, because "the bot will not rise" is otherwise undiagnosable
+                // from outside: it looks identical whether the assist is off, stuck in sink,
+                // or holding jump against a ceiling.
+                const sa = bot.swimAssist;
+                if (sa) res += ` [assist: ${sa.stats.mode}, jump=${sa.stats.holdingJump}, boost=${sa.stats.boosted}]`;
+                // The PHYSICS flag, not our block-name fallback. If these disagree, every water
+                // control is a no-op: prismarine-physics applies neither water movement nor
+                // ground acceleration, and the bot sits at vel=0 with the keys held.
+                res += ` [physics.isInWater=${bot.entity.isInWater} vel.y=${bot.entity.velocity.y.toFixed(3)}]`;
+            }
             let weather = "Clear";
             if (bot.rainState > 0)
                 weather = "Rain";

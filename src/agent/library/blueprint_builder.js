@@ -397,6 +397,28 @@ export async function buildBlueprint(agent, filePath, origin) {
             }
         }
 
+        // foundation: underpin every ground-layer cell down to real ground (max 8 deep) so
+        // the base never floats - natural terrain is never flat enough for a 32x31 footprint
+        let foundationPlaced = 0;
+        for (const p of pass1.filter(q => q.y === 0)) {
+            const top = new Vec3(origin.x + p.x, origin.y - 1, origin.z + p.z);
+            let groundY = null;
+            for (let depth = 0; depth < 8; depth++) {
+                const b = bot.blockAt(top.offset(0, -depth, 0));
+                if (!b) break;
+                if (b.boundingBox === 'block') { groundY = top.y - depth; break; }
+            }
+            if (groundY === null || groundY === top.y) continue;
+            for (let y = groundY + 1; y <= top.y; y++) {
+                const res = await placeOne(bot, new Vec3(top.x, y, top.z),
+                    { name: 'cobblestone', properties: {} });
+                if (res.ok && !res.skipped) foundationPlaced++;
+                if (foundationPlaced % 25 === 0)
+                    writeStatus(agent, { phase: 'foundation', placed: foundationPlaced, total: buildable.length });
+            }
+        }
+        if (foundationPlaced) console.log(`[builder] foundation: ${foundationPlaced} support blocks placed`);
+
         for (const [passName, list] of [['pass1', pass1], ['pass2', pass2]]) {
             for (const p of list) {
                 if (bot.interrupt_code) throw new Error('interrupted');

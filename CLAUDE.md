@@ -482,7 +482,10 @@ ones that fight an existing rule.
 ## Web UI
 
 - **MindServer**: http://localhost:8080 (`mindserver_host_public: true` is set, binds 0.0.0.0)
-- **From a phone via Tailscale**: http://cbx3.tail873622.ts.net:8080 (viewer :3000 works too)
+- **From a phone via Twingate**: connector `twingate-abiding-jerboa` runs on this host
+  (network=host). Add a Resource in the Twingate admin for this machine (`cbx3` / LAN IP)
+  with ports 8080 + 3000, assign it to your user, then open http://cbx3:8080 in the phone's
+  browser with the Twingate app connected. (Tailscale was tried first and torn down.)
 - **3D Viewer**: http://localhost:3000 (per agent: 3001, 3002...)
 - **Map**: http://localhost:8090 (run `./regenerate_map.sh` first)
 

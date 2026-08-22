@@ -104,10 +104,14 @@ async function goNear(bot, P, reach = 3.0) {
     return eyeDist() <= 4.6;
 }
 
-// Placement fails server-side if the bot's body occupies the destination cell - step aside.
+// Placement fails server-side if the bot's body occupies OR nearly touches the destination
+// cell (skills.placeBlock's 1.1-block rule, learned the hard way) - step aside.
 async function stepOff(bot, P) {
     const feet = bot.entity.position.floored();
-    if (!feet.equals(P) && !feet.offset(0, 1, 0).equals(P)) return;
+    const center = P.offset(0.5, 0.5, 0.5);
+    const tooClose = bot.entity.position.distanceTo(center) < 1.1
+        || bot.entity.position.offset(0, 1, 0).distanceTo(center) < 1.1;
+    if (!feet.equals(P) && !feet.offset(0, 1, 0).equals(P) && !tooClose) return;
     for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [-1, -1]]) {
         const t = feet.offset(dx, 0, dz);
         const b = bot.blockAt(t), head = bot.blockAt(t.offset(0, 1, 0)), below = bot.blockAt(t.offset(0, -1, 0));
@@ -132,11 +136,18 @@ async function waitForBlock(bot, P, ms = 8000) {
 
 async function equip(bot, itemName) {
     if (bot.heldItem?.name === itemName) return true;
-    const item = mc.makeItem(itemName, 1);
-    if (!item) return false;
     try {
-        await bot.creative.setInventorySlot(36, item);
-        await bot.setQuickBarSlot(0);
+        // the proven skills.placeBlock path: creative-write the slot, then a real
+        // bot.equip so the SERVER's held-item state is synced. A raw hotbar write can
+        // leave the server seeing an empty hand - every placement then times out, except
+        // during streaks of the same block where a previous equip still held.
+        let item = bot.inventory.findInventoryItem(itemName);
+        if (!item) {
+            await bot.creative.setInventorySlot(36, mc.makeItem(itemName, 1));
+            item = bot.inventory.findInventoryItem(itemName);
+        }
+        if (!item) return false;
+        await bot.equip(item, 'hand');
         return true;
     } catch (e) {
         console.log(`[builder] equip ${itemName} failed: ${e.message}`);
@@ -219,34 +230,38 @@ async function placeOne(bot, P, p) {
         return { ok: false, why: `no solid neighbor (self=${bot.blockAt(P)?.name} below=${nb(0,-1,0)} above=${nb(0,1,0)} n=${nb(0,0,-1)} s=${nb(0,0,1)} w=${nb(-1,0,0)} e=${nb(1,0,0)})` };
     }
 
-    if (!(await goNear(bot, P))) return { ok: false, why: 'out of reach (no walkable route)' };
+    // ---- auto angle, by POSITION not by forced look ----
+    // Modern servers (1.20.2+ interaction validation, which this one has) verify that the
+    // click is plausible from the player's eye: a look ray that never intersects the
+    // clicked face gets the placement silently rejected (observed: 94% blockUpdate
+    // timeouts with a horizontal forced yaw). A human places east-facing stairs by
+    // standing WEST of the cell and looking down-east at the click point - yaw comes from
+    // where you stand. So: approach from the side opposite the desired look direction,
+    // then genuinely look at the click point; orientation and validation both fall out.
+    const look = lookVecFor(p);
+    const props = p.properties || {};
+    let approach = P;
+    if (look) {
+        approach = P.minus(new Vec3(Math.round(look.x * 2), 0, Math.round(look.z * 2)));
+    } else if (SIDE_FACES.includes(choice.faceName)) {
+        approach = P.plus(new Vec3(choice.faceVec.x * 2, 0, choice.faceVec.z * 2)); // in front of the clicked face
+    }
+    if (!(await goNear(bot, approach)) && !(await goNear(bot, P)))
+        return { ok: false, why: 'out of reach (no walkable route)' };
     await stepOff(bot, P);
 
     const itemName = itemNameFor(p.name);
     if (!(await equip(bot, itemName))) return { ok: false, why: `no item ${itemName}` };
 
-    // ---- auto angle ----
-    const eye = bot.entity.position.offset(0, 1.62, 0);
-    const look = lookVecFor(p);
-    const props = p.properties || {};
-    if (look) {
-        let pitchY = 0;
-        await bot.lookAt(eye.plus(look.scaled(4)).offset(0, pitchY, 0), true);
-    } else if (props.facing === 'up') {
-        await bot.lookAt(eye.offset(0, -3, 0.01), true);   // steep down -> facing=up (barrels)
-    } else if (props.facing === 'down') {
-        await bot.lookAt(eye.offset(0, 3, 0.01), true);
-    } else {
-        const clickPoint = choice.ref.position.offset(
-            0.5 + choice.faceVec.x * 0.5, 0.5 + choice.faceVec.y * 0.5, 0.5 + choice.faceVec.z * 0.5);
-        await bot.lookAt(clickPoint, true);
-    }
-
     try {
-        const opts = { forceLook: 'ignore', swingArm: 'right' };
+        // default forceLook: the library looks at the (half-adjusted) click point itself,
+        // which passes validation; our standing side supplies the yaw for orientation
+        const opts = { swingArm: 'right' };
         if (choice.half) opts.half = choice.half;
         await bot._placeBlockWithOptions(choice.ref, choice.faceVec, opts);
     } catch (e) {
+        // the API can throw after a successful placement - re-read before believing it
+        await new Promise(r => setTimeout(r, 200));
         const now = bot.blockAt(P);
         if (!now || now.name !== p.name) return { ok: false, why: e.message };
     }

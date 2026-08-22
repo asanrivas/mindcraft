@@ -30,6 +30,7 @@ each rule, and what is still open — lives in **[docs/README.md](docs/README.md
 | [docs/SWIMMING.md](docs/SWIMMING.md) | Water, diving, oxygen, SwimAssist, the `drowning` mode |
 | [docs/LLM_FAILOVER.md](docs/LLM_FAILOVER.md) | The backup brain and the circuit breaker |
 | [docs/WORLD_TOOLS.md](docs/WORLD_TOOLS.md) | Seed/biome lookup, operator teleport, gamemode, block states |
+| [docs/CREATIVE_MODE.md](docs/CREATIVE_MODE.md) | Creative inventory, the web item picker, and the item-id check |
 | [docs/TESTING.md](docs/TESTING.md) | Running the suites, and driving the live bot without corrupting your results |
 
 Note `docs/` is gitignored — it does not travel with the repo.
@@ -413,6 +414,27 @@ An earlier driver re-sent `!travel` on a fixed timer and spent 97 minutes interr
 in-flight leg - which reads as "the bot is stuck" when it is not. Also avoid large
 `!serverFill` operations near the bot: those repeatedly dropped it into pits, buried it in
 sand, and opened a cave under it.
+
+## Creative mode
+
+Full story: **[docs/CREATIVE_MODE.md](docs/CREATIVE_MODE.md)**.
+
+`!creativeGive(item, count)`, `!creativeKit(building|mining|survival|all)`, `!creativeClear`,
+`!creativeStatus`, `!creativeIdSweep`. A web item picker lives behind the **Items** button on
+each agent card (`public/js/creative-panel.js`) and composes those same commands.
+
+- **mineflayer DOES support creative inventory.** `bot.creative` is a core auto-loaded plugin.
+  No `/give`, no operator permission, no chat round-trip.
+- **Every creative command refuses outside creative mode**, so the survival work stays honest.
+- **Never pass `waitTimeout: 0` to `setInventorySlot`.** mineflayer leaks its per-slot busy flag
+  on that path and every later write to that slot throws for the life of the process. It bricked
+  all 37 slots once. `WRITE_ACK_MS = 60` is a correctness constant, not a tuning knob.
+- **Item ids ride the wire as numbers**, resolved from 1.21.11 tables against a 26.1 server. A
+  registry shift would silently produce the wrong item and **no in-process check can see it** —
+  the server sends no ack, so our own echo confirms itself. Verify server-side by NAME:
+  `!creativeIdSweep` then `mc "clear andy <item> 0"`. Swept 2026-08-23, ids 150–1458, all correct.
+- **RCON truncates long NBT.** `data get entity andy Inventory` cut off at ~120 chars and made a
+  full bag look empty, which read as a bug in working code. Use `clear <player> <item> 0`.
 
 ## World-edit guards (do not route around these)
 

@@ -781,6 +781,17 @@ const Components = {
             onClick: () => window.restartAgent(agent.name)
         });
 
+        // Opens the creative item picker. It composes !creativeGive/!creativeKit and sends them
+        // down the existing chat channel, so it needs the agent in game and nothing else.
+        const creativeBtn = this.Button({
+            text: 'Items',
+            variant: 'muted',
+            size: 'sm',
+            id: `creativeBtn-${agent.name}`,
+            disabled: !agent.in_game,
+            onClick: () => window.openCreativePanel(agent.name)
+        });
+
         const connectBtn = this.Button({
             text: agent.in_game ? 'Disconnect' :
                  (agent.socket_connected ? 'Connecting...' : 'Connect'),
@@ -806,6 +817,7 @@ const Components = {
 
         controlsButtons.appendChild(stopBtn);
         controlsButtons.appendChild(stayBtn);
+        controlsButtons.appendChild(creativeBtn);
         controlsButtons.appendChild(restartBtn);
         controlsButtons.appendChild(connectBtn);
         controlsButtons.appendChild(removeBtn);

@@ -35,6 +35,7 @@ enough not to need its own file.
 
 | Doc | What it covers |
 |---|---|
+| [CREATIVE_MODE.md](CREATIVE_MODE.md) | Native creative inventory, the web item picker, the `waitTimeout: 0` mineflayer bug, and how to check item ids against a newer server |
 | [TESTING.md](TESTING.md) | Unit suites, driving the live bot over the MindServer socket, and the procedural traps that produce wrong readings |
 | [SERVICE_MANAGEMENT.md](SERVICE_MANAGEMENT.md) | systemd service control |
 | [DIAGNOSTIC_COMMANDS.sh](DIAGNOSTIC_COMMANDS.sh) · [verify_build.py](verify_build.py) | Diagnostic helpers |

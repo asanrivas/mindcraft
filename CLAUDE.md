@@ -4,14 +4,15 @@
 
 ```bash
 # Start/Stop
-sudo systemctl restart mindcraft-andy    # Restart bot
-sudo systemctl status mindcraft-andy     # Check status
-tail -f /home/azureuser/mindcraft/logs/andy-service.log  # View logs
+systemctl --user restart mindcraft       # Restart bot
+tailgate                                 # LIVE combined view: bot + server console
+tail -f logs/service.log                 # Bot log only
 
-# RCON commands (mc alias)
+# RCON server console (mc -> tools/rcon.mjs; password in ~/.config/mc-rcon.env)
 mc "msg andy <message>"                  # Send message to bot
 mc "give andy cobblestone 640"           # Give items
 mc "tp andy 1500 65 -900"                # Teleport
+mc "difficulty normal"                   # World state (set 2026-08-22; was Peaceful)
 
 # Development
 bun install && bun run main.js           # Start manually

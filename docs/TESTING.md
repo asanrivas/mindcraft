@@ -33,7 +33,14 @@ bun run test        # all four suites
 
 ## 2. Driving the live bot
 
-There is no RCON on this machine. Drive Andy over the MindServer socket instead:
+Two channels exist:
+
+**RCON — server console** (`mc "..."`), for world state: time, difficulty, summon, give, tp.
+`~/.local/bin/mc` wraps `tools/rcon.mjs` (a dependency-free bun RCON client); the password
+lives in `~/.config/mc-rcon.env` (mode 600), read from the server container's
+server.properties. `mc "msg andy <text>"` also reaches Andy as chat.
+
+**MindServer socket** — for driving Andy as a user would:
 
 ```js
 // scratchpad/say.mjs   —   bun say.mjs "!swimProbe" 120
@@ -117,12 +124,20 @@ ceiling. Three numbers settled it in one reading:
 `jump=true` with `vel.y=-0.005` is sinking with the key supposedly held — a state desync, not a
 physics problem. Add the diagnostic **before** the third wrong hypothesis, not after.
 
-## 5. Service control
+## 5. Service control and live visibility
 
 ```bash
 systemctl --user restart mindcraft
-tail -f logs/service.log
+tailgate            # combined live view: bot (cyan) + server console (yellow), alerts in red
+tailgate bot        # just Andy's brain
+tailgate server     # just the server console
+tailgate chat       # just in-game chat
 ```
+
+`~/.local/bin/tailgate` merges `logs/service.log` with `docker logs -f geyser-minecraftbe-1`,
+strips the console's cursor-control junk and our own RCON thread churn, and highlights
+errors/deaths/drowning. The `-u` on every sed is load-bearing: without it the pipeline
+buffers and the "live" view shows nothing for minutes.
 
 Restarting resets in-memory state (SwimAssist mode, breaker state, steering is reloaded from
 disk). If you are debugging live state, capture it *before* restarting.

@@ -8,7 +8,7 @@
  *   !serverSetblock("snow_block", -2572, 63, 5269)   -> overwrote its own bed
  *   !serverFill snow_block -2573 63 5268 -> -2571 65 5270   -> solid fill over its own body
  */
-import { checkEdit, isProtectedName, isTrappingBlock, regionVolume, inRegion }
+import { checkEdit, isProtectedName, isTrappingBlock, regionVolume, inRegion, isShellCell, cellFate }
     from '../src/agent/library/world_guard.js';
 
 let failures = 0;
@@ -140,6 +140,107 @@ const emptyWorld = () => 'stone';
     check('oversized region not scanned', reads, 0);
     check('oversized flagged', r.oversized, true);
     check('oversized not silently refused', r.ok, true);
+}
+
+// --- UNLOADED CHUNKS: unknown must never read as safe -------------------------------------------
+// Live catch: with the bot 200 blocks away the chunk was unloaded, blockAt returned null, and a
+// setblock destroyed a bed the guard had refused from close range minutes earlier.
+{
+    const r = checkEdit({
+        a: { x: 4527, y: 68, z: 4855 }, b: { x: 4527, y: 68, z: 4855 },
+        blockType: 'snow_block', getName: () => null,
+    });
+    check('unloaded chunk refused', r.ok, false);
+    check('unloaded counted', r.unknownCells, 1);
+    check('unloaded reason is explicit', /cannot check that area/.test(r.reason), true);
+}
+{
+    // A known protected hit still wins the message - it is the more specific answer.
+    const world = (x) => (x === 5) ? 'red_bed' : null;
+    const r = checkEdit({
+        a: { x: 4, y: 0, z: 0 }, b: { x: 6, y: 0, z: 0 },
+        blockType: 'stone', getName: world,
+    });
+    check('known bed beats unknown message', /red_bed/.test(r.reason), true);
+}
+{
+    // Fully loaded ordinary terrain is untouched by this rule.
+    const r = checkEdit({
+        a: { x: 0, y: 0, z: 0 }, b: { x: 2, y: 0, z: 2 },
+        blockType: 'stone', getName: emptyWorld,
+    });
+    check('loaded terrain still allowed', r.ok, true);
+    check('no unknown cells', r.unknownCells, 0);
+}
+
+// --- FILL MODES: hollow paints the SHELL with blockType, not air ------------------------------
+// Substituting 'air' for the whole region disabled the entombment check on exactly the fills
+// that can bury the bot - the accident this guard exists to prevent.
+check('shell cell detected', isShellCell({x:0,y:0,z:0}, {x:0,y:0,z:0}, {x:4,y:4,z:4}), true);
+check('interior cell not shell', isShellCell({x:2,y:2,z:2}, {x:0,y:0,z:0}, {x:4,y:4,z:4}), false);
+check('hollow shell gets blockType', cellFate({x:0,y:0,z:0}, {x:0,y:0,z:0}, {x:4,y:4,z:4}, 'hollow'), 'blockType');
+check('hollow interior gets air', cellFate({x:2,y:2,z:2}, {x:0,y:0,z:0}, {x:4,y:4,z:4}, 'hollow'), 'air');
+check('outline interior untouched', cellFate({x:2,y:2,z:2}, {x:0,y:0,z:0}, {x:4,y:4,z:4}, 'outline'), 'untouched');
+check('replace everything gets blockType', cellFate({x:2,y:2,z:2}, {x:0,y:0,z:0}, {x:4,y:4,z:4}, 'replace'), 'blockType');
+
+{
+    // Bot standing ON the shell of its own hollow fill: encased in stone. Must refuse.
+    const r = checkEdit({
+        a: { x: 10, y: 64, z: 10 }, b: { x: 20, y: 70, z: 20 },
+        blockType: 'stone', getName: emptyWorld, mode: 'hollow',
+        botPos: { x: 10.5, y: 64.0, z: 15.5 },      // x === x1 -> shell
+    });
+    check('hollow shell entombment refused', r.ok, false);
+    check('hollow shell entombs flagged', r.entombs, true);
+}
+{
+    // Bot in the INTERIOR of a hollow fill: interior becomes air. Perfectly safe, must allow.
+    const r = checkEdit({
+        a: { x: 10, y: 64, z: 10 }, b: { x: 20, y: 70, z: 20 },
+        blockType: 'stone', getName: emptyWorld, mode: 'hollow',
+        botPos: { x: 15.5, y: 66.0, z: 15.5 },
+    });
+    check('hollow interior allowed', r.ok, true);
+}
+{
+    // outline leaves the interior alone, so a bot in the middle must NOT be refused.
+    const r = checkEdit({
+        a: { x: 10, y: 64, z: 10 }, b: { x: 20, y: 70, z: 20 },
+        blockType: 'stone', getName: emptyWorld, mode: 'outline',
+        botPos: { x: 15.5, y: 66.0, z: 15.5 },
+    });
+    check('outline interior allowed', r.ok, true);
+}
+{
+    // ...and a protected block in an outline's untouched interior is not destroyed either.
+    const world = (x, y, z) => (x === 15 && y === 66 && z === 15) ? 'chest' : 'stone';
+    const r = checkEdit({
+        a: { x: 10, y: 64, z: 10 }, b: { x: 20, y: 70, z: 20 },
+        blockType: 'stone', getName: world, mode: 'outline',
+    });
+    check('outline spares interior chest', r.ok, true);
+}
+
+// --- the hit cap must break ALL loops, not just the innermost ----------------------------------
+{
+    const allBeds = () => 'red_bed';
+    const r = checkEdit({
+        a: { x: 0, y: 0, z: 0 }, b: { x: 29, y: 29, z: 29 },
+        blockType: 'stone', getName: allBeds,
+    });
+    check('hit list capped at 8', r.protectedHits.length, 8);
+    check('truncation flagged', r.truncated, true);
+    check('refusal string stays short', r.reason.length < 600, true);
+}
+
+// --- oversized regions must WARN, not pass silently --------------------------------------------
+{
+    const r = checkEdit({
+        a: { x: 0, y: 0, z: 0 }, b: { x: 199, y: 199, z: 199 },
+        blockType: 'stone', getName: emptyWorld, maxScan: 4096,
+    });
+    check('oversized carries a warning', typeof r.warning === 'string' && r.warning.length > 0, true);
+    check('warning says it was NOT checked', /NOT checked/.test(r.warning), true);
 }
 
 if (failures) {

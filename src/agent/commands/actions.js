@@ -760,12 +760,15 @@ export const actionsList = [
             // Refuse edits that destroy something irreplaceable or bury the bot. A model cannot
             // see that the cell it is about to overwrite holds its own bed; the edit itself has
             // to notice. See world_guard.js for the night this cost.
+            // Pass the MODE, never a substituted blockType: hollow paints the shell with
+            // blockType and only the interior with air, so 'air' here disabled the entombment
+            // check on exactly the fills that can bury the bot.
             const guard = worldGuard.checkEditForBot(agent.bot,
-                { x: x1, y: y1, z: z1 }, { x: x2, y: y2, z: z2 },
-                mode === 'hollow' ? 'air' : blockType);
+                { x: x1, y: y1, z: z1 }, { x: x2, y: y2, z: z2 }, blockType, { mode });
             if (!guard.ok) {
                 return `REFUSED: ${guard.reason} Move it, or use !forceFill if you really mean it.`;
             }
+            const guardNote = guard.warning ? ` [GUARD: ${guard.warning}]` : '';
 
             const command = `/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} ${mode}`;
             agent.bot.chat(command);
@@ -774,6 +777,7 @@ export const actionsList = [
             // requested block count would claim success even when the command silently
             // failed (no operator permission, unloaded chunks, bad block name).
             await new Promise(r => setTimeout(r, 600));
+            if (guardNote) console.warn(`[worldGuard]${guardNote}`);
             if (mode === 'replace' || mode === 'keep') {
                 const check = skills.verifyRegion(agent.bot,
                     Math.min(Math.floor(x1), Math.floor(x2)), Math.min(Math.floor(z1), Math.floor(z2)),
@@ -851,7 +855,7 @@ export const actionsList = [
         description: 'Shoot a mob with bow or crossbow from range. Refuses players. Needs arrows.',
         params: {
             'mob_type': { type: 'string', description: 'The mob to shoot, e.g. "zombie", "skeleton".' },
-            'weapon': { type: 'string', description: '"bow", "crossbow" or "auto".' }
+            'weapon': { type: 'string', description: '"bow", "crossbow" or "auto".', optional: true }
         },
         perform: runAsAction(async (agent, mob_type, weapon) => {
             const w = ['bow', 'crossbow', 'auto'].includes(String(weapon)) ? weapon : 'auto';
@@ -868,12 +872,15 @@ export const actionsList = [
             'count': { type: 'int', description: 'How many.', domain: [1, 640] }
         },
         perform: runAsAction(async (agent, item, count) => {
-            const line = await runServerCommand(agent.bot, `/give ${agent.name} ${item} ${Math.floor(count)}`,
-                /gave|permission|Unknown|No such|Invalid/i, 5000);
-            await new Promise(r => setTimeout(r, 500));
+            // No runServerCommand here: its reply reader drops any line containing the bot's
+            // username (to ignore the agent's own chat echo), and "Gave 5 [Diamond] to andy"
+            // always contains it - so every give stalled the full 5s timeout and reported
+            // "no confirmation" even on success. The inventory recount is the real verification.
+            agent.bot.chat(`/give ${agent.name} ${item} ${Math.floor(count)}`);
+            await new Promise(r => setTimeout(r, 700));
             const held = agent.bot.inventory.items().filter(i => i.name === item)
                 .reduce((n, i) => n + i.count, 0);
-            return `GIVE: now holding ${held} ${item}${line ? ` (server said: ${line})` : ''}.`;
+            return `GIVE: now holding ${held} ${item}.`;
         }, false, 1)
     },
     {

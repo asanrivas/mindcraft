@@ -64,10 +64,25 @@ export const FRIENDLY_ENTITIES = [
  * @param {Entity} entity - the entity to check
  * @returns {boolean} true if the entity is friendly
  */
+/**
+ * Matched EXACTLY, plus a short list of genuinely friendly compound names.
+ *
+ * The substring version classified every HOSTILE piglin as friendly: 'piglin',
+ * 'piglin_brute' and 'zombified_piglin' all contain 'pig'; 'zombie_horse' and 'skeleton_horse'
+ * contain 'horse'. In the Nether that made the bot refuse to shoot anything with a piglin
+ * anywhere near the firing line, and it is the same substring-matching class of bug the repo
+ * already carries a scar from ("sandstone".includes("sand") froze the agent for 11 minutes).
+ */
+const FRIENDLY_COMPOUND = new Set([
+    'trader_llama', 'skeleton_horse', 'zombie_horse',   // horses: not hostile, just undead mounts
+    'snow_golem', 'wandering_trader', 'villager_golem',
+]);
+
 export function isFriendly(entity) {
     if (!entity || !entity.name) return false;
     const entityName = entity.name.toLowerCase();
-    return FRIENDLY_ENTITIES.some(name => entityName.includes(name));
+    if (FRIENDLY_COMPOUND.has(entityName)) return true;
+    return FRIENDLY_ENTITIES.includes(entityName);
 }
 
 export function initBot(username) {

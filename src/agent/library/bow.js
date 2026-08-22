@@ -8,10 +8,14 @@ import { isFriendly } from '../../utils/mcdata.js';
  * The load-bearing fact, read from mineflayer's inventory plugin: item use is ONE channel.
  * `bot.activateItem(offHand)` starts using whatever is in that hand, and `bot.deactivateItem()`
  * sends a single "released use item" packet that releases WHICHEVER item is in use - a bow
- * release and a shield lower are the same packet. So everything that uses the channel (bow
- * draw, crossbow charge, shield raise, auto-eat's consume) must go through one lock:
- * `bot.itemUseOwner`. Contention here is the same class of bug as the jump-key fights
- * documented in docs/SWIMMING.md - three separate incidents' worth.
+ * release and a shield lower are the same packet.
+ *
+ * `bot.itemUseOwner` is this module's lock over that channel. **It is currently honoured only
+ * here.** `skills.js` (eating, buckets) still calls `bot.activateItem()` directly, so an eat
+ * during a draw can still steal the channel and its cleanup can release our arrow. Making the
+ * lock real means routing every activateItem/deactivateItem call in the tree through it; until
+ * that happens this provides bow-vs-bow and bow-vs-shield exclusion only. Do not read the lock
+ * as a guarantee. Same class of bug as the jump-key contention in docs/SWIMMING.md.
  *
  * Crossbow semantics differ from bow and it is easy to get backwards:
  *   bow:      activate = start drawing, deactivate = FIRE.
@@ -22,9 +26,11 @@ import { isFriendly } from '../../utils/mcdata.js';
 const ARROW_ITEMS = ['arrow', 'spectral_arrow', 'tipped_arrow'];
 
 export function bowInfo(bot) {
-    const items = bot.inventory.items();
-    const held = (bot.heldItem && [bot.heldItem]) || [];
-    const all = items.concat(held);
+    // bot.inventory.items() covers slots 9-44, which ALREADY includes the hotbar and therefore
+    // bot.heldItem. Concatenating them double-counted the held stack, so a bot holding arrows
+    // reported twice the ammunition it had - and the VERIFIED line then reported a fictional
+    // arrow count.
+    const all = bot.inventory.items();
     return {
         bow: all.find(i => i.name === 'bow') || null,
         crossbow: all.find(i => i.name === 'crossbow') || null,
@@ -132,15 +138,31 @@ export async function shootAt(bot, target, weapon = 'auto', opts = {}) {
             return { fired: true, reason: 'fired', weapon: 'crossbow' };
         }
 
-        // Bow: draw, keep the aim fresh while charging, settle, release = fire.
+        // Aim BEFORE drawing. The previous order called activateItem() first and then bailed
+        // out with deactivateItem() on out-of-range or interrupt - but deactivateItem IS the
+        // release packet, so after ~3 ticks of draw that "abort" actually loosed a weak,
+        // unaimed arrow along a stale look while reporting `fired: false`. Establishing the
+        // firing solution first means the abort paths never touch the channel.
+        let aim = await aimAtEntity(bot, target, constants);
+        if (!aim) return { fired: false, reason: 'out_of_range' };
+        if (bot.interrupt_code) return { fired: false, reason: 'interrupted' };
+
         bot.activateItem();
         const chargeMs = opts.chargeMs ?? FULL_CHARGE_MS;
         const start = Date.now();
-        let aim = null;
         while (Date.now() - start < chargeMs - 150) {
-            if (bot.interrupt_code) { bot.deactivateItem(); return { fired: false, reason: 'interrupted' }; }
-            aim = await aimAtEntity(bot, target, constants);
-            if (!aim) { bot.deactivateItem(); return { fired: false, reason: 'out_of_range' }; }
+            // Once drawn, an early exit still has to release - so from here on, a bail is a
+            // SHOT, and it is reported as one rather than as a silent miss.
+            if (bot.interrupt_code) {
+                bot.deactivateItem();
+                return { fired: true, reason: 'released_early_interrupted', weapon: 'bow' };
+            }
+            const next = await aimAtEntity(bot, target, constants);
+            if (!next) {
+                bot.deactivateItem();
+                return { fired: true, reason: 'released_early_target_moved', weapon: 'bow' };
+            }
+            aim = next;
             await sleep(250);
         }
         // Final settle: nothing may move the look between here and the release.

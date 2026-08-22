@@ -68,6 +68,34 @@ export function inRegion(p, a, b) {
     return p.x >= r.x1 && p.x <= r.x2 && p.y >= r.y1 && p.y <= r.y2 && p.z >= r.z1 && p.z <= r.z2;
 }
 
+/** Is this cell on the outer shell of the region (as opposed to its interior)? */
+export function isShellCell(p, a, b) {
+    if (!inRegion(p, a, b)) return false;
+    const r = regionBounds(a, b);
+    return p.x === r.x1 || p.x === r.x2 || p.y === r.y1 || p.y === r.y2 || p.z === r.z1 || p.z === r.z2;
+}
+
+/**
+ * What a given cell becomes under a vanilla /fill mode.
+ *
+ * This distinction is load-bearing, not pedantry: `hollow` fills the SHELL with blockType and
+ * only the interior with air. Substituting 'air' for the whole region (the first version of
+ * this guard) meant a bot standing on the shell of its own hollow fill was encased in stone
+ * while the entombment check was skipped entirely - the precise accident the guard exists to
+ * prevent. `outline` is the mirror case: shell painted, interior untouched, so refusing
+ * because the bot sits in the untouched middle is a false alarm.
+ *
+ * @returns {'blockType'|'air'|'untouched'}
+ */
+export function cellFate(p, a, b, mode = 'replace') {
+    const shell = isShellCell(p, a, b);
+    switch (mode) {
+        case 'hollow':  return shell ? 'blockType' : 'air';
+        case 'outline': return shell ? 'blockType' : 'untouched';
+        default:        return 'blockType';   // replace, destroy, keep
+    }
+}
+
 /**
  * Decide whether an edit should be refused.
  *
@@ -81,23 +109,27 @@ export function inRegion(p, a, b) {
  *   @param {number}  [req.maxScan]   cells to inspect before giving up on the scan
  * @returns {{ok:boolean, reason:string|null, protectedHits:Array, entombs:boolean, hitsSpawn:boolean, scanned:number}}
  */
-export function checkEdit({ a, b, blockType, getName, botPos = null, spawnPos = null, maxScan = 32768 }) {
+export function checkEdit({ a, b, blockType, getName, botPos = null, spawnPos = null, maxScan = 32768, mode = 'replace' }) {
     const r = regionBounds(a, b);
     const volume = regionVolume(a, b);
-    const result = { ok: true, reason: null, protectedHits: [], entombs: false, hitsSpawn: false, scanned: 0 };
+    const result = { ok: true, reason: null, protectedHits: [], entombs: false, hitsSpawn: false,
+                     scanned: 0, oversized: false, warning: null, unknownCells: 0 };
 
     const filling = isTrappingBlock(blockType);
 
-    // Self-entombment: a solid fill over the cells the body occupies. Checked before the scan
-    // because it needs no block reads and is the most immediately fatal.
+    // Self-entombment: a trapping fill over the cells the body occupies. Checked before the scan
+    // because it needs no block reads and is the most immediately fatal. Mode-aware: only cells
+    // that actually receive blockType can bury us.
     if (filling && botPos) {
         const feet = { x: Math.floor(botPos.x), y: Math.floor(botPos.y), z: Math.floor(botPos.z) };
         const head = { x: feet.x, y: feet.y + 1, z: feet.z };
-        if (inRegion(feet, a, b) || inRegion(head, a, b)) {
+        const buried = [feet, head].some(c =>
+            inRegion(c, a, b) && cellFate(c, a, b, mode) === 'blockType');
+        if (buried) {
             result.entombs = true;
             result.ok = false;
             result.reason = `that would seal ${blockType} around me - I am standing inside the region `
-                + `(${feet.x}, ${feet.y}, ${feet.z}).`;
+                + `(${feet.x}, ${feet.y}, ${feet.z})${mode !== 'replace' ? ` (mode ${mode})` : ''}.`;
             return result;
         }
     }
@@ -118,24 +150,49 @@ export function checkEdit({ a, b, blockType, getName, botPos = null, spawnPos = 
     }
 
     if (volume > maxScan) {
-        // Too big to inspect. Say so rather than pretending it was checked.
-        result.reason = null;
+        // Too big to inspect. SAY SO rather than pretending it was checked - the largest fills
+        // are the ones most likely to sweep up a bed or a chest, so a silent pass here would
+        // exempt exactly the dangerous cases. Callers must surface `warning`.
         result.scanned = 0;
         result.oversized = true;
+        result.warning = `region is ${volume} cells (> ${maxScan}); protected blocks were NOT checked`;
         return result;
     }
 
+    const MAX_HITS = 8;
+    // Labelled break: an inner-only `break` left x/y iterating, so a large fill over a village
+    // accumulated hundreds of hits, all joined into the refusal string and handed to the LLM.
+    // This codebase already fights context exhaustion; a multi-kilobyte refusal is a hazard.
+    scan:
     for (let x = r.x1; x <= r.x2; x++) {
         for (let y = r.y1; y <= r.y2; y++) {
             for (let z = r.z1; z <= r.z2; z++) {
+                // 'outline' leaves the interior alone - do not refuse over blocks it never touches.
+                if (cellFate({ x, y, z }, a, b, mode) === 'untouched') continue;
                 const n = getName(x, y, z);
                 result.scanned++;
+                // UNKNOWN IS NOT SAFE. blockAt returns null outside the bot's loaded chunks,
+                // and /fill and /setblock act server-side regardless of what the bot can see.
+                // Measured: with the bot 200 blocks away, a setblock happily destroyed a bed
+                // the guard had refused to touch minutes earlier from close range. Same
+                // invariant the swimming code already carries - an unloaded chunk is a wall,
+                // never air.
+                if (n === null) { result.unknownCells++; continue; }
                 if (isProtectedName(n)) {
                     result.protectedHits.push({ name: n, x, y, z });
-                    if (result.protectedHits.length >= 8) break;
+                    if (result.protectedHits.length >= MAX_HITS) { result.truncated = true; break scan; }
                 }
             }
         }
+    }
+
+    // Cannot certify what we cannot see. Refuse rather than pretend, and point at the override.
+    if (result.unknownCells > 0 && !result.protectedHits.length) {
+        result.ok = false;
+        result.reason = `I cannot check that area - ${result.unknownCells} of ${result.scanned} `
+            + `cell(s) are outside my loaded chunks, so I cannot tell what is there. `
+            + `Go there first, or use the force variant if you have checked it yourself.`;
+        return result;
     }
 
     if (result.protectedHits.length) {
@@ -143,7 +200,8 @@ export function checkEdit({ a, b, blockType, getName, botPos = null, spawnPos = 
             .map(h => `${h.name} at (${h.x}, ${h.y}, ${h.z})`)
             .join(', ');
         result.ok = false;
-        result.reason = `that would destroy ${result.protectedHits.length} irreplaceable block(s): ${list}.`;
+        result.reason = `that would destroy ${result.protectedHits.length}${result.truncated ? '+' : ''} `
+            + `irreplaceable block(s): ${list}${result.truncated ? ', and more' : ''}.`;
     }
     return result;
 }

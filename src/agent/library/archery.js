@@ -99,6 +99,13 @@ export function solvePitch({ dist, dy = 0, speed = ARROW.speed, gravity = ARROW.
         if (pitch < -Math.PI / 2) pitch = -Math.PI / 2 + 0.01;
     }
 
+    // Re-check the residual. The loop can exit by exhausting its 12 iterations rather than by
+    // converging - and when the first probe returns null, dErr collapses and the fallback nudges
+    // by a fixed 0.02 rad per step, a total of 0.24 rad: nowhere near a solution. Returning that
+    // pitch anyway meant aiming several blocks wide and reporting a confident `fired: true`.
+    const finalErr = errAt(pitch);
+    if (finalErr === null || Math.abs(finalErr) > 0.35) return null;
+
     const sim = simulateShot(pitch, speed, { gravity, drag, maxTicks: 300 });
     const ticks = sim.ticksTo(dist);
     if (ticks === null) return null;

@@ -64,8 +64,14 @@ sock.on('data', (chunk) => {
         const body = acc.toString('utf8', 12, 4 + len - 2);
         acc = acc.subarray(4 + len);
 
+        // Gate on the ECHOED REQUEST ID, not on "first packet seen". Some servers emit an empty
+        // SERVERDATA_RESPONSE_VALUE before the auth reply; treating that as the auth response
+        // flipped stage to 'cmd' and sent the command unauthenticated, and the real auth-failure
+        // packet (id -1) then matched no branch and was dropped - so a wrong password produced
+        // an 8s timeout instead of "auth failed".
+        if (id === -1) { console.error('rcon: auth failed'); process.exit(1); }
         if (stage === 'auth') {
-            if (id === -1) { console.error('rcon: auth failed'); process.exit(1); }
+            if (id !== 1) continue;   // pre-auth chatter; keep waiting for our login echo
             stage = 'cmd';
             sock.write(frame(2, 2, command));
             // Sentinel: servers may split long responses across packets; an empty follow-up

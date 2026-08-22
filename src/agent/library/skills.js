@@ -502,13 +502,29 @@ export async function shootBow(bot, mobType, weapon = 'auto', maxShots = 12) {
     let fired = 0, lastReason = '';
     const t0 = Date.now();
 
+    // Confirm death by the ENTITY, never by absence from a radius query. A mob that takes one
+    // arrow and wanders past the search radius - or blinks out of bot.entities during a chunk
+    // update - would otherwise be reported as killed. In a codebase whose entire convention is
+    // "VERIFIED means read back from world state", inferring a kill from a failed lookup is a
+    // fabricated verification.
+    const targetId = target0.id;
+    let confirmedDead = false;
+    const onDeath = (entity) => { if (entity?.id === targetId) confirmedDead = true; };
+    bot.on('entityDead', onDeath);
+    try {
+
     for (let shot = 0; shot < maxShots; shot++) {
         if (bot.interrupt_code) { lastReason = 'interrupted'; break; }
         // Re-find each round: the entity object goes invalid on death or despawn.
-        const target = Object.values(bot.entities).find(e =>
-            e?.name === mobType && e.isValid !== false
-            && e.position.distanceTo(bot.entity.position) <= 40);
-        if (!target) { lastReason = fired > 0 ? 'target_down' : 'target_lost'; break; }
+        if (confirmedDead) { lastReason = 'target_down'; break; }
+        const target = bot.entities[targetId];
+        if (!target || target.isValid === false) {
+            // Gone from the entity table without a death event: it despawned, unloaded, or
+            // simply walked away. Say which we do NOT know rather than claiming a kill.
+            lastReason = confirmedDead ? 'target_down' : 'target_vanished';
+            break;
+        }
+        if (target.position.distanceTo(bot.entity.position) > 40) { lastReason = 'out_of_range'; break; }
 
         const r = await bowLib.shootAt(bot, target, weapon);
         lastReason = r.reason;
@@ -521,9 +537,13 @@ export async function shootBow(bot, mobType, weapon = 'auto', maxShots = 12) {
         await new Promise(s => setTimeout(s, 600)); // arrow flight + server-side damage tick
     }
 
+    } finally {
+        bot.removeListener('entityDead', onDeath);
+    }
+
     await pickupNearbyItems(bot); // recover arrows and drops
     const after = bowLib.bowInfo(bot).arrows;
-    const downed = lastReason === 'target_down';
+    const downed = confirmedDead;
     // Returned, not log()ed: runAsAction concatenates bot.output with the return value, so
     // logging AND returning printed the line once and then a bare "true" after it.
     return `VERIFIED SHOOT: ${downed ? `killed ${mobType}` : `${mobType} NOT confirmed dead (${lastReason})`}, `

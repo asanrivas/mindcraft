@@ -2,6 +2,7 @@ import * as skills from '../library/skills.js';
 import * as swim from '../library/swim.js';
 import { measureSwim, formatProbe } from '../library/swim_probe.js';
 import * as worldGuard from '../library/world_guard.js';
+import * as creative from '../library/creative.js';
 import { Vec3 } from 'vec3';
 import fs from 'fs';
 import settings from '../settings.js';
@@ -743,6 +744,20 @@ export const actionsList = [
         }, true, 600)  // resume=true allows resuming after interruption
     },
     {
+        name: '!buildBlueprint',
+        description: 'Hand-build a blueprint placements JSON block by block: fly to each position (creative), auto-compute the look angle and click face, place with own hands. No server /setblock.',
+        params: {
+            'file': { type: 'string', description: 'Path to the placements JSON, relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
+            'x': { type: 'int', description: 'World X of the blueprint origin (its local 0,0,0 min-corner).' },
+            'y': { type: 'int', description: 'World Y of the blueprint origin.' },
+            'z': { type: 'int', description: 'World Z of the blueprint origin.' }
+        },
+        perform: runAsAction(async (agent, file, x, y, z) => {
+            const { buildBlueprint } = await import('../library/blueprint_builder.js');
+            return await buildBlueprint(agent, file, new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)));
+        }, false, 240)  // minutes - a few thousand blocks at ~1s each needs hours of headroom
+    },
+    {
         name: '!serverFill',
         description: 'PREFERRED for building. Instant server /fill - thousands of blocks at once, no walking. Takes BOTH corners in full 3D: (blockType, x1, y1, z1, x2, y2, z2). Note this is a DIFFERENT argument order from !fill.',
         params: {
@@ -1262,5 +1277,65 @@ export const actionsList = [
         perform: runAsAction(async (agent, liquid_type) => {
             await skills.fillBucket(agent.bot, liquid_type);
         })
+    },
+    {
+        name: '!creativeGive',
+        description: 'Creative mode only: put an item straight into your own inventory, no /give needed.',
+        params: {
+            'item': { type: 'ItemName', description: 'The item to summon, e.g. "cobblestone".' },
+            'count': { type: 'int', description: 'How many.', domain: [1, 2304] }
+        },
+        perform: runAsAction(async (agent, item, count) => {
+            const r = await creative.giveItem(agent.bot, item, count);
+            if (!r.ok) return `CREATIVE GIVE FAILED: ${r.error || 'unknown error'}`;
+            return `CREATIVE GIVE: ${r.placed} ${r.item} across ${r.slots.length} slot(s).`;
+        }, false, 1)
+    },
+    {
+        name: '!creativeKit',
+        description: 'Creative mode only: stock a ready-made kit of items (building, mining, or survival).',
+        params: {
+            'kit': { type: 'string', description: 'Which kit: "building", "mining", "survival", or "all".' }
+        },
+        perform: runAsAction(async (agent, kit) => {
+            const r = await creative.giveKit(agent.bot, kit);
+            if (r.error) return `CREATIVE KIT FAILED: ${r.error}`;
+            const ok = r.results.filter(x => x.ok);
+            const bad = r.results.filter(x => !x.ok);
+            let line = `CREATIVE KIT "${r.kit}": ${ok.length} item(s) stocked`;
+            if (bad.length) line += `; ${bad.length} failed (${bad.slice(0, 3).map(b => `${b.item}: ${b.error}`).join(', ')})`;
+            return line + '.';
+        }, false, 2)
+    },
+    {
+        name: '!creativeClear',
+        description: 'Creative mode only: empty your entire inventory.',
+        perform: runAsAction(async (agent) => {
+            const r = await creative.clearInventory(agent.bot);
+            if (!r.ok) return `CREATIVE CLEAR FAILED: ${r.error}`;
+            return `CREATIVE CLEAR: emptied ${r.cleared} slot(s).`;
+        }, false, 1)
+    },
+    {
+        name: '!creativeIdSweep',
+        description: 'Diagnostic: give one of each id-sweep sample so item ids can be checked server-side.',
+        perform: runAsAction(async (agent) => {
+            const r = await creative.idSweep(agent.bot);
+            if (r.error) return `ID SWEEP FAILED: ${r.error}`;
+            return 'ID SWEEP: ' + r.asked.map(a => `${a.item}=${a.id}${a.placed ? '' : '(FAILED)'}`).join(' ');
+        }, false, 2)
+    },
+    {
+        name: '!creativeStatus',
+        description: 'Report your game mode, and whether creative item ids match this server.',
+        perform: runAsAction(async (agent) => {
+            const mode = creative.gameMode(agent.bot);
+            if (mode !== 'creative') return `GAME MODE: ${mode}. Creative commands are unavailable.`;
+            const p = await creative.probeIdMapping(agent.bot);
+            if (p.error) return `GAME MODE: creative. Probe failed: ${p.error}`;
+            return p.ok
+                ? `GAME MODE: creative. Item ids OK (asked ${p.asked}, got ${p.got}).`
+                : `GAME MODE: creative. ITEM ID MISMATCH - asked ${p.asked} (id ${p.askedId}), got ${p.got ?? 'nothing'} (id ${p.gotId ?? 'n/a'}).`;
+        }, false, 1)
     },
 ];

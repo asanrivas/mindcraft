@@ -1,52 +1,133 @@
-# Replacing mineflayer with an owned Minecraft client
+# The mineflayer replacement investigation — and why it stopped
 
-Status: **M1 in progress** (started 2026-08-23). `src/mc/` exists with the mineflayer backend
-wired through it and a passing contract test; the native backend is a stub.
+Status: **HALTED at end of M2 (2026-08-23). The premise was falsified.**
+M1 (the `src/mc/` BotClient seam) and M2 (the read-only observer client) are built, working and
+worth keeping. **M3–M8 should not be started**: the problem they were meant to solve does not
+exist.
 
-## Why
+---
 
-The bot connects to a **Minecraft 26.1 server (protocol 775)**, but connects *as* 1.21.11.
-`src/mindcraft/mcserver.js` used to regex-extract the version from the server's ping *name*
-string (`"Purpur 1.21.11"`) and never read `response.version.protocol`. So the bot ran
-one-version-stale collision data against a 26.x world.
+## ⚠️ Read this first: the version-mismatch theory is DEAD
 
-The visible symptom: **`bot.entity.onGround` lies** — false for seconds while the bot is
-provably standing (constant y, zero velocity), so prismarine-physics applies no ground
-acceleration. Measured in [NAVIGATION_REBUILD.md](NAVIGATION_REBUILD.md): 136 jump-ticks over
-241 ticks moved 0.1 blocks; `mineflayer-pathfinder` won't plan a route over a 1-block step. An
-entire replacement nav/swim stack exists to work around this (`nav.js`, `auto_jump.js`,
-`swim_assist.js`, `swim_probe.js` — ~129 `bot.*` refs of pure compensation).
+This project was justified by the belief that the server is Minecraft 26.1 (protocol 775) while
+the bot connects as 1.21.11, running "one-version-stale collision data against a 26.x world."
 
-**Why a client rather than a version bump.** The bump looks tractable now (below), but the goal
-is strategic: own the client, target 775 and whatever follows, and stop being gated on upstream
-PrismarineJS release timing. The bump is a reprieve; ownership is the outcome.
+**That belief was wrong, and it is now disproven three independent ways.**
 
-**Deliverable:** a client we own, swapped in behind a config flag (`settings.mc_client`), proven
-at parity against the live server, with mineflayer deletable once parity holds.
+### The server is genuinely 1.21.11
 
-## A stale claim, corrected
+```
+$ mc "purpur version"
+This server is running Purpur version 1.21.11-2568-HEAD@f57bd86  (MC: 1.21.11)
+$ mc "plugins"
+Bukkit Plugins (8): CountryBlock, floodgate, Geyser-Spigot, MapModCompanion,
+                    SkinsRestorer, ViaBackwards, ViaVersion, ViaVersion
+$ mc "viaversion list"
+[1.21.11] (2): [bob, andy]
+```
 
-`CLAUDE.md` used to assert `prismarine-chunk` "has no 26.x chunk implementation in any release."
-**That was verifiably false for the installed packages** — a misread of a JS object literal
-where unquoted keys sit beside quoted ones. Confirmed by loading each module at runtime
-(2026-08-23):
+The ping *name* string (`"Purpur 1.21.11"`) was **telling the truth all along**. The ping
+*protocol* number (775) is **ViaVersion advertising the newest protocol it can translate** —
+that is precisely what ViaVersion is for. The server core is natively protocol **774**.
 
-| Package | Installed | 26.1 / protocol 775 |
+So `minecraft_version: "auto"` → `1.21.11` is not a stale fallback, it is **correct**.
+Connecting as 26.1 would be strictly *worse*: every packet would then be routed through
+ViaVersion's translation layer instead of matching the server natively.
+
+### Collision data is not stale — the delta is two flowers
+
+Diffed `blockCollisionShapes` between the 1.21.11 and 26.1 `minecraft-data` sets:
+
+| | |
+|---|---|
+| block names total | 1168 |
+| **identical collision entries** | **1166** |
+| **differing collision entries** | **0** |
+| shapes lookup table | byte-identical |
+| present only in 26.1 | `golden_dandelion`, `potted_golden_dandelion` |
+
+`golden_dandelion` maps to collision shape `[]` — no collision box at all. **There is no
+collision difference between the two versions that could affect a bot in any way.**
+
+### Both protocols decode the world identically
+
+`tools/observe.mjs` connected read-only to the live server as 1.21.11, then again as 26.1,
+sampling the **same absolute world coordinates** both times (bot-relative sampling is not
+comparable — the two runs stand in different places):
+
+| | |
+|---|---|
+| blocks compared | **24,389** |
+| distinct block types | 22, incl. stateful `wall_torch`, `furnace`, `chest`, `pink_petals`, `grass_block` |
+| **disagreements** | **0** |
+| decode errors | 0 in both runs |
+| chunk columns loaded | 557 in both runs |
+
+### What this means
+
+**Do not attribute movement bugs to a version mismatch, and do not try to fix them by changing
+the connect version.** The `onGround` measurements in
+[NAVIGATION_REBUILD.md](NAVIGATION_REBUILD.md) are real and reproducible — only their
+*explanation* was wrong.
+
+This is exactly "riskiest assumption #1" from the original plan, now confirmed. The remaining
+suspects are all **server-side**, and that is where the investigation should go next:
+
+- **Purpur/Paper movement validation or anti-cheat correcting the client.** `swim_assist.js`
+  already carries a `forcedMove` valve that disables its speed boost after 3 server corrections
+  in 10 seconds — direct evidence the server *does* correct this client.
+- **Packet rate limiting.** The 50ms `position`/`look` throttle (now in
+  `src/mc/backends/mineflayer.js`, originally a monkeypatch in `mcdata.js`) exists because the
+  server was dropping the connection otherwise. A client being throttled on movement packets is
+  a plausible route to "the server thinks I'm not on the ground."
+- **ViaVersion sitting in the packet path** even for native-version clients.
+- **Purpur's own movement/entity config knobs.**
+
+None of these are fixed by owning the client library.
+
+### Was any of it wasted?
+
+Two earlier claims were *also* wrong, and correcting them is what led here:
+
+- "prismarine-chunk has no 26.x implementation in any release" — false; a misread JS object
+  literal. `prismarine-chunk@1.41.0` maps `26.1` fine. (Moot now, since we should connect as
+  1.21.11 regardless.)
+- "mineflayer caps at 1.21.11 so we're stuck" — mineflayer capping at 1.21.11 turns out to be
+  *the right place to be*.
+
+---
+
+## What was built, and what it is still good for
+
+All of this is committed, tested and running. None of it depends on the disproven premise.
+
+| Artifact | Keep? | Why |
 |---|---|---|
-| `prismarine-chunk` (root) | 1.41.0 | `26.1: require('./pc/1.18/chunk')` at `src/index.js:17` — instantiates |
-| `minecraft-data` | 3.113.2 | full `pc/26.1/` incl. **`blockCollisionShapes.json`**; `{"version":775}` |
-| `minecraft-protocol` | 1.67.0 | `26.1` in `supportedVersions` (and it is the `defaultVersion`) |
-| `prismarine-registry` | 1.11.0 | `('26.1')` → 1168 blocks, 1506 items, protocol 775 |
+| `src/mc/index.js` + `contract.js` + `backends/mineflayer.js` | **Yes** | A clean single construction seam is good design regardless. `initBot()` no longer hides 60 lines of monkeypatching, and the two `_client` patches are now documented, named code rather than private-API surgery. |
+| `tests/contract.test.mjs` | **Yes** | Executable spec for the ~1000-call-site `bot.*` surface, with no live-server dependency. Catches an upstream mineflayer change that drops a method we rely on. |
+| `src/mc/net/connection.js` | **Yes, unused for now** | The rate limiter is a strict improvement on the old single-timer throttle (always sends the *newest* movement packet, never a stale one), and the decode-error policy counts failures *by packet name* instead of blind-swallowing them. Worth adopting even on the mineflayer backend. |
+| `src/mc/world/`, `src/mc/entities/`, `src/mc/observer.js` | **Yes** | The observer is a genuinely useful diagnostic: a read-only second client that can watch the world without touching the live bot. It is what produced the 24,389-block comparison above. |
+| `tools/observe.mjs` | **Yes** | Point it at the server, get a world/entity snapshot with decode-error counts. Reusable for any future "is the client seeing the world correctly?" question. |
+| `tools/parity_versions.mjs` | **Yes** | Automates the two-version comparison. (Its subprocess-spawning form may need running by hand.) |
+| `backends/native.js` | Stub only | **Do not build this out** unless a *new* reason appears. |
+| M3–M8 in the ladder below | **Do not start** | Retained for the record; the justification is void. |
 
-The whole stack *below* mineflayer already speaks 775. The two remaining gates are policy, not
-capability:
+**Cost of the correction:** the seam and observer were roughly a session's work, and they bought
+a definitive answer to a question that had been guessed at (wrongly) in the docs for months, plus
+a reusable diagnostic. The alternative — starting M3 — would have spent months building physics
+and inventory layers to fix a version skew that does not exist.
 
-1. **mineflayer bundles `prismarine-chunk@1.39.0`** (no `26.1` key) shadowing the working root
-   1.41.0 — addressable via the `overrides` block already in `package.json`.
-2. **`testedVersions`** in `node_modules/mineflayer/lib/version.js` ends at `1.21.11`; the gate
-   throws in `lib/loader.js`. A one-line patch-package append.
+**The genuinely useful follow-up** is `src/mc/entities/metadata.js`: it names the version-fragile
+metadata indices, including the bare `mob.metadata[16]` magic number in `mcdata.js`
+`isHuntable()`. That index shifting is a real, silent hazard independent of any of the above.
 
-Stepping below mineflayer removes a *policy* gate. That is precisely the independence sought.
+---
+
+## Historical: the original plan
+
+Everything below documents the plan **as it stood before the premise was falsified**. It is kept
+because the API audit, the borrow-vs-build reasoning and the plugin inventory remain accurate and
+useful; the *motivation* does not.
 
 ## Constraints
 

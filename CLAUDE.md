@@ -138,40 +138,66 @@ Tests: `bun tests/fallback.test.mjs` (fakes, no network). Verified live against 
 dead local server, and recovery verified with real sockets: down -> backup, back up but inside
 cooldown -> still backup, after cooldown -> primary.
 
-## Movement (we own the client; see docs/CLIENT_REPLACEMENT.md)
+## Movement (the "version mismatch" was a myth - see below)
 
 Full story, measurements and bug list: **[docs/NAVIGATION_REBUILD.md](docs/NAVIGATION_REBUILD.md)**.
-Replacement-client plan: **[docs/CLIENT_REPLACEMENT.md](docs/CLIENT_REPLACEMENT.md)**.
+Investigation that overturned the diagnosis: **[docs/CLIENT_REPLACEMENT.md](docs/CLIENT_REPLACEMENT.md)**.
 
-**The server is Minecraft 26.1 (protocol 775).** Its ping *name* string lies and says
-`Purpur 1.21.11`, and `mcserver.js` used to regex-extract the version from that name while
-ignoring the protocol number - it now also reads `response.version.protocol` and logs the
-mismatch, but the value used to connect is still the name-derived one (see below).
+### THE SERVER IS 1.21.11. There is no version skew. (Established 2026-08-23, with evidence.)
 
-**Corrected 2026-08-23: the "prismarine-chunk has no 26.x" claim below was wrong.** Verified by
-loading the installed packages at runtime: `prismarine-chunk@1.41.0` (root) maps
-`26.1: require('./pc/1.18/chunk')` and instantiates; `minecraft-data@3.113.2` ships a full
-`pc/26.1/` dataset including `blockCollisionShapes.json`; `minecraft-protocol@1.67.0` lists
-`26.1` in `supportedVersions`; `prismarine-registry('26.1')` resolves 1168 blocks, 1506 items,
-protocol 775. The whole stack **below** mineflayer already speaks 775. The only real gates are
-policy, not capability: mineflayer bundles its own `prismarine-chunk@1.39.0` (no `26.1` key,
-shadowing the working root copy), and mineflayer's `testedVersions`
-(`node_modules/mineflayer/lib/version.js`) ends at `1.21.11`. **We are not chasing that bump** -
-we're building an owned client instead (`src/mc/`, `settings.mc_client`), because the goal is
-independence from upstream's release pace, not just this one version. See
-`docs/CLIENT_REPLACEMENT.md` for the staged plan, and its "riskiest assumptions" section for
-why the bump alone might not even fix the symptom below - Purpur/Paper server-side movement
-validation is an equally good explanation, and `swim_assist.js`'s `forcedMove` valve (disables
-its boost after 3 server corrections in 10s) is direct evidence the server *does* correct this
-client.
+Everything below used to say "the server is really 26.1 (protocol 775) and its ping *name*
+lies." **That was backwards.** The ping *name* was telling the truth; the ping *protocol
+number* is what misled us:
+
+```
+$ mc "purpur version"
+This server is running Purpur version 1.21.11-2568-HEAD@f57bd86  (MC: 1.21.11)
+$ mc "plugins"
+Bukkit Plugins (8): ... ViaBackwards, ViaVersion, ViaVersion
+$ mc "viaversion list"
+[1.21.11] (2): [bob, andy]        <- our bots, on the server's NATIVE version
+```
+
+**ViaVersion advertises protocol 775 in the ping so that newer clients can connect.** That is
+its entire job. The server core is natively **1.21.11 = protocol 774**. So
+`minecraft_version: "auto"` resolving to `1.21.11` is not a stale fallback - it is **exactly
+correct**, and connecting as 26.1 would be *worse*, since it would route every packet through
+ViaVersion's translation layer.
+
+Three independent checks, all agreeing:
+
+1. **Collision data is not stale.** Diffed `blockCollisionShapes` between the 1.21.11 and 26.1
+   minecraft-data sets: **1166/1168 blocks byte-identical, 0 differing entries, shapes table
+   identical.** The only delta is two blocks that exist solely in 26.1 (`golden_dandelion`,
+   `potted_golden_dandelion`) - and `golden_dandelion` maps to collision shape `[]`, i.e. no
+   collision box at all. **There is no collision difference that could affect a bot.**
+2. **World decode is identical across both protocols.** `tools/observe.mjs` connected read-only
+   as 1.21.11 and again as 26.1, sampling the *same absolute coordinates*: **24,389 blocks
+   across 22 block types (incl. stateful `wall_torch`, `furnace`, `chest`, `pink_petals`) - zero
+   disagreements, zero decode errors, 557 chunk columns both times.**
+3. The earlier "prismarine-chunk has no 26.x support" claim was *also* wrong (it misread a JS
+   object literal) - but that no longer matters, because we should not be connecting as 26.1
+   anyway.
+
+**Consequence: do NOT attribute movement bugs to a version mismatch, and do not "fix" them by
+changing the connect version.** That theory is dead. `src/mc/` (the BotClient seam) is still
+useful as a clean construction seam, but its original justification is void - see
+`docs/CLIENT_REPLACEMENT.md` for what was actually established and what to investigate instead.
 
 **`onGround` cannot be trusted here.** Traced directly: it reads false for seconds at a time
 while the bot is provably standing (constant y, zero velocity), so prismarine-physics applies
 no ground acceleration and the bot sits at `vel=(0,0)` with forward held. **Anything that
 waits for `onGround` waits forever.** `followPath` pulses jump when progress stalls, because
 airborne acceleration still works - that is what actually moves the bot. `mineflayer-pathfinder`
-will not even *plan* a route over a 1-block step, so it simply stands still. This is the symptom
-we are hunting; per the correction above, its cause is not yet established.
+will not even *plan* a route over a 1-block step, so it simply stands still.
+
+**The measurements above are real; only the explanation was wrong.** With the version theory
+ruled out, the remaining suspects are server-side: Purpur/Paper movement validation or
+anti-cheat correcting the client (`swim_assist.js` already carries a `forcedMove` valve that
+disables its boost after 3 server corrections in 10s - direct evidence the server *does* correct
+us), the `position`-packet rate limiting the 50ms throttle in `src/mc/backends/mineflayer.js`
+exists to survive, or ViaVersion sitting in the packet path. **Investigate the server, not the
+client library.**
 
 ### The stack we run instead
 

@@ -185,19 +185,33 @@ async function waitForBlock(bot, P, ms = 8000) {
     return null;
 }
 
+// Rotates when a slot's busy-flag leaks: mineflayer's setInventorySlot can permanently
+// brick a slot for the life of the process after an overlapping/cancelled write (see
+// CLAUDE.md creative notes - it once bricked all 37 slots). Observed live as a mid-run
+// cliff: ~80% success until one interrupted equip, then every "no item X" after.
+// Slots 36-43 rotate; 44 is reserved for scaffold dirt.
+let equipSlot = 36;
 async function equip(bot, itemName) {
     if (bot.heldItem?.name === itemName) return true;
-    try {
-        // the proven skills.placeBlock path: creative-write the slot, then a real
-        // bot.equip so the SERVER's held-item state is synced. A raw hotbar write can
-        // leave the server seeing an empty hand - every placement then times out, except
-        // during streaks of the same block where a previous equip still held.
-        let item = bot.inventory.findInventoryItem(itemName);
-        if (!item) {
-            await bot.creative.setInventorySlot(36, mc.makeItem(itemName, 1));
-            item = bot.inventory.findInventoryItem(itemName);
+    let item = bot.inventory.findInventoryItem(itemName);
+    for (let attempt = 0; attempt < 4 && !item; attempt++) {
+        try {
+            await bot.creative.setInventorySlot(equipSlot, mc.makeItem(itemName, 1));
+        } catch (e) {
+            if (/cancelled|again/i.test(e.message)) {
+                await new Promise(r => setTimeout(r, 400));
+                if (attempt >= 1) equipSlot = 36 + ((equipSlot - 36 + 1) % 8); // slot may be bricked - move on
+                continue;
+            }
+            console.log(`[builder] equip ${itemName} failed: ${e.message}`);
+            return false;
         }
-        if (!item) return false;
+        item = bot.inventory.findInventoryItem(itemName);
+    }
+    if (!item) { console.log(`[builder] equip ${itemName}: item never appeared (slot ${equipSlot})`); return false; }
+    try {
+        // real equip so the SERVER's held-item state is synced - a raw hotbar write can
+        // leave the server seeing an empty hand
         await bot.equip(item, 'hand');
         return true;
     } catch (e) {
@@ -434,7 +448,7 @@ export async function buildBlueprint(agent, filePath, origin) {
         pillar: [],
     };
     // dirt for scaffolding, in a non-hand slot so equips of build blocks don't evict it
-    try { await bot.creative.setInventorySlot(37, mc.makeItem('dirt', 64)); } catch (e) { /* pillarUp will report */ }
+    try { await bot.creative.setInventorySlot(44, mc.makeItem('dirt', 64)); } catch (e) { /* pillarUp will report */ }
 
     let placed = 0, skipped = 0;
     const failures = [];

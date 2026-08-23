@@ -501,7 +501,10 @@ export async function buildBlueprint(agent, filePath, origin) {
                     if (failures.length <= 3) console.log(`[builder] FAIL ${p.name}@(${P.x},${P.y},${P.z}): ${res.why}`);
                 }
                 const done = placed + skipped + failures.length;
-                if (done % 25 === 0) writeStatus(agent, { phase: passName, done, total: buildable.length, placed, failed: failures.length });
+                // heartbeat EVERY block: a scaffolded placement can take a minute, and 25
+                // of them outlasts the watchdog's staleness window - which then "rescues"
+                // (interrupts) the live build. Same lesson as the per-dig heartbeat.
+                writeStatus(agent, { phase: passName, done, total: buildable.length, placed, failed: failures.length });
                 if (done % 200 === 0)
                     console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}]`);
             }

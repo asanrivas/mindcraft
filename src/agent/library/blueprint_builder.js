@@ -515,8 +515,16 @@ export async function buildBlueprint(agent, filePath, origin) {
                 // of them outlasts the watchdog's staleness window - which then "rescues"
                 // (interrupts) the live build. Same lesson as the per-dig heartbeat.
                 writeStatus(agent, { phase: passName, done, total: buildable.length, placed, failed: failures.length });
-                if (done % 200 === 0)
-                    console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}]`);
+                if (done % 200 === 0) {
+                    const byWhy = new Map();
+                    for (const f of failures) {
+                        const k = (f.why || '?').slice(0, 45);
+                        byWhy.set(k, (byWhy.get(k) || 0) + 1);
+                    }
+                    const top = [...byWhy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+                        .map(([w, n]) => `${n}x"${w}"`).join(' ');
+                    console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}] ${top}`);
+                }
             }
         }
 

@@ -4905,7 +4905,7 @@ export async function climbLedgeByPlacing(bot, dx, dz, rise) {
  * wall to cut a staircase into.
  * @returns {Promise<number>} height actually gained.
  */
-async function pillarUp(bot, blocks = 1) {
+export async function pillarUp(bot, blocks = 1) {
     const { Vec3 } = await import('vec3');
     const stackable = STACKABLE;
     const startY = bot.entity.position.y;

@@ -1,6 +1,7 @@
 import { Vec3 } from 'vec3';
 import * as mc from '../../utils/mcdata.js';
 import * as nav from './nav.js';
+import { pillarUp } from './skills.js';
 import fs from 'fs';
 
 /**
@@ -102,6 +103,53 @@ async function goNear(bot, P, reach = 3.0) {
     await nav.navigateTo(bot, { x: P.x, y: P.y, z: P.z },
         { arriveDist: reach, arriveY: 3, maxReplans: 3 });
     return eyeDist() <= 4.6;
+}
+
+// ---- scaffolding: vertical access for work above walking reach ----
+// The navigator only paths over existing blocks, so anything above ~2 blocks is
+// unreachable until something exists to stand on (measured: 3,138 of 3,648 blocks failed
+// exactly this way). Classic player solution: pillar-jump a dirt column next to the work,
+// build what is in reach, then dig back down through the pillar before moving on - so the
+// scaffold never outlives its use.
+async function pillarDown(bot, ctx) {
+    while (ctx.pillar.length) {
+        const under = bot.blockAt(bot.entity.position.offset(0, -1, 0));
+        if (!under || under.name !== 'dirt') { ctx.pillar.length = 0; break; }
+        try { await bot.dig(under, true); } catch (e) { ctx.pillar.length = 0; break; }
+        await new Promise(r => setTimeout(r, 350)); // fall into the gap
+        ctx.pillar.pop();
+    }
+}
+
+async function scaffoldTo(bot, P, ctx) {
+    // choose a support column adjacent to P that the blueprint never occupies
+    const candidates = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
+    for (const [dx, dz] of candidates) {
+        const cx = P.x + dx, cz = P.z + dz;
+        // must be blueprint-free all the way up, and open in the world
+        let clash = false;
+        for (let y = P.y - 12; y <= P.y + 1; y++) {
+            if (ctx.occupied.has(`${cx - ctx.origin.x},${y - ctx.origin.y},${cz - ctx.origin.z}`)) { clash = true; break; }
+        }
+        if (clash) continue;
+        // find ground in this column
+        let groundTop = null;
+        for (let y = P.y; y > P.y - 16; y--) {
+            const b = bot.blockAt(new Vec3(cx, y, cz));
+            if (b && b.boundingBox === 'block') { groundTop = y; break; }
+        }
+        if (groundTop === null) continue;
+        const res = await nav.navigateTo(bot, { x: cx, y: groundTop + 1, z: cz }, { arriveDist: 0.6, arriveY: 2, maxReplans: 2 });
+        if (!res.arrived) continue;
+        const targetFeet = P.y - 1;
+        const need = targetFeet - Math.floor(bot.entity.position.y);
+        if (need <= 0) return true;
+        const before = Math.floor(bot.entity.position.y);
+        const gained = await pillarUp(bot, need);
+        for (let i = 0; i < Math.round(gained); i++) ctx.pillar.push({ x: cx, y: before + i, z: cz });
+        return bot.entity.position.y >= targetFeet - 0.6;
+    }
+    return false;
 }
 
 // Placement fails server-side if the bot's body occupies OR nearly touches the destination
@@ -209,7 +257,12 @@ function chooseFace(bot, P, p) {
     return null;
 }
 
-async function placeOne(bot, P, p) {
+async function placeOne(bot, P, p, ctx = null) {
+    // leaving high work? dismantle the scaffold under our feet first
+    if (ctx?.pillar?.length &&
+        bot.entity.position.offset(0, 1.62, 0).distanceTo(P.offset(0.5, 0.5, 0.5)) > 4.6) {
+        await pillarDown(bot, ctx);
+    }
     let existing = bot.blockAt(P);
     if (!existing) {
         await goNear(bot, P);
@@ -246,8 +299,11 @@ async function placeOne(bot, P, p) {
     } else if (SIDE_FACES.includes(choice.faceName)) {
         approach = P.plus(new Vec3(choice.faceVec.x * 2, 0, choice.faceVec.z * 2)); // in front of the clicked face
     }
-    if (!(await goNear(bot, approach)) && !(await goNear(bot, P)))
-        return { ok: false, why: 'out of reach (no walkable route)' };
+    if (!(await goNear(bot, approach)) && !(await goNear(bot, P))) {
+        // above walking reach: pillar a dirt scaffold next to the work
+        if (!(ctx && P.y > bot.entity.position.y + 1.5 && await scaffoldTo(bot, P, ctx)))
+            return { ok: false, why: 'out of reach (no walkable route)' };
+    }
     await stepOff(bot, P);
 
     const itemName = itemNameFor(p.name);
@@ -361,6 +417,16 @@ export async function buildBlueprint(agent, filePath, origin) {
 
     for (const m of PAUSABLE_MODES) { try { bot.modes.pause(m); } catch (e) { /* mode absent */ } }
 
+    // scaffold context: which cells the blueprint owns (never pillar there), and the live
+    // dirt pillar under the bot (always dismantled before moving on)
+    const ctx = {
+        origin,
+        occupied: new Set(all.map(p => `${p.x},${p.y},${p.z}`)),
+        pillar: [],
+    };
+    // dirt for scaffolding, in a non-hand slot so equips of build blocks don't evict it
+    try { await bot.creative.setInventorySlot(37, mc.makeItem('dirt', 64)); } catch (e) { /* pillarUp will report */ }
+
     let placed = 0, skipped = 0;
     const failures = [];
     const started = Date.now();
@@ -374,8 +440,7 @@ export async function buildBlueprint(agent, filePath, origin) {
 
         // clear natural terrain poking into the lower floors of the footprint
         if (meta.size) {
-            const occupied = new Set(all.map(p => `${p.x},${p.y},${p.z}`));
-            for (let y = 0; y < Math.min(6, meta.size.height); y++) {
+                        for (let y = 0; y < Math.min(6, meta.size.height); y++) {
                 console.log(`[builder] clearing terrain layer ${y}`);
                 for (let x = 0; x < meta.size.width; x++) {
                     // heartbeat per ROW, not per layer: a layer of digging can take
@@ -383,7 +448,7 @@ export async function buildBlueprint(agent, filePath, origin) {
                     // command - which interrupts the very build it is guarding
                     writeStatus(agent, { phase: 'clear', layer: y, row: x, total: buildable.length });
                     for (let z = 0; z < meta.size.length; z++) {
-                        if (occupied.has(`${x},${y},${z}`)) continue;
+                        if (ctx.occupied.has(`${x},${y},${z}`)) continue;
                         const P = new Vec3(origin.x + x, origin.y + y, origin.z + z);
                         const b = bot.blockAt(P);
                         if (b && NATURAL_TERRAIN.has(b.name)) {
@@ -412,7 +477,7 @@ export async function buildBlueprint(agent, filePath, origin) {
             if (groundY === null || groundY === top.y) continue;
             for (let y = groundY + 1; y <= top.y; y++) {
                 const res = await placeOne(bot, new Vec3(top.x, y, top.z),
-                    { name: 'cobblestone', properties: {} });
+                    { name: 'cobblestone', properties: {} }, ctx);
                 if (res.ok && !res.skipped) foundationPlaced++;
                 if (foundationPlaced % 25 === 0)
                     writeStatus(agent, { phase: 'foundation', placed: foundationPlaced, total: buildable.length });
@@ -426,7 +491,7 @@ export async function buildBlueprint(agent, filePath, origin) {
                 const P = new Vec3(origin.x + p.x, origin.y + p.y, origin.z + p.z);
                 let res;
                 try {
-                    res = await placeOne(bot, P, p);
+                    res = await placeOne(bot, P, p, ctx);
                 } catch (e) {
                     res = { ok: false, why: `threw: ${e.message}` };
                 }
@@ -449,7 +514,7 @@ export async function buildBlueprint(agent, filePath, origin) {
         let retried = 0;
         for (const p of retry) {
             const P = new Vec3(origin.x + p.x, origin.y + p.y, origin.z + p.z);
-            const res = await placeOne(bot, P, p);
+            const res = await placeOne(bot, P, p, ctx);
             if (res.ok) placed++;
             else failures.push(p);
             if (++retried % 10 === 0) writeStatus(agent, { phase: 'retry', done: retried, total: retry.length });

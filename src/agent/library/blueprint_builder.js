@@ -317,6 +317,11 @@ async function placeOne(bot, P, p, ctx = null) {
         // which passes validation; our standing side supplies the yaw for orientation
         const opts = { swingArm: 'right' };
         if (choice.half) opts.half = choice.half;
+        // PACE the packets. The server rate-limits interactions and silently DROPS the
+        // excess (observed: bursts of placements time out en masse while slow stretches
+        // succeed; a long chat reply got the bot kicked with disconnect.spam). A beat
+        // before each place keeps us under the limiter.
+        await new Promise(r => setTimeout(r, 250));
         await bot._placeBlockWithOptions(choice.ref, choice.faceVec, opts);
     } catch (e) {
         // the API can throw after a successful placement - re-read before believing it
@@ -457,6 +462,7 @@ export async function buildBlueprint(agent, filePath, origin) {
                         const b = bot.blockAt(P);
                         if (b && NATURAL_TERRAIN.has(b.name)) {
                             if (!(await goNear(bot, P))) continue; // unreachable bump; skip
+                            await new Promise(r => setTimeout(r, 120)); // stay under the packet limiter
                             try { await bot.dig(b, true); } catch (e) { /* skip stubborn */ }
                             // heartbeat per DIG: a dig-dense row outlasts every staleness
                             // threshold, and a "stale" live build gets killed by its own watchdog

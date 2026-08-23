@@ -500,8 +500,16 @@ export async function buildBlueprint(agent, filePath, origin) {
             }
             if (groundY === null || groundY === top.y) continue;
             for (let y = groundY + 1; y <= top.y; y++) {
-                const res = await placeOne(bot, new Vec3(top.x, y, top.z),
-                    { name: 'cobblestone', properties: {} }, ctx);
+                let res;
+                try {
+                    res = await placeOne(bot, new Vec3(top.x, y, top.z),
+                        { name: 'cobblestone', properties: {} }, ctx);
+                } catch (e) {
+                    // one bad column must not abort the whole run - this exact leak
+                    // silently killed runs for hours (pass loops caught, this one didn't)
+                    console.log(`[builder] foundation threw at ${top.x},${y},${top.z}: ${e.message}`);
+                    continue;
+                }
                 if (res.ok && !res.skipped) foundationPlaced++;
                 if (foundationPlaced % 25 === 0)
                     writeStatus(agent, { phase: 'foundation', placed: foundationPlaced, total: buildable.length });
@@ -549,7 +557,12 @@ export async function buildBlueprint(agent, filePath, origin) {
         let retried = 0;
         for (const p of retry) {
             const P = new Vec3(origin.x + p.x, origin.y + p.y, origin.z + p.z);
-            const res = await placeOne(bot, P, p, ctx);
+            let res;
+            try {
+                res = await placeOne(bot, P, p, ctx);
+            } catch (e) {
+                res = { ok: false };
+            }
             if (res.ok) placed++;
             else failures.push(p);
             if (++retried % 10 === 0) writeStatus(agent, { phase: 'retry', done: retried, total: retry.length });

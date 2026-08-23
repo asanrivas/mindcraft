@@ -122,6 +122,9 @@ async function pillarDown(bot, ctx) {
 }
 
 async function scaffoldTo(bot, P, ctx) {
+    // heartbeat before the slow part: one scaffold (nav + pillar) can take minutes, and a
+    // silent stretch that long reads as "dead" to the watchdog
+    if (ctx.agent) writeStatus(ctx.agent, { phase: 'scaffold', target: `${P.x},${P.y},${P.z}` });
     // choose a support column adjacent to P that the blueprint never occupies
     const candidates = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]];
     for (const [dx, dz] of candidates) {
@@ -421,6 +424,7 @@ export async function buildBlueprint(agent, filePath, origin) {
     // dirt pillar under the bot (always dismantled before moving on)
     const ctx = {
         origin,
+        agent,
         occupied: new Set(all.map(p => `${p.x},${p.y},${p.z}`)),
         pillar: [],
     };
@@ -541,8 +545,18 @@ export async function buildBlueprint(agent, filePath, origin) {
     let out = `VERIFIED BUILD: ${match}/${buildable.length} blocks match (${pct}%) after ${mins} min. `
         + `${placed} placed, ${skipped} already correct, ${failures.length} failed.`;
     if (failures.length) {
-        const sample = failures.slice(0, 5).map(f => `${f.name}@(${f.x},${f.y},${f.z}): ${f.why}`).join('; ');
-        out += ` Failures e.g.: ${sample}`;
+        // aggregate failure reasons so the report explains itself instead of needing a
+        // log dive - the mass-failure runs each had ONE dominant cause worth naming
+        const byWhy = new Map();
+        for (const f of failures) {
+            const key = (f.why || 'unknown').slice(0, 60);
+            byWhy.set(key, (byWhy.get(key) || 0) + 1);
+        }
+        const top = [...byWhy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
+            .map(([w, n]) => `${n}x "${w}"`).join('; ');
+        out += ` Failure breakdown: ${top}.`;
+        const sample = failures.slice(0, 3).map(f => `${f.name}@(${f.x},${f.y},${f.z})`).join('; ');
+        out += ` E.g.: ${sample}`;
     }
     return out;
 }

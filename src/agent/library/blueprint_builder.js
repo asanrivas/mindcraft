@@ -142,16 +142,24 @@ async function scaffoldTo(bot, P, ctx) {
             if (b && b.boundingBox === 'block') { groundTop = y; break; }
         }
         if (groundTop === null) continue;
-        const res = await nav.navigateTo(bot, { x: cx, y: groundTop + 1, z: cz }, { arriveDist: 0.6, arriveY: 2, maxReplans: 2 });
-        if (!res.arrived) continue;
+        // arriveDist was 0.6 with 2 replans: navigating to an EXACT cell beside a wall
+        // through bumpy terrain failed so often that scaffolding - and with it every
+        // block above walking reach - silently starved. Loosen, then verify by position.
+        await nav.navigateTo(bot, { x: cx, y: groundTop + 1, z: cz }, { arriveDist: 1.3, arriveY: 3, maxReplans: 4 });
+        const feet = bot.entity.position;
+        if (Math.hypot(feet.x - (cx + 0.5), feet.z - (cz + 0.5)) > 1.8) continue;
         const targetFeet = P.y - 1;
         const need = targetFeet - Math.floor(bot.entity.position.y);
-        if (need <= 0) return true;
+        if (need <= 0) { ctx.scaffoldOk = (ctx.scaffoldOk || 0) + 1; return true; }
         const before = Math.floor(bot.entity.position.y);
         const gained = await pillarUp(bot, need);
-        for (let i = 0; i < Math.round(gained); i++) ctx.pillar.push({ x: cx, y: before + i, z: cz });
-        return bot.entity.position.y >= targetFeet - 0.6;
+        for (let i = 0; i < Math.round(gained); i++) ctx.pillar.push({ x: feet.floored().x, y: before + i, z: feet.floored().z });
+        const ok = bot.entity.position.y >= targetFeet - 0.6;
+        if (ok) ctx.scaffoldOk = (ctx.scaffoldOk || 0) + 1;
+        else ctx.scaffoldShort = (ctx.scaffoldShort || 0) + 1;
+        return ok;
     }
+    ctx.scaffoldNoCol = (ctx.scaffoldNoCol || 0) + 1;
     return false;
 }
 
@@ -545,7 +553,7 @@ export async function buildBlueprint(agent, filePath, origin) {
                     }
                     const top = [...byWhy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
                         .map(([w, n]) => `${n}x"${w}"`).join(' ');
-                    console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}] ${top}`);
+                    console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}] ${top} | scaffold ok=${ctx.scaffoldOk||0} short=${ctx.scaffoldShort||0} nocol=${ctx.scaffoldNoCol||0}`);
                 }
             }
         }

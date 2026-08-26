@@ -1,5 +1,5 @@
 import { Vec3 } from 'vec3';
-import { digWithTool, isTreeTrunk, isLavaName, isSwimmable, isBubbleColumn } from './tools.js';
+import { digWithTool, isTreeTrunk, isLavaName, isSwimmable, isBubbleColumn, isWaterName } from './tools.js';
 
 /**
  * A self-contained navigator: A* planner + lookahead executor.
@@ -51,6 +51,13 @@ const DEFAULTS = {
     // wide, so a detour is trivial, while chopping is slower and wrecks the landscape. Priced
     // as a strong preference rather than a ban so a bot boxed in by trees cannot deadlock.
     treeDigCost: 60,
+    // Digging a cell that will FLOOD is not a route, it is a longer swim. On land a dug block
+    // yields a path; at or below the waterline it yields water, so the bot pays the effort and
+    // gains nothing - then does it again one block further on. That is how it "dug a canal"
+    // across a lake: repeatedly mining the only block it could reach while floating. Priced
+    // near treeDigCost so a detour almost always wins, but not infinite - a bot already in the
+    // water must still be able to cut its way out when there is genuinely no other route.
+    floodDigCost: 70,
     // Water USED to be priced at 15 on the belief that "with this server's physics the bot
     // barely moves while swimming". That was never measured, and it is false. `!swimProbe` in
     // 7-block-deep water, repeated across five runs:
@@ -225,11 +232,21 @@ function digCostAt(ctx, x, y, z) {
     const below = classify(ctx, x, y - 1, z);
     if (feet === HAZARD || head === HAZARD || below === HAZARD) return null;
     if (below !== SOLID && below !== UNKNOWN) return null; // nothing to land on after digging
+    // Will the hole fill in behind us? Any water touching the cell - beside it or directly
+    // above - means digging it produces water, not passage.
+    const floods = (yy) => {
+        for (const [ax, az] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            if (classify(ctx, x + ax, yy, z + az) === WATER) return true;
+        }
+        return classify(ctx, x, yy + 1, z) === WATER;
+    };
+
     let cost = 0, n = 0;
     for (const dy of [0, 1]) {
         if ((dy === 0 ? feet : head) !== SOLID) continue;
         n++;
-        cost += isTreeTrunk(nameAt(ctx, x, y + dy, z)) ? o.treeDigCost : o.digCost;
+        const base = isTreeTrunk(nameAt(ctx, x, y + dy, z)) ? o.treeDigCost : o.digCost;
+        cost += floods(y + dy) ? Math.max(base, o.floodDigCost) : base;
     }
     if (n === 0) return null;
     return cost;
@@ -538,6 +555,31 @@ export async function followPath(bot, path, opts = {}) {
             // Buoyancy carries the bot up and it overshoots, so waypoints need a wider catchment
             // while swimming than while walking.
             const wet = bot.entity.isInWater === true;
+            // `wet` is not one state, and conflating the two paralysed the bot.
+            //
+            //   AFLOAT  - head under, or nothing solid under the feet. Jump is buoyancy here and
+            //             SwimAssist owns the key; hopping only makes the bot bob.
+            //   WADING  - in water with solid ground under the feet: a puddle, a ford, a
+            //             shoreline. For propulsion this is LAND.
+            //
+            // While wading, SwimAssist releases the jump key (its `auto` mode presses only when
+            // the head is submerged) and AutoJump stands down (it bails on any `isInWater`) - so
+            // NOTHING presses jump, `onGround` reads false as it always does on this server, and
+            // prismarine-physics applies no acceleration from any source at all. Measured at
+            // (4281, 62, 4935), in one block of water with dry land two blocks east:
+            // vel=(0.000, 0.000, 0.000) with `forward` held, unchanged for twenty minutes,
+            // through four process restarts. The bot was in the one state where every
+            // subsystem correctly refused to act.
+            // Read the blocks live, NOT through `ctx.cache`: that cache is per-plan and the bot
+            // is standing in terrain it may have just mined.
+            // Biased up 0.15 before flooring - see skills.js travelToward: a surface float
+            // dips below the block boundary and flips this classification every few ticks.
+            const wadeFeet = bot.entity.position.offset(0, 0.15, 0).floored();
+            const wadeHead = bot.blockAt(wadeFeet.offset(0, 1, 0));
+            const wadeBelow = bot.blockAt(wadeFeet.offset(0, -1, 0));
+            const wading = wet
+                && !!wadeBelow && wadeBelow.boundingBox === 'block'
+                && !(wadeHead && (wadeHead.name === 'water' || wadeHead.name === 'flowing_water'));
             const arriveXZ = wet ? Math.max(o.arriveXZ, 1.2) : o.arriveXZ;
 
             while (i < path.length) {
@@ -578,10 +620,17 @@ export async function followPath(bot, path, opts = {}) {
 
             if (o.debug && (Date.now() - dbgAt) > 1000) {
                 dbgAt = Date.now();
+                // Print EVERY control state, not just `forward`. A control left latched on by a
+                // skill that exited badly - sneak in particular, which prismarine-physics uses
+                // to suppress movement at block edges - looks identical from outside to "the
+                // physics is broken", and the two need completely different fixes.
+                const cs = bot.controlState ?? {};
+                const held = Object.keys(cs).filter(k => cs[k]).join(',') || 'none';
                 console.warn(`[nav] pos=(${p.x.toFixed(2)},${p.y.toFixed(2)},${p.z.toFixed(2)}) `
                     + `i=${i}/${path.length} aim=${aim} tgt=(${target.x.toFixed(1)},${target.y},${target.z.toFixed(1)}) `
-                    + `yaw=${bot.entity.yaw.toFixed(2)}/${yaw.toFixed(2)} fwd=${bot.controlState?.forward} `
-                    + `onGround=${bot.entity.onGround} vel=(${bot.entity.velocity.x.toFixed(3)},${bot.entity.velocity.z.toFixed(3)})`);
+                    + `yaw=${bot.entity.yaw.toFixed(2)}/${yaw.toFixed(2)} held=[${held}] `
+                    + `wet=${wet} wading=${wading} onGround=${bot.entity.onGround} `
+                    + `vel=(${bot.entity.velocity.x.toFixed(3)},${bot.entity.velocity.y.toFixed(3)},${bot.entity.velocity.z.toFixed(3)})`);
             }
 
             const remaining = Math.hypot(final.x - p.x, final.z - p.z);
@@ -592,7 +641,7 @@ export async function followPath(bot, path, opts = {}) {
                 hops = 0;
             } else if (Date.now() - stallSince > o.waypointMs) {
                 break; // not converging; let the caller replan
-            } else if (wet) {
+            } else if (wet && !wading) {
                 // No hopping, no digging while afloat. Jump is buoyancy in water, not
                 // propulsion, so pulsing it makes the bot bob instead of advance; and neither
                 // mining nor placing works while floating, for the same reason pillaring does
@@ -616,6 +665,18 @@ export async function followPath(bot, path, opts = {}) {
                 // already priced a dig move here. Mine the obstruction rather than grinding.
                 lastProgress = Date.now();
                 hops = 0;
+                // AFLOAT AND PINNED: build a footing before reaching for the pickaxe. Digging
+                // here is how the bot "solves" a one-block bank by mining a channel through it
+                // at water level and swimming on - measured in the test gym at every depth: it
+                // ends up east of the bank still at water height, having destroyed the bank
+                // rather than climbed it. Placing a block on the pool floor under its feet makes
+                // the water shallow enough to stand in, and the ordinary step-up does the rest.
+                console.log(`[${bot.username ?? '?'}] pinned: wet=${wet} wading=${wading} `
+                    + `hops=${hops} pos=(${p.x.toFixed(1)}, ${p.y.toFixed(2)}, ${p.z.toFixed(1)})`);
+                if (wet && !wading) {
+                    const { buildFootingBelow } = await import('./skills.js');
+                    if (await buildFootingBelow(bot, 2)) { continue; }
+                }
                 const climbed = await climbAhead(bot, yaw);
                 if (!climbed && !(await digAhead(bot, yaw))) {
                     // Nothing to mine, so we are wedged on a corner rather than blocked by a
@@ -694,7 +755,23 @@ async function digAhead(bot, yaw) {
         const b = bot.blockAt(t);
         if (!b || b.name.includes('water')) continue;
         if (isTreeTrunk(b.name)) continue;   // walk around trees; do not fell them
+        // REFUSE TO DIG A HOLE THAT WILL FLOOD. Underwater a dug block yields water, not
+        // passage: the bot pays the effort, gains a longer swim, and repeats one block on. That
+        // is exactly how it mined a canal instead of climbing a one-block bank - measured at
+        // `leg 1: moved=10.36` through solid ground at water level, all inside a single leg, so
+        // the traveller never even saw a stall. The planner already prices this
+        // (`floodDigCost`); the executor has to honour it too or it just overrides the plan.
+        if (wouldFlood(bot, t)) continue;
         if (await digWithTool(bot, b)) return true;
+    }
+    return false;
+}
+
+/** Would a hole at `t` immediately fill with water from a neighbour or from above? */
+function wouldFlood(bot, t) {
+    for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0]]) {
+        const n = bot.blockAt(t.offset(dx, dy, dz));
+        if (n && isWaterName(n.name)) return true;
     }
     return false;
 }

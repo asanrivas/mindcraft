@@ -11,8 +11,9 @@
  *     as air is how a bot swims confidently into a ceiling it cannot see.
  */
 import { isWaterName, isSwimmable, isLavaName, isBubbleColumn } from '../src/agent/library/tools.js';
-import { verticalIntent, airPocketAbove, waterSurfaceY, nearestOpenColumn, oxygen }
+import { verticalIntent, airPocketAbove, waterSurfaceY, nearestOpenColumn, oxygen, bankTargetAhead }
     from '../src/agent/library/swim.js';
+import { Vec3 } from 'vec3';
 import { verdictFor } from '../src/agent/library/swim_probe.js';
 import { swimCostFor, WATER_CLASS, SOLID_CLASS, AIR_CLASS, UNKNOWN_CLASS, HAZARD_CLASS as HZ }
     from '../src/agent/library/nav.js';
@@ -273,6 +274,177 @@ check('oxygen survives a null bot', oxygen(null), 20);
     check('...which it did not before', oldRiver > 60, true);
     // ...but an ocean must still lose to any land route.
     check('a 500-wide ocean loses', 500 * swimCostFor({ feet: W, head: W, below: W }, on) > 500, true);
+}
+
+// --- bankTargetAhead -------------------------------------------------------------------------
+// The shoreline the marathon ground against: floating at (4264, 62, 4931), heading +x, with
+// water at x+1 and a one-block bank at x+2 whose top face is y=63. The bot could see the land
+// and had no move that would put it on top.
+{
+    const world = new Map();
+    const key = (x, y, z) => `${x},${y},${z}`;
+    const put = (x, y, z, name) => world.set(key(x, y, z),
+        { name, boundingBox: name === 'air' || name === 'water' ? 'empty' : 'block' });
+    // A 7-wide strip at the bot's feet level and below, mirroring the live slice.
+    for (let x = 4261; x <= 4267; x++) {
+        for (let y = 58; y <= 70; y++) put(x, y, 4931, 'air');
+    }
+    for (let x = 4261; x <= 4265; x++) for (let y = 58; y <= 62; y++) put(x, y, 4931, 'water');
+    for (let x = 4266; x <= 4267; x++) for (let y = 58; y <= 62; y++) put(x, y, 4931, 'stone');
+
+    const bot = {
+        entity: { position: new Vec3(4264.89, 62.26, 4931.35) },
+        blockAt: (v) => world.get(key(v.x, v.y, v.z)) ?? null,
+    };
+    const t = bankTargetAhead(bot, 1, 0);
+    check('finds the bank top ahead', t && `${t.x},${t.y},${t.z}`, '4266,63,4931');
+
+    // Backwards there is nothing but open water, so there is nothing to climb onto.
+    check('no bank behind', bankTargetAhead(bot, -1, 0), null);
+
+    // A bank taller than maxRise is not a step, it is a cliff - refuse rather than swim at it.
+    check('a cliff is not a bank', bankTargetAhead(bot, 1, 0, { maxRise: 0 }), null);
+    // ...and one further away than reach is somebody else's problem.
+    check('out of reach', bankTargetAhead(bot, 1, 0, { reach: 1 }), null);
+
+    // An unloaded chunk must read as blocked, never as air - same invariant as airPocketAbove.
+    const blind = { entity: bot.entity, blockAt: () => null };
+    check('unloaded chunk is not a bank', bankTargetAhead(blind, 1, 0), null);
+
+    // A ledge with no headroom is not standable: solid floor, solid ceiling one above.
+    put(4266, 64, 4931, 'stone');
+    check('no headroom on the ledge means no bank', bankTargetAhead(bot, 1, 0, { maxRise: 0 }), null);
+}
+
+// The second shoreline, at (4279, 62, 4934): the bank due EAST is a two-block step, which a
+// floating bot cannot climb - it can only swim as high as the water surface, and `onGround` is
+// unusable here so there is no jump. Half a step to the SOUTH-EAST the same shore is a one-block
+// step. The search has to look across the forward cone, and has to prefer the LOWER step to the
+// straighter one, or it declares the whole shoreline impassable - which is what happened: four
+// consecutive legs covering 0.0, 3.5, 2.0, 0.0 blocks.
+{
+    // Build the world from a heightmap: H(x,z) is the topmost solid y. Anything above it is air,
+    // except the pond, which is water at y=62.
+    const H = (x, z) => {
+        if (z >= 4935) return 62;             // the low south shelf: a ONE-block step up
+        if (x >= 4281) return 63;             // the east ridge: a TWO-block step up
+        return 61;                            // the pond floor
+    };
+    let pondIsWater = true;
+    const blockAt = (v) => {
+        const h = H(v.x, v.z);
+        if (v.y <= h) return { name: 'stone', boundingBox: 'block' };
+        if (pondIsWater && h === 61 && v.y === 62) return { name: 'water', boundingBox: 'empty' };
+        return { name: 'air', boundingBox: 'empty' };
+    };
+    const bot = { entity: { position: new Vec3(4280.00, 62.00, 4934.70) }, blockAt };
+
+    const t = bankTargetAhead(bot, 1, 0);
+    check('takes the one-block step in the cone, not the two-block step dead ahead',
+        t && `${t.x},${t.y},${t.z}`, '4281,63,4935');
+
+    // Straight-ahead-only search: the same shore now reads as a two-block scramble.
+    const straight = bankTargetAhead(bot, 1, 0, { cone: false, maxRise: 3 });
+    check('the two-block step is what lies straight ahead',
+        straight === null || `${straight.x},${straight.y},${straight.z}`, '4281,64,4934');
+    // ...and at the real default it is correctly reported as unclimbable rather than attempted.
+    check('a two-block bank is refused, not attempted',
+        bankTargetAhead(bot, 1, 0, { cone: false }), null);
+
+    // A standable cell BEHIND A WALL is not a bank. This is the one that cost eight seconds a
+    // leg: from (4280, 62, 4935) the search picked a real ledge three blocks east with two solid
+    // blocks in between, and the bot swam into the wall reporting "gained 0.00".
+    {
+        const wall = (v) => {
+            if (v.y <= 61) return { name: 'stone', boundingBox: 'block' };          // lake bed
+            if (v.x === 4281 || v.x === 4282) {                                     // the 2-high wall
+                return v.y <= 63 ? { name: 'stone', boundingBox: 'block' } : { name: 'air', boundingBox: 'empty' };
+            }
+            if (v.x === 4283) {                                                     // the ledge behind it
+                return v.y <= 62 ? { name: 'stone', boundingBox: 'block' } : { name: 'air', boundingBox: 'empty' };
+            }
+            return v.y === 62 ? { name: 'water', boundingBox: 'empty' } : { name: 'air', boundingBox: 'empty' };
+        };
+        const walled = { entity: { position: new Vec3(4280.0, 62.0, 4935.0) }, blockAt: wall };
+        check('a ledge behind a wall is not a bank', bankTargetAhead(walled, 1, 0), null);
+    }
+
+    // A LEVEL exit - dry ground at the same height as the water we are floating in - must win
+    // over any step up, however straight ahead that step is.
+    const level = bankTargetAhead(
+        { entity: bot.entity, blockAt: (v) => (v.z >= 4935 && v.y <= 61) || (v.z < 4935 && v.x >= 4281 && v.y <= 63) || (v.z < 4935 && v.x < 4281 && v.y <= 61)
+            ? { name: 'stone', boundingBox: 'block' }
+            : (v.z < 4935 && v.x < 4281 && v.y === 62)
+                ? { name: 'water', boundingBox: 'empty' }
+                : { name: 'air', boundingBox: 'empty' } },
+        1, 0);
+    check('a level exit beats a step up', level && `${level.x},${level.y},${level.z}`, '4281,62,4935');
+}
+
+// --- flooding digs must be priced as the non-solution they are -------------------------------
+// On land a dug block yields a path. At the waterline it yields WATER: the bot pays the effort
+// and gains a longer swim, then repeats one block on. That is literally how it mined a canal
+// across a lake. `floodDigCost` has to dominate `digCost` so a detour wins, while staying
+// finite - a bot already in water must still be able to cut its way out as a last resort.
+{
+    const nav = await import('../src/agent/library/nav.js');
+    const src = (await import('fs')).readFileSync(
+        new URL('../src/agent/library/nav.js', import.meta.url), 'utf8');
+    const num = (k) => Number((src.match(new RegExp(k + ':\\s*(\\d+)')) || [])[1]);
+    check('floodDigCost exists', Number.isFinite(num('floodDigCost')), true);
+    check('flooding digs cost more than ordinary ones', num('floodDigCost') > num('digCost'), true);
+    check('...but are not infinite', num('floodDigCost') < 1000, true);
+    check('the flood test checks all four neighbours and above',
+        /\[1, 0\], \[-1, 0\], \[0, 1\], \[0, -1\]/.test(src) && /yy \+ 1/.test(src), true);
+}
+
+
+// --- swimTo must always yield a real macrotask ------------------------------------------------
+// The regression that killed a live bot: followPlayer loops on swimTo while the player is in
+// water, and swimTo's fast exits await nothing but `bot.look(..., force)` - which resolves
+// without a timer or any I/O (mineflayer physics.js returns from the force branch before
+// awaiting lookingTask, and returns even earlier when the look delta is zero). A loop of pure
+// microtasks never lets the event loop reach its timer/IO phases, so the socket goes unread and
+// the SERVER drops the client: "andy lost connection: Timed out", 70s into a follow. From the
+// outside that is indistinguishable from the bot drowning.
+//
+// The test: schedule a timer, then run the fast path. If swimTo yields properly the timer fires
+// before it resolves. If it only awaits microtasks, it does not.
+{
+    const { swimTo } = await import('../src/agent/library/swim.js');
+
+    const at = (x, y, z) => new Vec3(x, y, z);
+    const fakeBot = (overrides = {}) => ({
+        interrupt_code: false,
+        entity: {
+            position: at(0, 64, 0),
+            velocity: at(0, 0, 0),
+            yaw: 0, pitch: 0,
+            isInWater: true,
+            isCollidedHorizontally: false,
+        },
+        // Resolves immediately, exactly like the real force-look.
+        look: async () => {},
+        setControlState: () => {},
+        blockAt: () => ({ name: 'water', boundingBox: 'empty' }),
+        ...overrides,
+    });
+
+    // Already inside `arrive`: swimTo returns 'arrived' on its first loop iteration.
+    let timerFired = false;
+    setTimeout(() => { timerFired = true; }, 0);
+    const r = await swimTo(fakeBot(), at(0, 64, 0), { arrive: 1.5, timeoutMs: 5000 });
+    check('the fast path still reports arrived', r.reason, 'arrived');
+    check('...and yielded a macrotask on the way', timerFired, true);
+
+    // The lava refusal returns before even the look. Same requirement.
+    const lavaBot = fakeBot({ blockAt: () => ({ name: 'lava', boundingBox: 'empty' }) });
+    lavaBot.entity.isInLava = true;
+    let timerFired2 = false;
+    setTimeout(() => { timerFired2 = true; }, 0);
+    const r2 = await swimTo(lavaBot, at(0, 64, 0), { arrive: 1.5, timeoutMs: 5000 });
+    check('lava is still refused', r2.reason.startsWith('lava'), true);
+    check('...and the refusal yielded too', timerFired2, true);
 }
 
 if (failures) {

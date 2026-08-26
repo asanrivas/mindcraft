@@ -302,6 +302,14 @@ export async function swimTo(bot, target, opts = {}) {
         };
     };
 
+    // Yield a real macrotask before anything can return. Every exit below this point is
+    // reachable with only microtask awaits - the lava refusals await nothing at all, and the
+    // `arrived` exit awaits only `bot.look(..., force)`, which resolves without a timer or any
+    // I/O. A caller that loops on swimTo would then spin without ever letting the event loop
+    // service the socket, and the server drops the client with "Timed out". followPlayer did
+    // exactly that; this makes the primitive safe for any caller, not just the fixed one.
+    await sleep(o.tickMs);
+
     if (inLava(bot)) return done('lava');
     if (lavaOnLine(bot, target)) return done('lava_on_route');
 
@@ -444,7 +452,13 @@ export async function surface(bot, opts = {}) {
     if (open && !outOfTime()) {
         const r = await swimTo(bot, open.pos, {
             arrive: 1.2,
-            timeoutMs: Math.max(1500, o.timeoutMs - (Date.now() - t0)),
+            // Bounded to a SHARE of the deadline, not all of it. `nearestOpenColumn` finds a
+            // column by block scan, and a bot wedged under an overhang cannot necessarily reach
+            // the one it finds - so this leg would swim into a wall for the entire budget and
+            // phase 3, the one that actually cuts through the ceiling, never ran at all.
+            // Observed: `surface()` returning `timeout` with `rose -0.2` while a single
+            // diggable stone block sat directly overhead.
+            timeoutMs: Math.max(1500, Math.min(4000, o.timeoutMs - (Date.now() - t0))),
             sprint: false,
         });
         if (r.arrived || r.reason === 'beached') {
@@ -603,6 +617,292 @@ function isDiggableCeiling(bot, block) {
  * steady heading instead of pulsing jump - in water, jump is buoyancy, not propulsion.
  * @returns {Promise<number>} blocks covered along (dx,dz).
  */
+/**
+ * Climb out of the water onto the bank ahead.
+ *
+ * The gap this closes: SwimAssist's default `auto` mode holds the bot at the WATER SURFACE -
+ * head just clear, feet still wet - and a bank's top face is a block ABOVE that surface.
+ * Swimming forward from there presses the bot's chest into the bank and it never rises over
+ * the lip. AutoJump, which clears exactly this step on land, deliberately early-returns in
+ * water, because the jump key there is buoyancy and not a hop. So nothing in the stack owned
+ * "get out of the water onto the shore in front of me".
+ *
+ * Observed live on a marathon leg: four consecutive travel legs at (4264, 62, 4931) covering
+ * 0.0, 0.5, 2.0 and 0.0 blocks against a ONE-block bank, mining three blocks of it in the
+ * process. The bot could see the land and could not stand on it.
+ *
+ * Vanilla players do this by holding forward AND jump at the same time; `climb` mode is the
+ * jump half of that, and it is the one mode that keeps rising past the surface instead of
+ * levelling off at it.
+ *
+ * @param {number} dx integer heading, -1..1
+ * @param {number} dz integer heading, -1..1
+ * @returns {Promise<{out:boolean, gained:number, target:Vec3|null}>}
+ */
+/**
+ * The nearest dry standing spot `reach` blocks ahead that the bot could climb onto.
+ *
+ * Nearest first, then lowest, so the bot takes the shallowest step onto shore rather than
+ * trying to scale the tallest thing it can see. Split out from `climbBank` because this is
+ * the half worth testing: it is pure block reads, and getting it wrong sends the bot swimming
+ * at a cliff face.
+ *
+ * @returns {Vec3|null} the FOOT cell to stand in (not the block below it)
+ */
+export function bankTargetAhead(bot, dx, dz, opts = {}) {
+    // maxRise 1, not 3. A floating bot rises only while its feet are still in water, so the
+    // highest foot cell it can ever enter is one whose floor is at the water surface - a
+    // ONE-block bank. A two-block bank needs a jump, and `onGround` is unusable on this server,
+    // so there is no jump to be had. Searching higher just buys six seconds of swimming into a
+    // wall per attempt; the traveller's dig/detour ladder is the right answer for those.
+    const o = { reach: 3, maxRise: 1, cone: true, ...opts };
+    const solid = (v) => { const b = bot.blockAt(v); return !!b && b.boundingBox === 'block'; };
+    const clear = (v) => {
+        const b = bot.blockAt(v);
+        // An unloaded chunk is NOT clear. Treating unknown as air is how a bot swims
+        // confidently into a ceiling it cannot see.
+        return !!b && (b.name === 'air' || b.name === 'cave_air');
+    };
+    const p = bot.entity.position.floored();
+
+    // RISE FIRST, then distance, then straightness. A bot floating at the water surface can
+    // only climb what it can swim up to, and the water surface is the ceiling of that: a bank
+    // two blocks above it needs a jump, and `onGround` is unusable on this server so there is
+    // no jump to be had. Observed live at (4279, 62, 4934): the bank due east was a two-block
+    // step and unclimbable, while the SAME shore one block to the south was a one-block step.
+    // Searching only the exact heading declared that shoreline impassable and the bot ground
+    // against it for four legs.
+    for (let dy = 0; dy <= o.maxRise; dy++) {
+        for (let n = 1; n <= o.reach; n++) {
+            for (const [ax, az] of (o.cone ? forwardCone(dx, dz) : [[Math.sign(dx), Math.sign(dz)]])) {
+                const foot = new Vec3(p.x + ax * n, p.y + dy, p.z + az * n);
+                if (!solid(foot.offset(0, -1, 0))) continue;                  // nothing to stand ON
+                if (!clear(foot) || !clear(foot.offset(0, 1, 0))) continue;   // no room for the body
+                // ...and we have to be able to GET there. A standable cell behind a wall is not
+                // a bank. Observed: from (4280, 62, 4935) this picked (4283, 63, 4935) - a real
+                // ledge, three blocks east, with two solid blocks in between - then swam into
+                // the wall for eight seconds and reported "still wet, gained 0.00".
+                if (!corridorClear(bot, p, ax, az, n, dy)) continue;
+                return foot;
+            }
+        }
+    }
+    return null;
+}
+
+/**
+ * Can the bot actually swim from `from` to the cell `n` steps along (ax, az) at rise `dy`?
+ *
+ * Checks the whole corridor between here and there, over the full height the body will occupy
+ * on the way - from the feet we start at to the head we finish with. Water counts as passable;
+ * only solid blocks block. Cheap and deliberately conservative: a false negative costs one
+ * candidate, a false positive costs eight seconds of swimming into a wall.
+ */
+function corridorClear(bot, from, ax, az, n, dy) {
+    const yLo = Math.min(from.y, from.y + dy);
+    const yHi = Math.max(from.y, from.y + dy) + 1;   // +1 for the head
+    for (let k = 1; k < n; k++) {
+        for (let y = yLo; y <= yHi; y++) {
+            const b = bot.blockAt(new Vec3(from.x + ax * k, y, from.z + az * k));
+            if (!b || b.boundingBox === 'block') return false;   // unloaded counts as blocked
+        }
+    }
+    return true;
+}
+
+// Vanilla's jump impulse. Applied by hand because `onGround` is unreliable here, so the physics
+// engine never fires the jump itself - see climbBank.
+const JUMP_IMPULSE = 0.42;
+
+/** Is there a full block directly beneath the feet? Then the water is stand-deep, not swim-deep. */
+function standingOnSolid(bot) {
+    // The block BELOW THE FEET CELL, not 0.2 below the eye-position. A bot floating a third of
+    // a block above the boundary (y=110.32) still floors into its own water cell, so the naive
+    // offset reported "not standing" and sent a stand-deep bot into a pointless sink phase.
+    const b = bot.blockAt(bot.entity.position.floored().offset(0, -1, 0));
+    return !!b && b.boundingBox === 'block';
+}
+
+/** The eight integer headings, in rotational order, so neighbours are +-1 apart. */
+const RING8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+
+/**
+ * The heading and its two 45-degree neighbours, straightest first.
+ *
+ * Leaving the water at 45 degrees off the bearing is still forward progress, and it is what a
+ * person does at a shoreline rather than scaling the one spot directly in front of them.
+ */
+function forwardCone(dx, dz) {
+    const i = RING8.findIndex(([x, z]) => x === Math.sign(dx) && z === Math.sign(dz));
+    if (i < 0) return [[Math.sign(dx) || 1, Math.sign(dz)]];
+    return [RING8[i], RING8[(i + 1) % 8], RING8[(i + 7) % 8]];
+}
+
+export async function climbBank(bot, dx, dz, opts = {}) {
+    const o = { timeoutMs: 8000, reach: 3, ...opts };
+    const start = bot.entity.position.clone();
+    const fail = (target = null) => ({ out: !inWater(bot), gained: bot.entity.position.y - start.y, target });
+
+    if (!inWater(bot) || inLava(bot)) return fail();
+
+    const target = bankTargetAhead(bot, dx, dz, o);
+    const say = (msg) => console.log(`[${bot.username ?? '?'}] climbBank: ${msg}`);
+    if (!target) {
+        // Console only, deliberately: this fires on every stalled leg in open water and would
+        // otherwise flood bot.output, which is budgeted and goes to the model.
+        say(`no reachable bank in the forward cone heading (${dx},${dz}) `
+            + `from ${bot.entity.position.floored()}`);
+        return fail();
+    }
+    say(`target ${target} from ${bot.entity.position.floored()} heading (${dx},${dz})`);
+
+    // DUCK, THEN CLIMB. A bot floating at the surface cannot rise at all: prismarine-physics
+    // grants the swim impulse only while it counts the player as in water, and at the surface
+    // it does not - while `onGround` is unusable on this server, so the land jump branch is dead
+    // too. Measured at (4281, 62, 4935): jump=true, mode=climb, wet=true, sub=false, and
+    // vel=(0.000, 0.000, 0.000) for eight seconds straight. The bot was in the one state where
+    // neither half of the stack can lift it.
+    //
+    // So put the head back under for a moment. `sink` submerges, `climb` then gets the full
+    // +0.175 b/t, and that momentum carries the hitbox up over the lip while `forward` walks it
+    // inland. This is the duty cycle the whole vertical-control design is built on: rising is
+    // seven times faster than sinking, so a short dip costs almost nothing.
+    // BACK OFF THE WALL FIRST. Pressed flush against the bank face the bot cannot rise at all:
+    // measured at x=4508.70 (hitbox edge exactly on the block boundary at 4509.0) it held y
+    // 110.000 for 22 seconds with zero movement, while the identical attempt from x=4508.40 -
+    // a 0.3 block gap - was out in 0.8s. The collision resolution appears to cancel the whole
+    // move, vertical included, while the AABB is touching. So make a gap, then climb.
+    await aimAt(bot, target.offset(0.5, 0, 0.5), true);
+    const gapTo = (p) => Math.hypot(target.x + 0.5 - p.x, target.z + 0.5 - p.z);
+    if (gapTo(bot.entity.position) < 1.05) {
+        bot.setControlState('forward', false);
+        bot.setControlState('back', true);
+        const backOff = Date.now() + 400;
+        while (Date.now() < backOff && !bot.interrupt_code) await sleep(DEFAULTS.tickMs);
+        bot.setControlState('back', false);
+    }
+    setMode(bot, 'climb');
+    let submergeUntil = 0;
+    let lastBoost = 0;
+    bot.setControlState('forward', true);
+    // Never sprint here: the boost is a horizontal acceleration and it drives the bot INTO the
+    // bank face harder, which is the opposite of what is needed.
+    bot.setControlState('sprint', false);
+
+    const t0 = Date.now();
+    let sampled = 0;
+    // Count real physics ticks. Everything above cannot distinguish "the simulation is not
+    // running for this bot" from "it is running and computing zero", and those need completely
+    // different fixes. vel=(0.000, 0.000, 0.000) with `forward` held is not a water problem at
+    // all - `applyHeading` accelerates regardless of water - so it is worth one listener.
+    let ticks = 0;
+    const countTick = () => { ticks++; };
+    bot.on('physicsTick', countTick);
+    let bestProgress = 0;      // furthest we have got, as rise + horizontal closing
+    let lastGain = Date.now();
+    const startFlat = Math.hypot(target.x + 0.5 - start.x, target.z + 0.5 - start.z);
+    try {
+        while (Date.now() - t0 < o.timeoutMs) {
+            if (bot.interrupt_code || inLava(bot)) break;
+
+            const now2 = bot.entity.position;
+
+            // Trust MEASURED progress over the block scan - the same invariant that
+            // `riseUntilBreathing` had to learn. A bot whose 0.6-wide hitbox is jammed in a
+            // corner reads as "open bank one block ahead" and cannot move a millimetre toward
+            // it: observed at (4282, 62, 4935), walled east and south at feet level, holding
+            // jump and forward for the full eight seconds at vel=(0,0,0). Bail in 1.5s instead.
+            // SUBMERGE FIRST, THEN RISE - copied from what a real player actually does.
+            //
+            // A 20Hz trace of a human climbing out (recordings/trace-asanrivas-*.tsv) shows every
+            // successful climb starting from BELOW the surface and rising at ~0.16 blocks/tick
+            // with x pinned against the bank face, e.g. y 108.67 -> 110.90 over 683ms at a
+            // constant x=4508.70, `onGround=0` throughout. The rise is the buoyancy impulse, and
+            // it only exists while the player counts as submerged.
+            //
+            // The previous version dipped for a fixed 250ms and then climbed, which is not long
+            // enough to actually get the head under - so it never earned the impulse and measured
+            // `gained 0.00`. Sink until genuinely submerged (bounded), then hold the climb.
+            const nowMs = Date.now();
+            if (isSubmerged(bot)) {
+                setMode(bot, 'climb');
+                submergeUntil = 0;
+            }
+            // The impulse is not only for stand-deep water. At two blocks deep the bot can
+            // neither submerge (buoyancy holds it above y=110, so its head never goes under)
+            // nor jump (`onGround` is false), and a controlled run measured it topping out at
+            // y=110.34 against a bank whose face is 111.0 - 0.66 short, pinned at x=4508.70.
+            // Whenever we are in water, below the target, and not already rising, supply the
+            // impulse the broken ground flag denies us.
+            if (inWater(bot) && bot.entity.position.y < target.y - 0.05) {
+                // A real player just jumps: the captured trace shows +0.75 in a single tick from
+                // `onGround=1`. Our `onGround` reads false permanently (see CLAUDE.md), so
+                // prismarine-physics never grants that impulse and buoyancy alone tops out ~0.2
+                // blocks short of the lip. Supply it directly - the same thing SwimAssist does
+                // in the other direction with `sinkAssist`. This one impulse covers both the
+                // submerged and the stand-deep cases; they used to have separate branches.
+                const v = bot.entity.velocity;
+                if (v && v.y < 0.08 && Date.now() - lastBoost > 350) {
+                    lastBoost = Date.now();
+                    v.y += JUMP_IMPULSE;
+                }
+            }
+            if (bot.entity.position.y < target.y - 0.15) {
+                // Not under yet and not high enough: keep sinking, but never forever - a bot in
+                // water too shallow to submerge in must fall through to the caller's other moves.
+                if (!submergeUntil) submergeUntil = nowMs + 1500;
+                if (nowMs < submergeUntil) setMode(bot, 'sink');
+                else setMode(bot, 'climb');
+            } else {
+                setMode(bot, 'climb');
+            }
+
+            const flat = Math.hypot(target.x + 0.5 - now2.x, target.z + 0.5 - now2.z);
+            const progress = (now2.y - start.y) + (startFlat - flat);
+            if (progress > bestProgress + 0.05) { bestProgress = progress; lastGain = Date.now(); }
+            else if (Date.now() - lastGain > 2500) {   // > one dip(250ms)+rise cycle, with slack
+                say(`jammed - no measured progress in 2.5s, giving up`);
+                break;
+            }
+            // Success is measured, not assumed: out of the water and standing at or above the
+            // bank. `onGround` is not usable on this server - it reads false for seconds while
+            // the bot is provably standing.
+            // Height alone is not success. Measured at both depths: the bot reaches exactly
+            // y=111.003 - the bank's top face - but sits at x=4508.85, perched on the LIP with
+            // its hitbox half over the edge, and slides back into the pool the moment the climb
+            // stops. It has to end up actually over the target cell.
+            const over = Math.abs(now2.x - (target.x + 0.5)) < 0.6
+                && Math.abs(now2.z - (target.z + 0.5)) < 0.6;
+            if (!inWater(bot) && bot.entity.position.y >= target.y - 0.2 && over) break;
+            // Once a second, record the three numbers that separate "the key is not pressed"
+            // from "the key is pressed and the physics does nothing" - the whole diagnosis of a
+            // failed climb, and indistinguishable from outside without them.
+            const elapsed = Date.now() - t0;
+            if (elapsed >= sampled * 1000) {
+                sampled = Math.floor(elapsed / 1000) + 1;
+                const p2 = bot.entity.position, v = bot.entity.velocity;
+                say(`  t=${(elapsed / 1000).toFixed(1)}s jump=${bot.controlState?.jump} `
+                    + `fwd=${bot.controlState?.forward} mode=${assist(bot)?.mode} `
+                    + `vel=(${v.x.toFixed(3)}, ${v.y.toFixed(3)}, ${v.z.toFixed(3)}) `
+                    + `pos=(${p2.x.toFixed(2)}, ${p2.y.toFixed(2)}, ${p2.z.toFixed(2)}) `
+                    + `wet=${inWater(bot)} sub=${isSubmerged(bot)} `
+                    + `ticks=${ticks} physOn=${bot.physicsEnabled} onGround=${bot.entity.onGround} `
+                    + `liqAcc=${bot.physics?.liquidAcceleration} yaw=${bot.entity.yaw.toFixed(2)} `
+                    + `chunk=${bot.blockAt(bot.entity.position)?.name}`);
+            }
+            await sleep(DEFAULTS.tickMs);
+        }
+    } finally {
+        bot.removeListener('physicsTick', countTick);
+        bot.setControlState('back', false);
+        releaseControls(bot);   // forward off, sprint off, SwimAssist back to 'auto'
+    }
+    const r = fail(target);
+    say(`${r.out ? 'OUT' : 'still wet'} after ${Date.now() - t0}ms, gained ${r.gained.toFixed(2)}, `
+        + `now ${bot.entity.position.floored()}`);
+    return r;
+}
+
 export async function swimForward(bot, dx, dz, ms, opts = {}) {
     const o = { ...DEFAULTS, ...opts };
     const len = Math.hypot(dx, dz) || 1;

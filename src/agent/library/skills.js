@@ -34,6 +34,11 @@ const BLOCK_TYPES = {
 
 export function log(bot, message) {
     bot.output += message + '\n';
+    // Mirror to the service log. `bot.output` is only read when the ACTION returns, so a skill
+    // that runs for forty minutes reports nothing at all until it is over - which is exactly
+    // when you need to know what it decided. Prefixed with the bot name because two agents
+    // share one log.
+    console.log(`[${bot.username ?? '?'}] ${message}`);
 }
 
 /**
@@ -3280,6 +3285,41 @@ export async function goToPlayer(bot, username, distance=3) {
 }
 
 
+/**
+ * Is this entity in water? Read it from the WORLD, not from the entity: prismarine-physics
+ * only simulates our own bot, so `entity.isInWater` is undefined for every other player.
+ * Checks feet and head, so a player treading at the surface still counts.
+ */
+function entityInWater(bot, entity) {
+    const p = entity.position;
+    for (const dy of [0, 1]) {
+        const b = bot.blockAt(p.offset(0, dy, 0));
+        if (b && isWaterName(b.name)) return true;
+    }
+    return false;
+}
+
+/** Beyond this we assume you swam off rather than dived, and stop chasing into open water. */
+const FOLLOW_SWIM_RANGE = 48;
+
+/**
+ * Break off a dive and breathe at this many bubbles. Must stay ABOVE mode:drowning's
+ * threshold of 8, because the mode interrupts - and an interrupt sets bot.interrupt_code,
+ * which is followPlayer's own loop condition. Letting drowning fire would not merely pause
+ * the follow, it would END it, permanently, on the first deep dive. So we surface first and
+ * the mode never needs to.
+ */
+const FOLLOW_AIR_FLOOR = 10;
+
+/**
+ * Poll period for the swim branch of `followPlayer`.
+ *
+ * Load-bearing, not a tuning knob: every path through that branch must yield a real macrotask
+ * or the follow loop starves the event loop and the server times the client out. See the
+ * comment at the `continue` for the failure it produced.
+ */
+const SWIM_POLL_MS = 100;
+
 export async function followPlayer(bot, username, distance=4) {
     /**
      * Follow the given player endlessly. Will not return until the code is manually stopped.
@@ -3311,11 +3351,62 @@ export async function followPlayer(bot, username, distance=4) {
     bot.pathfinder.setGoal(new pf.goals.GoalFollow(player, distance), true);
     log(bot, `You are now actively following player ${username}.`);
 
+    // Follow has TWO drivers. mineflayer-pathfinder cannot follow anyone underwater - its
+    // movement generator carries two literal `if (blockC.liquid) return // dont go underwater`
+    // guards (mineflayer-pathfinder/lib/movements.js:541,561), so GoalFollow has no move that
+    // descends into water and the bot floats on the surface watching you dive. When the player
+    // is wet we stand pathfinder down and hand over to the swim stack instead.
+    let swimming = false;
 
     while (!bot.interrupt_code) {
+        const distance_from_player = bot.entity.position.distanceTo(player.position);
+
+        if (entityInWater(bot, player) && distance_from_player < FOLLOW_SWIM_RANGE) {
+            if (!swimming) {
+                // pathfinder rewrites control states every tick and silently cancels ours,
+                // so it has to be fully stood down, not merely out-prioritised.
+                bot.pathfinder.setGoal(null);
+                bot.pathfinder.stop();
+                swimming = true;
+            }
+            if (swim.oxygen(bot) <= FOLLOW_AIR_FLOOR && swim.isSubmerged(bot)) {
+                await swim.surface(bot, { timeoutMs: 8000 });
+                await new Promise(r => setTimeout(r, SWIM_POLL_MS));
+                continue;   // re-evaluate: you may have surfaced too, or dived deeper
+            }
+            // Short legs, because swimTo is point-to-point and the target is moving. swimTo
+            // refuses lava on itself and on the route, and its releaseControls hands the jump
+            // key back to SwimAssist ('auto'), so a leg that ends deep leaves the bot buoyant.
+            //
+            // Only when there is actually a gap to close. swimTo returns 'arrived' on its
+            // FIRST iteration when we are already inside `arrive`, and that path awaits
+            // nothing but `bot.look(..., force)` - which resolves without a timer or any I/O
+            // (mineflayer physics.js: the force branch returns before `lookingTask.promise`,
+            // and a zero-delta look returns even earlier). See the poll note below.
+            if (distance_from_player > Math.max(1.5, distance)) {
+                await swim.swimTo(bot, player.position.clone(), {
+                    timeoutMs: 1200,
+                    arrive: Math.max(1.5, distance),
+                });
+            }
+            // NEVER `continue` STRAIGHT BACK. This branch used to skip the 500ms poll on the
+            // grounds that "a diver moves faster than that" - but every await on the fast
+            // paths above is a microtask, not a macrotask, so the loop could spin without
+            // ever yielding to the timer/IO phases. The socket then goes unread and unwritten
+            // and the SERVER drops us: `andy lost connection: Timed out`, 70 seconds after a
+            // follow began, which from the outside looks exactly like the bot drowning.
+            // Trigger is ordinary: you stand in water within `follow_dist` of the bot.
+            // 100ms keeps the dive responsive while bounding the loop at 10Hz.
+            await new Promise(r => setTimeout(r, SWIM_POLL_MS));
+            continue;
+        }
+        if (swimming) {
+            swimming = false;
+            bot.pathfinder.setGoal(new pf.goals.GoalFollow(player, distance), true);
+        }
+
         await new Promise(resolve => setTimeout(resolve, 500));
         // in cheat mode, if the distance is too far, teleport to the player
-        const distance_from_player = bot.entity.position.distanceTo(player.position);
 
         const teleport_distance = 100;
         const ignore_modes_distance = 30; 
@@ -4412,14 +4503,74 @@ export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
     return climbed;
 }
 
-export async function travelDirection(bot, dx, dz, distance, step = 48) {
+/**
+ * The eight integer headings. Every block-level helper in this file - `scanAhead`,
+ * `clearWayAhead`, `bridgeWayAhead`, `hopForward`, `climbLedgeByPlacing` - indexes blocks as
+ * `p + d * n`, so `d` HAS to be integral or those reads land on the wrong column. A marathon
+ * leg points wherever it likes, so the heading used for STEERING (a real unit vector) is kept
+ * separate from the one used for DIGGING (this, the nearest of eight).
+ */
+const COMPASS8 = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]];
+
+/** Nearest of the eight integer headings to a free direction. Exported for the tests. */
+export function nearestCompass(dx, dz) {
+    const len = Math.hypot(dx, dz) || 1;
+    const ux = dx / len, uz = dz / len;
+    let best = COMPASS8[0], bestDot = -Infinity;
+    for (const [cx, cz] of COMPASS8) {
+        const cl = Math.hypot(cx, cz);
+        const dot = (ux * cx + uz * cz) / cl;
+        if (dot > bestDot) { bestDot = dot; best = [cx, cz]; }
+    }
+    return best;
+}
+
+/**
+ * Travel overland to an XZ target, mining, bridging, swimming and climbing as needed.
+ *
+ * This is the engine `travelDirection` has always been; the only thing generalised is the
+ * heading. It used to be one of four compass directions baked in for the whole journey, which
+ * made every block-level helper's `p + d*n` arithmetic trivially correct but meant the bot
+ * could only ever be told "go west". A checkpoint is at a bearing, not on an axis, so the
+ * heading is now recomputed each leg from the vector to the target, and quantised to the
+ * nearest of eight only where block arithmetic demands it.
+ *
+ * @returns {Promise<{arrived:boolean, covered:number, remaining:number, dug:number, legs:number, stalls:number}>}
+ */
+export async function travelToward(bot, targetX, targetZ, opts = {}) {
+    const {
+        step = 48,            // how far ahead each navigator leg aims
+        arrive = 3,           // XZ distance that counts as arrival
+        timeoutMs = 30 * 60 * 1000,
+        announce = true,
+        // Price water into the A* frontier, or keep it prohibitive.
+        //
+        // `travelDirection` keeps this ON: swimming was measured at 1.96 blocks/s against ~25
+        // blocks/min overland, and a river crossing is unambiguously worth it - there is a far
+        // bank, and the bot walks out on the other side.
+        //
+        // A checkpoint marathon turns it OFF, because a POND is not a river. Measured here over
+        // twenty-five minutes at (4282, 62, 4935): this bot cannot climb out of water at all.
+        // Holding jump in `climb` mode against an adjacent one-block bank produced
+        // vel=(0.000, 0.000, 0.000) and gained 0.00 blocks, every time. Cheap water therefore
+        // buys a route the bot can enter and cannot leave, and each attempt to mine its way out
+        // widens the pond - the bot dug a canal east and the water followed it in.
+        //
+        // Water is only cheap if you can get out of it.
+        swimEnabled = true,
+        // Called after every navigator leg. Long journeys are otherwise completely opaque:
+        // `log()` only appends to bot.output, which nothing reads until the whole action
+        // returns - so a 40-minute run reports nothing at all until it is over.
+        onLeg = null,
+    } = opts;
+
     const startPos = bot.entity.position.clone();
-    const targetX = Math.floor(startPos.x + dx * distance);
-    const targetZ = Math.floor(startPos.z + dz * distance);
-    log(bot, `Travelling ${distance} blocks to (${targetX}, ${targetZ}). This may take a while.`);
+    const startDist = Math.hypot(targetX - startPos.x, targetZ - startPos.z);
+    if (announce)
+        log(bot, `Travelling ${startDist.toFixed(0)} blocks to (${Math.round(targetX)}, ${Math.round(targetZ)}). This may take a while.`);
 
     let legs = 0, dug = 0, stalls = 0;
-    const deadline = Date.now() + 30 * 60 * 1000; // hard cap so this can never run forever
+    const deadline = Date.now() + timeoutMs;
 
     // Surface travel only. If a previous leg ended in a cave, climb out before going further -
     // otherwise every route the planner can see from down there is also underground.
@@ -4431,16 +4582,52 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
     }
     preferY = Math.floor(bot.entity.position.y);
 
+    // Set only when the bot is wet and could not reach a bank: see the loop below.
+    let strandedInWater = false;
+
+    const result = () => {
+        const p = bot.entity.position;
+        const remaining = Math.hypot(targetX - p.x, targetZ - p.z);
+        return {
+            arrived: remaining <= arrive,
+            covered: Math.max(0, startDist - remaining),
+            remaining, dug, legs, stalls,
+        };
+    };
+
     while (Date.now() < deadline) {
-        if (bot.interrupt_code) return `Travel interrupted. ${travelReport(bot, startPos, dx, dz, distance, dug)}`;
+        if (bot.interrupt_code) return result();
+
+        // A land-only journey must not plan THROUGH water, but a bot that is ALREADY wet has to
+        // be able to plan its way out, so water is priced normally while it is in some.
+        //
+        // This used to call `escapeWater` here on EVERY iteration instead. That was actively
+        // harmful: `escapeWater` heads for the NEAREST dry land, which is frequently behind the
+        // bot, so each iteration dragged it backwards and the following leg pulled it forwards
+        // again. Measured on a bot standing in ONE block of water with open air on all four
+        // sides - the easiest case there is - reporting `navMoved -1.2` then `-3.6` and "Still
+        // in water" indefinitely, 34 blocks from its checkpoint.
+        //
+        // Genuine traps are the recovery ladder's job further down; it already calls
+        // `escapeWater`, but only after a leg has actually stalled.
+        strandedInWater = inWater(bot);
 
         const pos = bot.entity.position;
-        const covered = Math.abs(dx) * Math.abs(pos.x - startPos.x) + Math.abs(dz) * Math.abs(pos.z - startPos.z);
-        if (covered >= distance - 2) break;
+        const toX = targetX - pos.x, toZ = targetZ - pos.z;
+        const dist = Math.hypot(toX, toZ);
+        if (dist <= arrive) break;
+
+        // Steering heading: a true unit vector toward the target.
+        const ux = toX / dist, uz = toZ / dist;
+        // Digging heading: the nearest of eight, so `p + d*n` stays on real block columns.
+        const [dx, dz] = nearestCompass(ux, uz);
 
         const before = pos.clone();
-        const wx = Math.floor(pos.x + dx * step);
-        const wz = Math.floor(pos.z + dz * step);
+        // Aim at the target itself once it is within one leg - overshooting a checkpoint by 48
+        // blocks and walking back is how a fixed-stride traveller wastes an entire leg.
+        const reach = Math.min(step, dist);
+        const wx = Math.floor(pos.x + ux * reach);
+        const wz = Math.floor(pos.z + uz * reach);
 
         try {
             // Use our own navigator (nav.js). mineflayer-pathfinder will not plan a route over
@@ -4454,11 +4641,20 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
             await nav.navigateTo(bot, new Vec3(wx, Math.floor(pos.y), wz), {
                 arriveDist: 3, maxReplans: 3, goalXZOnly: true, planRange: 96, horizon: 10,
                 preferY,
-                // Long-distance travel is the only caller that gets the measured water costs.
-                // !navTo, moveAway and every mode-driven move stay on the land-only model that
-                // has a 1018-block journey behind it: a cheaper river changes which nodes win
-                // the whole A* frontier, not just the wet ones.
-                swimEnabled: true,
+                // Only once we are already stuck - the per-second line is noise on a leg that is
+                // working, and the whole point of it is diagnosing a leg that is not.
+                debug: stalls > 0,
+                // See the `swimEnabled` note above. !navTo, moveAway and every mode-driven move
+                // stay on the land-only model that has a 1018-block journey behind it: a cheaper
+                // river changes which nodes win the whole A* frontier, not just the wet ones.
+                //
+                // `|| inWater(bot)` is not a hedge, it is the other half of the rule. "Don't go
+                // in" and "do get out" need opposite prices, and a bot standing IN water with
+                // water priced at 15 has no affordable first move at all - A* returns nothing,
+                // `followPath` never runs, and the recovery ladder grinds against a pond it is
+                // no longer allowed to plan through. That regressed a bot into a second freeze
+                // within minutes of fixing the first one.
+                swimEnabled: swimEnabled || strandedInWater,
             });
         } catch (err) {
             // fall through to the obstruction check
@@ -4467,22 +4663,51 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
         // Progress must be measured ALONG THE TRAVEL AXIS, not as total distance moved. When
         // the planner can only find a partial route it often heads the wrong way around an
         // obstacle; counting that as progress meant the "we are stuck, dig through" fallback
-        // never fired and the bot wandered sideways for a quarter of an hour.
+        // never fired and the bot wandered sideways for a quarter of an hour. The projection is
+        // SIGNED, so retreating now counts against us - the old `|dx|*|Δx|` form scored a step
+        // backwards exactly like a step forwards.
         const after = bot.entity.position;
-        let moved = (after.x - before.x) * dx + (after.z - before.z) * dz;
+        let moved = (after.x - before.x) * ux + (after.z - before.z) * uz;
         legs++;
+        // Why did this leg stall, or not? `climbBank` never running turned out to be because
+        // legs kept reporting progress - the bot was mining its way forward inside followPath,
+        // so travelToward never saw a stall and its whole water ladder was unreachable.
+        console.log(`[${bot.username ?? '?'}] leg ${legs}: moved=${moved.toFixed(2)} `
+            + `stalls=${stalls} wet=${inWater(bot)} interrupt=${!!bot.interrupt_code} `
+            + `pos=(${after.x.toFixed(1)}, ${after.y.toFixed(2)}, ${after.z.toFixed(1)}) `
+            + `-> ${moved < 1.0 ? 'RECOVERY' : 'continue'}`);
+        if (onLeg) onLeg({
+            leg: legs, moved, dug, stalls,
+            remaining: Math.hypot(targetX - after.x, targetZ - after.z),
+            pos: after.clone(),
+        });
         if (moved < 1.0) {
             // The pathfinder refuses to PLAN a route over a 1-block step on this server, so it
             // just stands still. Walking manually gets the bot moving, and AutoJump (see
             // auto_jump.js) then carries it over the step - measured: 9.4 blocks covered and a
             // step cleared where pathfinding moved 0.
+            // NOT WHILE WET. walkForward exists for a land problem - the pathfinder refuses to
+            // plan a 1-block step, and AutoJump carries the bot over once it is walking. AutoJump
+            // early-returns in water, so in water this does nothing except hold `forward` into
+            // the bank for 4 seconds - and being pressed flush against the bank is precisely the
+            // state that makes the climb impossible (measured: 22s of zero movement at
+            // x=4508.70 vs out in 0.8s from x=4508.40). It also delayed climbBank past the point
+            // where the leg budget ran out. Go straight to the recovery ladder instead.
             const beforeWalk = bot.entity.position.clone();
-            await walkForward(bot, dx, dz, 4000);
+            if (!inWater(bot)) await walkForward(bot, dx, dz, 4000);
             const afterWalk = bot.entity.position;
-            const walkedOver = (afterWalk.x - beforeWalk.x) * dx + (afterWalk.z - beforeWalk.z) * dz;
+            const walkedOver = (afterWalk.x - beforeWalk.x) * ux + (afterWalk.z - beforeWalk.z) * uz;
+            console.log(`[${bot.username ?? '?'}] postwalk: walkedOver=${walkedOver.toFixed(2)} `
+                + `-> ${walkedOver > 1.0 ? 'RESTART LEG' : 'ladder'}`);
             if (walkedOver > 1.0) { stalls = 0; continue; }
         }
         if (moved < 1.0) {
+            // An interrupted leg is not a stall, and the recovery ladder must not run on one.
+            // Every step in it (climbBank, buildFootingBelow, escapeWater, the digs) begins by
+            // checking `interrupt_code` and returns immediately, so the whole ladder silently
+            // no-ops - `climbBank` reporting "still wet after 0ms, gained 0.00" is the
+            // signature. That made four separate wiring fixes look like they did nothing.
+            if (bot.interrupt_code) return result();
             stalls++;
             // Look 10 blocks ahead BEFORE touching the terrain. A ridge we can walk around is
             // far cheaper to walk around than to mine through, and mining a dune drops the sand
@@ -4512,7 +4737,96 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
             // to the bank - but only while the far side is close enough to be a crossing and not
             // an ocean. If the swim itself stalls, fall back to the old bank-first behaviour,
             // because none of the machinery below (dig, bridge, pillar) works while floating.
+            // WADING is not AFLOAT, and this branch is only for afloat. A bot standing on solid
+            // ground in one block of water, head in clear air, is on LAND as far as recovery
+            // goes - it should walk, hop and dig like any other stall. Sending it through the
+            // swim ladder instead had it surfacing, hunting banks and calling `escapeWater`,
+            // which heads for the NEAREST dry land - often backwards. Measured: a bot in a
+            // single block of water with open air on all four sides reporting navMoved -1.9,
+            // -3.0, -0.8 and drifting away from its checkpoint indefinitely.
+            //
+            // Same distinction `nav.js` followPath and `auto_jump.js` already make.
+            // Bias the feet cell UP slightly before flooring it. A bot floating at the surface
+            // sits a hair above the block boundary (measured y=110.03 in 2-deep water), so any
+            // momentary dip flips `floor(y)` down a block, makes the cell below read solid, and
+            // the bot is misclassified as WADING. It then gets the land recovery - which mines -
+            // and tunnels through the bank instead of climbing it. Measured in the gym: depths
+            // 1 and 2 both ending east of the bank at y~110.05, having dug a channel.
+            const feetCell = bot.entity.position.offset(0, 0.15, 0).floored();
+            const headBlk = bot.blockAt(feetCell.offset(0, 1, 0));
+            const belowBlk = bot.blockAt(feetCell.offset(0, -1, 0));
+            const wading = inWater(bot)
+                && !!belowBlk && belowBlk.boundingBox === 'block'
+                && !(headBlk && isWaterName(headBlk.name));
+
+            console.log(`[${bot.username ?? '?'}] recovery: wet=${inWater(bot)} wading=${wading} `
+                + `submerged=${swim.isSubmerged(bot)} stalls=${stalls}`);
+
+            // A one-block bank is the same problem whether the bot is wading or afloat, and
+            // the answer is the same: hold jump continuously so the water impulse lifts it,
+            // rather than AutoJump's three-tick pulse which is not enough here. This used to sit
+            // behind `!wading`, so a bot standing in one block of water never got the climb at
+            // all - it fell straight through to `clearWayAhead` and mined the bank instead.
+            // That is the canal.
             if (inWater(bot)) {
+                // RETRY. One attempt is not enough: climbBank bails after 2.5s without measured
+                // progress (rightly - a genuinely jammed bot must not hold the leg forever), but
+                // getting out of stand-deep water takes several impulses. Measured in isolation:
+                // repeated attempts walked the bot from y=110.0 to y=111.0 over ~17s, while any
+                // single attempt reported `gained 0.00`. Bounded so a hopeless spot still falls
+                // through to the rest of the ladder.
+                let climbed = false;
+                for (let attempt = 0; attempt < 6 && !bot.interrupt_code; attempt++) {
+                    const bankTry = await swim.climbBank(bot, dx, dz);
+                    if (bankTry.out) {
+                        log(bot, `Climbed out of the water onto the bank after ${attempt + 1} attempt(s).`);
+                        climbed = true;
+                        break;
+                    }
+                    if (!bankTry.target) break;   // nothing to climb here; stop wasting the leg
+                }
+                if (climbed) { stalls = 0; continue; }
+            }
+
+            if (inWater(bot) && !wading) {
+                // SUBMERGED first, and before anything else in this branch. A bot under an
+                // overhang - solid ceiling directly above, water at feet and head - cannot rise,
+                // cannot climb a bank, and cannot walk out: buoyancy just presses it into the
+                // ceiling. Observed at (4322, 61, 5034), in a two-block water pocket with stone
+                // at y=63 and the only open faces to the east and south, while the checkpoint
+                // lay west - so every steering decision drove it into the wall.
+                //
+                // `swim.surface` already owns exactly this ladder - rise, move to a neighbouring
+                // open column, cut through a soft ceiling, unwedge - and the traveller simply
+                // never called it. Nothing else here can make progress until the head is out.
+                if (swim.isSubmerged(bot)) {
+                    const up = await swim.surface(bot, { timeoutMs: 12000 });
+                    log(bot, `Submerged and stalled; surfacing (${up.reason}, rose ${up.rose.toFixed(1)}).`);
+                    if (up.surfaced) { stalls = 0; continue; }
+                }
+
+                // Shore first. When the land we want is the bank right in front of us, the move
+                // is to climb ONTO it - not to look for a far bank to swim to, and certainly not
+                // to mine it. Nothing else in this ladder can do it: swimming forward presses
+                // the bot into the bank face, AutoJump refuses to fire in water, and digging and
+                // placing do nothing while afloat. Four legs ground against a one-block bank at
+                // (4264, 62, 4931) before this existed.
+                const bank = await swim.climbBank(bot, dx, dz);
+                if (bank.out) {
+                    log(bot, `Climbed out of the water onto the bank (${bank.gained.toFixed(1)} blocks up).`);
+                    stalls = 0;
+                    continue;
+                }
+
+                // BUILD A FOOTING. The bank is right there and the bot cannot rise onto it: at
+                // the water surface it gets no swim impulse and `onGround` is false, so there is
+                // no jump either. Measured in the test gym at water depths 1-6, where it either
+                // grinds against a one-block bank or mines a channel through it - while carrying
+                // 320 cobblestone it never thought to use. Placing a block on the pool floor
+                // under its feet makes the water shallow enough to STAND in, and the ordinary
+                // step-up takes it from there.
+                if (await buildFootingBelow(bot)) { stalls = 0; continue; }
+
                 const far = swimCrossingTarget(bot, dx, dz, MAX_SWIM_LEG);
                 if (far) {
                     log(bot, `In water; swimming ${far.distance.toFixed(0)} blocks to the far bank.`);
@@ -4569,6 +4883,11 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
                 }
             }
 
+            // `keepFloor` is deliberately NOT set here. It is the right idea only if the bot can
+            // actually climb the one-block step it preserves - and measured on this server it
+            // cannot: `climbBank` held jump against an adjacent one-block bank for 8s and gained
+            // 0.00 blocks. Until that is fixed, mining the bank at water level and swimming into
+            // the hole is the only escape that moves the bot at all, so do not take it away.
             let cleared = await clearWayAhead(bot, dx, dz, stalls > 3);
             // Bridging is for GAPS now. Water wide enough to reach here is water the swim
             // branch above already declined to cross, so filling it in is the right call; water
@@ -4600,7 +4919,15 @@ export async function travelDirection(bot, dx, dz, distance, step = 48) {
             stalls = 0;
         }
     }
-    return travelReport(bot, startPos, dx, dz, distance, dug);
+    return result();
+}
+
+export async function travelDirection(bot, dx, dz, distance, step = 48) {
+    const startPos = bot.entity.position.clone();
+    const targetX = Math.floor(startPos.x + dx * distance);
+    const targetZ = Math.floor(startPos.z + dz * distance);
+    const res = await travelToward(bot, targetX, targetZ, { step, arrive: 2 });
+    return travelReport(bot, startPos, dx, dz, distance, res.dug);
 }
 
 function travelReport(bot, startPos, dx, dz, distance, dug) {
@@ -4617,7 +4944,7 @@ function travelReport(bot, startPos, dx, dz, distance, dug) {
  * Only removes what actually blocks the path, and refuses to touch player-made blocks.
  * @returns {Promise<number>} how many blocks were removed.
  */
-async function clearWayAhead(bot, dx, dz, allowTrees = false) {
+async function clearWayAhead(bot, dx, dz, allowTrees = false, opts = {}) {
     const p = bot.entity.position.floored();
     let removed = 0;
     let blockedByBuild = false;
@@ -4625,7 +4952,13 @@ async function clearWayAhead(bot, dx, dz, allowTrees = false) {
     // boring a 2-high hole through a dune drops everything above straight onto the bot and
     // buries it (observed: 32 minutes entombed at y=55 with sand on every side). Clearing
     // well above head height lets the column collapse once and then stay clear.
-    const heights = [0, 1, 2, 3, 4];
+    //
+    // `keepFloor` leaves the block at the bot's OWN feet level alone. That block is the thing
+    // it is trying to step onto. In water this is the difference between cutting a two-block
+    // bank down to a one-block step and simply making the pond bigger: the bot mined 15 blocks
+    // of an east bank at (4280, 62, 4935), advanced two blocks in twenty minutes, and each dig
+    // let the water follow it in.
+    const heights = opts.keepFloor ? [1, 2, 3, 4] : [0, 1, 2, 3, 4];
     for (const ahead of [1, 2]) {
         for (const dy of heights) {
             const target = new Vec3(p.x + dx * ahead, p.y + dy, p.z + dz * ahead);
@@ -4905,6 +5238,68 @@ export async function climbLedgeByPlacing(bot, dx, dz, rise) {
  * wall to cut a staircase into.
  * @returns {Promise<number>} height actually gained.
  */
+/**
+ * Build a footing under a bot that is AFLOAT, so it can stand up and step out.
+ *
+ * `pillarUp` cannot do this: it requires a solid block directly beneath the bot and jumps to
+ * make clearance, and neither holds while floating. But "pillaring cannot work while floating"
+ * (the note this file used to carry) is too strong - there is usually a POOL FLOOR a couple of
+ * blocks down, and water is replaceable, so a block can be placed on that floor's top face to
+ * fill the cell under the bot's feet. One or two of those turn deep-enough-to-float water into
+ * water shallow enough to stand in, after which the ordinary step-up handles the bank.
+ *
+ * This is the move neither bot ever tried while carrying 320 cobblestone, and it is the one
+ * that the test gym shows is needed: at depths 1-2 the bot can neither rise (no swim impulse at
+ * the surface) nor jump (`onGround` is false), so it grinds against a one-block bank or mines
+ * through it.
+ *
+ * Only useful in shallow water - beyond about 4 blocks the floor is out of reach, and at those
+ * depths the bot can submerge and swim up under its own power anyway.
+ *
+ * @returns {Promise<number>} blocks placed
+ */
+export async function buildFootingBelow(bot, maxPlaces = 3) {
+    const { Vec3 } = await import('vec3');
+    let placed = 0;
+
+    const why = (m) => console.log(`[${bot.username ?? '?'}] footing: ${m}`);
+
+    for (let i = 0; i < maxPlaces; i++) {
+        if (bot.interrupt_code) break;
+        if (!inWater(bot)) { why('not in water'); break; }
+
+        const feet = bot.entity.position.floored();
+        const under = bot.blockAt(feet.offset(0, -1, 0));
+        if (under && under.boundingBox === 'block') { why(`already standing on ${under.name}`); break; }
+
+        // The reference has to be the highest solid in the column and within arm's reach.
+        let ref = null;
+        for (let dy = 2; dy <= 4; dy++) {
+            const b = bot.blockAt(feet.offset(0, -dy, 0));
+            if (b && b.boundingBox === 'block') { ref = b; break; }
+        }
+        if (!ref) { why(`no solid floor within reach under ${feet}`); break; }
+
+        const mat = STACKABLE.map((n) => bot.inventory.items().find((it) => it.name === n)).find(Boolean);
+        if (!mat) { why('nothing stackable in inventory'); break; }
+        try { await bot.equip(mat, 'hand'); } catch (err) { why(`equip failed: ${err.message}`); break; }
+
+        try {
+            await bot.look(bot.entity.yaw, Math.PI / 2, true);   // face straight down
+            await bot.placeBlock(ref, new Vec3(0, 1, 0));
+            placed++;
+            why(`placed ${mat.name} on ${ref.position} (feet ${feet})`);
+        } catch (err) {
+            why(`placeBlock failed on ${ref.position}: ${err.message}`);
+            break;
+        }
+        await new Promise((r) => setTimeout(r, 250));
+    }
+
+    if (placed) log(bot, `Built a footing of ${placed} block(s) to stand on.`);
+    return placed;
+}
+
 export async function pillarUp(bot, blocks = 1) {
     const { Vec3 } = await import('vec3');
     const stackable = STACKABLE;

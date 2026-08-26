@@ -841,6 +841,59 @@ carries the same `!swim.inWater(bot)` guard that `self_preservation`'s idle bran
 
 **To enable Mem0:** Change `andy.json` model to `"api": "mem0"` and set model/url to Azure Foundry endpoint. Mem0 event hooks (`recordDeath`, `recordPlayerJoin`, `recordChestDeposit`) are already wired in `agent.js` and `actions.js` — they become active automatically.
 
+### Ending a goal - there are TWO of them
+
+`!endGoal` used to stop only the self-prompt LOOP. The goal ALSO lives as a record in the typed
+memory store, which renders into `$MEMORY` - injected into **every** conversing prompt. So a
+goal the user had verbally ended was handed back to the model on every turn and it kept resuming
+the work, and `load_memory` restored it after a restart. On disk:
+
+```
+memory.json        self_prompt: null, self_prompting_state: 0     <- the loop really did stop
+memory_store.json  goal:current "Mine minerals below the base..." <- still there, origin "user"
+```
+
+Worse, a **user-origin** goal is immune to agent writes and deletes by design
+(`memory_store.js`), so the model could not drop it either - that is the
+`[History] memory store rejected 1 agent write(s)` line. `setUserGoal` had one caller and no
+counterpart, so nothing anywhere could clear it.
+
+- `!endGoal` now also calls `history.clearGoal(by)`. **Authority is asymmetric**: from a user it
+  deletes the record; from the model it stops the loop only and says so, because the model must
+  never be able to erase what a person asked for. Same rule `!goal` already uses.
+- **Memory summarisation must not mint goals.** `importLegacyBlob` takes `allowGoal`, defaulting
+  to **false**, and only the one-time legacy migration passes true. Without that the fix above
+  lasts about one summarisation: the summariser is an LLM writing markdown under a template that
+  literally contains a `## Goal` header, so it re-created the cleared goal out of the very turns
+  in which it was ended. The store already refused to let the model OVERWRITE a user's goal;
+  nothing stopped it INVENTING one where none stood.
+- A goal is a **directive**, not a memory. It arrives through `!goal` or not at all.
+
+## Andy notices when he is teleported
+
+Nothing consumed `forcedMove` at all outside the swim code, so `/tp andy asanrivas` left the bot
+carrying on toward wherever it had been walking - the in-flight leg keeps its original target,
+so it walks straight back. Observed: `/tp andy asanrivas` at 00:22:57 and 00:36:28, each time
+followed by the bot heading back for a base 7000 blocks away.
+
+`agent._wireTeleportDetection()` samples position every physics tick and, on `forcedMove`,
+compares. **The threshold is the whole design.** `forcedMove` fires on EVERY server position
+packet - login, respawn, and the routine anti-cheat corrections this server sends constantly
+(counting them unconditionally is what tripped SwimAssist's boost valve during spawn). Only
+distance separates a correction from a teleport: `TELEPORT_MIN_BLOCKS = 8`.
+
+On a real teleport it **cancels the running action AND its resume** - cancelling the action
+alone is not enough, because the idle handler replays the resume and the bot walks back anyway -
+then tells the model where it was moved from and to, and not to walk back.
+
+Suppressed for: the login packet (5s grace), respawn (`expectTeleport` from the death handler),
+`!serverTp` (which would otherwise cancel its own rescue), and `cheat` mode. Repeated moves
+coalesce into one message. The decision is the pure `teleportVerdict()`, so every branch is
+tested - the ones that must NOT fire matter more than the one that must.
+
+Verified live: `TELEPORTED 230 blocks (3393, 62, -1797) -> (3601, 80, -1700) during
+action:navTo`, 1 detection and 0 false positives.
+
 ## Steering (user-authored standing instructions)
 
 Give Andy standing instructions that shape how it talks and acts. They persist across restarts

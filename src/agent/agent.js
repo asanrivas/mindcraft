@@ -25,10 +25,47 @@ import { log, validateNameFormat } from './connection_handler.js';
 import { loadNamedChestsFromFile, setNamedChestsSaveCallback } from './library/skills.js';
 import { IdleBehavior } from './idle_behavior.js';
 
+/**
+ * How far the server must move the bot in ONE position packet to count as a teleport.
+ *
+ * This is the load-bearing constant of teleport detection, not a tuning knob. `forcedMove`
+ * fires on every server position packet - login, respawn, and the routine anti-cheat
+ * corrections this server sends constantly - and only distance separates a correction from a
+ * teleport. 8 blocks is far above any correction observed here and far below any deliberate
+ * teleport (the smallest real one in the logs is a `/tp andy asanrivas` across a valley).
+ */
+const TELEPORT_MIN_BLOCKS = 8;
+/** Login sends a position packet before the bot has done anything. Ignore that one. */
+const TELEPORT_SPAWN_GRACE_MS = 5000;
+/** Being moved several times in a row is ONE event to the model, not five. */
+const TELEPORT_REPORT_COOLDOWN_MS = 3000;
+
+/**
+ * Should this position jump be reported to the model as a teleport?
+ *
+ * Pure, and exported, because the live path can only ever exercise whichever branch the world
+ * happens to take - and the branches that matter most are the ones that must NOT fire.
+ *
+ * @returns {'report'|'below-threshold'|'spawn'|'expected'|'cheat'|'coalesced'}
+ */
+export function teleportVerdict({ jumped, sinceSpawnMs, expected = false, cheatOn = false,
+                                  sinceLastReportMs = Infinity }) {
+    if (!(jumped >= TELEPORT_MIN_BLOCKS)) return 'below-threshold';
+    if (sinceSpawnMs < TELEPORT_SPAWN_GRACE_MS) return 'spawn';
+    if (expected) return 'expected';
+    if (cheatOn) return 'cheat';
+    if (sinceLastReportMs < TELEPORT_REPORT_COOLDOWN_MS) return 'coalesced';
+    return 'report';
+}
+
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
         this.last_sender = null;
         this.count_id = count_id;
+        // Set before any packet can arrive: an unset value would make the grace-window check
+        // NaN, which compares false, and the login teleport would be reported as an operator
+        // moving the bot.
+        this._spawned_at = Date.now();
 
         // Initialize components with more detailed error handling
         this.actions = new ActionManager(this);
@@ -114,6 +151,9 @@ export class Agent {
 
         this.bot.on('login', () => {
             console.log(this.name, 'logged in!');
+            // Stamped so teleport detection can ignore the position packet that arrives with
+            // the login itself - see TELEPORT_SPAWN_GRACE_MS.
+            this._spawned_at = Date.now();
             serverProxy.login();
 
             // Set skin for profile, requires Fabric Tailor. (https://modrinth.com/mod/fabrictailor)
@@ -544,6 +584,95 @@ export class Agent {
         }
     }
 
+    /**
+     * Suppress teleport reporting for a while, because we are about to cause one ourselves.
+     *
+     * `!serverTp` and a respawn both move the bot a long way on purpose; reporting those as
+     * "somebody teleported you" and cancelling the action that asked for it would break the
+     * rescue hatch and spam the model after every death.
+     */
+    expectTeleport(ms = 4000, reason = 'expected') {
+        this._expected_teleport_until = Date.now() + ms;
+        this._expected_teleport_reason = reason;
+    }
+
+    /**
+     * Notice when the SERVER moves the bot, and tell the model.
+     *
+     * Until now nothing consumed this at all: mineflayer emits `forcedMove` from its server
+     * position-packet handler (`physics.js`), which is exactly what `/tp` produces, but the only
+     * listeners were the swim probe and SwimAssist's anti-cheat valve. So an operator could
+     * `/tp andy asanrivas` and the bot would carry on toward wherever it had been walking - the
+     * in-flight travel leg keeps its original target, so it immediately walks back the way it
+     * came. Observed live: `/tp andy asanrivas` at 00:22:57 and again at 00:36:28, each time
+     * followed by the bot heading straight back for a base 7000 blocks away.
+     *
+     * THE THRESHOLD IS THE WHOLE DESIGN. `forcedMove` fires on EVERY server position packet -
+     * login, respawn, and the routine anti-cheat corrections this server sends constantly (see
+     * `swim_assist.js`, whose valve was tripped during spawn by exactly this mistake). A
+     * correction nudges the bot; a teleport moves it far in a single packet. Only distance
+     * separates them.
+     */
+    _wireTeleportDetection() {
+        // Sampled every physics tick, so at forcedMove time it holds the position from at most
+        // ~50ms ago - under a block of ordinary movement, and far below the threshold.
+        let lastPos = null;
+        this.bot.on('physicsTick', () => {
+            if (this.bot.entity?.position) lastPos = this.bot.entity.position.clone();
+        });
+
+        this.bot.on('forcedMove', () => {
+            const now = this.bot.entity?.position;
+            if (!now || !lastPos) { lastPos = now?.clone() ?? null; return; }
+
+            const jumped = lastPos.distanceTo(now);
+            const from = lastPos.clone();
+            lastPos = now.clone();
+
+            const verdict = teleportVerdict({
+                jumped,
+                sinceSpawnMs: Date.now() - this._spawned_at,
+                expected: Date.now() < (this._expected_teleport_until ?? 0),
+                // With cheats on, teleporting is a normal way to travel and not worth narrating.
+                cheatOn: !!(this.bot.modes?.exists('cheat') && this.bot.modes.isOn('cheat')),
+                sinceLastReportMs: Date.now() - (this._last_teleport_report ?? -Infinity),
+            });
+            if (verdict !== 'report') {
+                if (verdict !== 'below-threshold') {
+                    console.log(`[${this.name}] teleport ignored (${verdict}`
+                        + `${verdict === 'expected' ? `: ${this._expected_teleport_reason}` : ''}), `
+                        + `${jumped.toFixed(0)} blocks`);
+                }
+                return;
+            }
+            this._last_teleport_report = Date.now();
+
+            const fmt = (p) => `(${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)})`;
+            const interrupted = this.actions.currentActionLabel;
+            console.log(`[${this.name}] TELEPORTED ${jumped.toFixed(0)} blocks `
+                + `${fmt(from)} -> ${fmt(now)}${interrupted ? ` during ${interrupted}` : ''}`);
+
+            // Cancel what was running, AND its resume. Cancelling the action alone is not
+            // enough - the idle handler replays the stored resume, so the bot would walk back
+            // to the old target anyway, which is the whole behaviour this is here to stop.
+            // A destination chosen before the move is simply no longer the destination.
+            if (interrupted) {
+                this.actions.cancelResume();
+                this.actions.stop();
+            }
+
+            this.handleMessage('system',
+                `(AUTO MESSAGE) You were teleported ${jumped.toFixed(0)} blocks by the server, `
+                + `from ${fmt(from)} to ${fmt(now)}. `
+                + (interrupted
+                    ? `Your action '${interrupted}' was cancelled, because its destination was `
+                      + `chosen before you were moved. `
+                    : '')
+                + 'Do not walk back unless someone asks you to. Check where you are now and '
+                + 'wait for instructions.');
+        });
+    }
+
     startEvents() {
         // Custom events
         this.bot.on('time', () => {
@@ -601,7 +730,12 @@ export class Agent {
         this.bot.on('death', () => {
             this.actions.cancelResume();
             this.actions.stop();
+            // A respawn is a position jump, and mineflayer emits a DELAYED forcedMove 1.5s
+            // later for it (physics.js). Do not report that as somebody teleporting the bot.
+            this.expectTeleport(6000, 'respawn');
         });
+
+        this._wireTeleportDetection();
         this.bot.on('kicked', (reason) => {
             console.warn('Bot kicked!', reason);
             // Clear watchdog interval

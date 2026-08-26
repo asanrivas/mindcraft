@@ -23,6 +23,8 @@ bun run test        # every tests/*.test.mjs
 | `tests/action_owner.test.mjs` | who owns the running action, and **resume ownership across a mode interrupt** |
 | `tests/modes.test.mjs` | every mode `execute()` call site passes a timeout |
 | `tests/torch.test.mjs` | the torch-placing light check, all four light/time quadrants |
+| `tests/teleport.test.mjs` | teleport detection: the threshold, and every branch that must NOT fire |
+| `tests/memory_store.test.mjs` | durable memory, goal authority, and that summarisation cannot mint goals |
 
 ### The regression cases — keep them
 
@@ -42,6 +44,13 @@ bun run test        # every tests/*.test.mjs
   reads 15 at midnight exactly as at noon — so it only means "daylight reaches here" when paired
   with `timeOfDay`. Without the pairing the check either disables torches underground or lets
   the desert spam back in, and each firing of `torch_placing` interrupts a follow.
+- **An anti-cheat correction must never read as a teleport.** `forcedMove` fires on every
+  server position packet; only distance separates a nudge from a `/tp`. The branches that must
+  NOT fire (login, respawn, `!serverTp`, cheat mode, coalescing) are the ones worth testing.
+- **Summarisation must not mint a goal.** The summariser is an LLM writing markdown under a
+  template containing a `## Goal` header, so with goals allowed it re-creates one the user just
+  ended, out of the very turns in which they ended it. Both call sites are asserted, because
+  getting the flag backwards restores the bug with every other test still green.
 - **A mode must not cancel the resume of the action it interrupted** — otherwise `torch_placing`
   *ends* a follow instead of pausing it. The paired case matters just as much: an action must
   still clear its OWN resume on clean completion, or the idle handler replays it forever. See

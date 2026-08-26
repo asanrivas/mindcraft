@@ -15,11 +15,12 @@ thing is built the way it is, what was measured, and which bugs are still open.
 |---|---|
 | [NAVIGATION_REBUILD.md](NAVIGATION_REBUILD.md) | Why mineflayer-pathfinder was replaced: the protocol-775 mismatch, the broken `onGround`, the A\* planner and lookahead executor, the cost model, 12 bugs, and the 1018-block verification journey |
 | [CLIENT_REPLACEMENT.md](CLIENT_REPLACEMENT.md) | Replacing mineflayer itself: the `src/mc/` seam, the borrow-vs-build call per layer, the milestone ladder, and the corrected prismarine-chunk claim |
-| [SWIMMING.md](SWIMMING.md) | Swimming, diving, sprint-swimming and oxygen. Measured swim speeds, the `waterCost` correction, SwimAssist, the `drowning` mode, and one still-open failure mode |
+| [SWIMMING.md](SWIMMING.md) | Everything wet: measured swim speeds, the three wet states, **climbing out onto a bank** (the reason the bot used to dig canals), SwimAssist, the `drowning` mode, and the still-open failure modes |
+| [MARATHON.md](MARATHON.md) | `travelToward`, checkpoint marathons, route surveying, and who owns a running action |
 | [WORLD_TOOLS.md](WORLD_TOOLS.md) | Seed lookup, `/locate biome`, operator teleport/gamemode/spawnpoint, block states, and placing blocks next to the bot |
 
 **Read together:** the water cost model lives in NAVIGATION_REBUILD, the physics that justifies
-it lives in SWIMMING.
+it lives in SWIMMING, and the journeys that spend it live in MARATHON.
 
 ## Model, memory and behaviour
 
@@ -76,3 +77,13 @@ swimming work.
    interrupts while the bot drowned.
 7. **Instrument before the third hypothesis.** Three numbers in `!stats` ended a diagnosis that
    had already consumed several wrong guesses.
+8. **A fix that works in isolation is not a fix.** `climbBank` passed its own harness while the
+   real `!travel` route still failed, because `walkForward` was re-creating the bad state
+   before it ran. Always verify through the path the bot actually takes.
+9. **Every subsystem can be individually correct and the bot still totally stuck.** Four of them
+   each correctly declined to press jump, and the bot sat at `vel=(0,0,0)` for twenty minutes.
+   Look for the gap between the cases, not for the broken component.
+10. **State that belongs to someone else is not yours to clear.** A mode's clean completion
+    wiped the resume of the action it had interrupted, so a follow *ended* instead of pausing.
+11. **`await` is not a yield.** A loop whose only awaits are microtasks starves the event loop
+    and the server drops the client — which looks exactly like the bot dying in-world.

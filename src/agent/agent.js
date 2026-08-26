@@ -5,7 +5,7 @@ import { VisionInterpreter } from './vision/vision_interpreter.js';
 import { Prompter } from '../models/prompter.js';
 import { initModes } from './modes.js';
 import { initBot } from '../utils/mcdata.js';
-import { containsCommand, commandExists, executeCommand, truncCommandMessage, isAction, blacklistCommands } from './commands/index.js';
+import { containsCommand, commandExists, executeCommand, truncCommandMessage, isAction, takesOverBot, blacklistCommands } from './commands/index.js';
 import { ActionManager } from './action_manager.js';
 import { NPCContoller } from './npc/controller.js';
 import { MemoryBank } from './memory_bank.js';
@@ -16,6 +16,7 @@ import { handleTranslation, handleEnglishTranslation } from '../utils/translator
 import { addBrowserViewer } from './vision/browser_viewer.js';
 import { AutoJump } from './library/auto_jump.js';
 import { SwimAssist } from './library/swim_assist.js';
+import * as swim from './library/swim.js';
 import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
 import { Task } from './tasks/tasks.js';
@@ -455,6 +456,24 @@ export class Agent {
                         this.routeResponse(source, pre_message);
                 }
 
+                // A command a PERSON asked for outranks one the model thought of. Without this,
+                // any long user-issued action is cancelled by the model's very next turn:
+                // observed live, a marathon the user had just started was killed six seconds in
+                // by `!travel("west", 500)` left over from a stale conversational thread, and
+                // the run silently became a walk in the opposite direction.
+                //
+                // Only ACTIONS are blocked - queries (!stats, !inventory) are free, so the model
+                // can still see what is going on and answer. Modes are untouched: drowning and
+                // self-defence still interrupt everything, including this.
+                if (takesOverBot(command_name) && this.actions.isUserOwned()) {
+                    const busy = `Refused ${command_name}: '${this.actions.currentActionLabel}' `
+                        + `was started by a user and is still running. Wait for it to finish, or `
+                        + `ask them to stop it - you cannot cancel it yourself.`;
+                    console.log(`[${this.name}] ${busy}`);
+                    this.history.add('system', busy);
+                    break;
+                }
+
                 this.command_author = 'model';   // see the note on the user path above
                 let execute_res = await executeCommand(this, res);
 
@@ -631,8 +650,32 @@ export class Agent {
                 }
             }
         });
+        // Repair mineflayer's difficulty reporting before anything reads it.
+        //
+        // `lib/plugins/game.js` sets the field with `if (packet.difficulty)` - and PEACEFUL IS
+        // ZERO, which is falsy. So on a Peaceful server the login packet never assigns it and
+        // `bot.game.difficulty` stays `undefined` forever. Every check written against it
+        // silently fails open: `mode:night_safety`'s Peaceful guard read `undefined`, decided
+        // the world was dangerous, and dug the bot in for the night - cancelling a user's
+        // marathon 12 seconds after it started.
+        //
+        // The later `difficulty` packet handler has no such guard, so this only bites when the
+        // world was already Peaceful when the bot logged in - which is the common case.
+        const DIFFICULTIES = ['peaceful', 'easy', 'normal', 'hard'];
+        const setDifficulty = (packet) => {
+            if (packet?.difficulty == null) return;      // == null: absent, but 0 is valid
+            this.bot.game.difficulty = DIFFICULTIES[packet.difficulty] ?? this.bot.game.difficulty;
+        };
+        this.bot._client.on('login', setDifficulty);
+        this.bot._client.on('difficulty', setDifficulty);
+
         this.bot.on('idle', () => {
-            this.bot.clearControlStates();
+            // Not while wet. SwimAssist owns the jump key whenever the bot is in water - that
+            // key is its buoyancy, not a movement input - and clearing it here drops the bot
+            // off the surface until SwimAssist's next tick notices. `self_preservation`'s idle
+            // branch already carries this guard; this one was missed, and it fires after EVERY
+            // action completes, which is most of the time a floating bot is idle at all.
+            if (!swim.inWater(this.bot)) this.bot.clearControlStates();
             this.bot.pathfinder.stop(); // clear any lingering pathfinder
             this.bot.modes.unPauseAll();
             setTimeout(() => {

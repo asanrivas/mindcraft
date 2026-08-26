@@ -1,3 +1,4 @@
+import assert from 'assert';
 import { getBudget } from '../utils/context_budget.js';
 
 export class ActionManager {
@@ -9,6 +10,10 @@ export class ActionManager {
         this.timedout = false;
         this.resume_func = null;
         this.resume_name = '';
+        // Who asked for the action currently running: 'user', 'model' or 'mode'. A long action
+        // a person started must not be cancelled by the model's next turn - see isUserOwned().
+        this.action_author = null;
+        this.resume_author = null;
         this.last_action_time = 0;
         this.recent_action_counter = 0;
     }
@@ -17,12 +22,29 @@ export class ActionManager {
         return this._executeResume(actionFn, timeout);
     }
 
-    async runAction(actionLabel, actionFn, { timeout, resume = false } = {}) {
+    async runAction(actionLabel, actionFn, { timeout, resume = false, author = null } = {}) {
+        // Fall back to the author of the command being handled right now. Modes pass 'mode'
+        // explicitly, because command_author still holds whoever issued the LAST command and
+        // would otherwise make a safety interrupt look user-initiated.
+        const who = author ?? this.agent.command_author ?? null;
         if (resume) {
-            return this._executeResume(actionLabel, actionFn, timeout);
+            return this._executeResume(actionLabel, actionFn, timeout, who);
         } else {
-            return this._executeAction(actionLabel, actionFn, timeout);
+            return this._executeAction(actionLabel, actionFn, timeout, who);
         }
+    }
+
+    /**
+     * Is a person waiting on the action that is running right now?
+     *
+     * The model gets its own turn while a long action is in flight, and any action command in
+     * that turn cancels it. Observed live: a user-issued marathon was killed six seconds in by
+     * `!travel("west", 500)` from a stale conversational thread, and the run silently became a
+     * walk in the opposite direction. Modes are deliberately NOT covered - drowning and
+     * self-defence must still interrupt anything.
+     */
+    isUserOwned() {
+        return this.executing && this.action_author === 'user';
     }
 
     async stop() {
@@ -41,18 +63,22 @@ export class ActionManager {
     cancelResume() {
         this.resume_func = null;
         this.resume_name = null;
+        this.resume_author = null;
     }
 
-    async _executeResume(actionLabel = null, actionFn = null, timeout = 10) {
+    async _executeResume(actionLabel = null, actionFn = null, timeout = 10, author = null) {
         const new_resume = actionFn != null;
         if (new_resume) { // start new resume
             this.resume_func = actionFn;
             assert(actionLabel != null, 'actionLabel is required for new resume');
             this.resume_name = actionLabel;
+            // Remember who asked, so a resumed leg is still theirs. `resumeAction()` is called
+            // from the idle handler with no author at all.
+            this.resume_author = author;
         }
         if (this.resume_func != null && (this.agent.isIdle() || new_resume) && (!this.agent.self_prompter.isActive() || new_resume)) {
             this.currentActionLabel = this.resume_name;
-            let res = await this._executeAction(this.resume_name, this.resume_func, timeout);
+            let res = await this._executeAction(this.resume_name, this.resume_func, timeout, this.resume_author);
             this.currentActionLabel = '';
             return res;
         } else {
@@ -60,7 +86,7 @@ export class ActionManager {
         }
     }
 
-    async _executeAction(actionLabel, actionFn, timeout = 10) {
+    async _executeAction(actionLabel, actionFn, timeout = 10, author = null) {
         let TIMEOUT;
         try {
             if (this.last_action_time > 0) {
@@ -97,6 +123,7 @@ export class ActionManager {
             this.executing = true;
             this.currentActionLabel = actionLabel;
             this.currentActionFn = actionFn;
+            this.action_author = author;
 
             // timeout in minutes
             if (timeout > 0) {
@@ -111,6 +138,7 @@ export class ActionManager {
 
             // mark action as finished + cleanup
             this.executing = false;
+            this.action_author = null;
             this.currentActionLabel = '';
             this.currentActionFn = null;
             clearTimeout(TIMEOUT);
@@ -127,7 +155,20 @@ export class ActionManager {
             // to the bot's own position re-ran every second for hours, hammering the
             // LLM and filling GPU VRAM). Interrupted/timed-out actions keep their
             // resume state so the intended resume-after-disruption still works.
-            if (!interrupted && !timedout) {
+            //
+            // BUT THE RESUME BELONGS TO WHOEVER REGISTERED IT, and a mode is a transient
+            // interruption rather than a new intent - that is the entire reason `resume`
+            // exists. Cancelling it here unconditionally meant a mode's own clean completion
+            // wiped the resume state of the action it had just interrupted. Observed live:
+            // `mode:torch_placing` interrupts `action:followPlayer` (it lists it in
+            // `interrupts`), places one torch, completes cleanly, and clears follow's resume
+            // - so the follow ENDED instead of pausing. `should_reprompt` then fired an
+            // "(AUTO MESSAGE) your previous action was interrupted" at the model, which
+            // guessed its way through !goToPlayer / !navTo / !entities / !lookAtPlayer
+            // instead. From the user's side the bot simply stopped following, every ~5s,
+            // in daylight, forever.
+            const ownsResume = this.resume_name === actionLabel;
+            if (!interrupted && !timedout && (ownsResume || author !== 'mode')) {
                 this.cancelResume();
             }
 
@@ -140,10 +181,14 @@ export class ActionManager {
             return { success: true, message: output, result, interrupted, timedout };
         } catch (err) {
             this.executing = false;
+            this.action_author = null;
             this.currentActionLabel = '';
             this.currentActionFn = null;
             clearTimeout(TIMEOUT);
-            this.cancelResume();
+            // Same rule as the clean-completion path above: a mode that throws must not take
+            // the interrupted action's resume down with it. `torch_placing` calling
+            // `placeBlock` into an occupied cell throws routinely.
+            if (this.resume_name === actionLabel || author !== 'mode') this.cancelResume();
             console.error("Code execution triggered catch:", err);
             // Log the full stack trace
             console.error(err.stack);

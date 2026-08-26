@@ -34,3 +34,10 @@ src/mindcraft-py/__pycache__/
 logs/
 maps/
 minedmap_output/
+
+# minecraft-assets download used by tools/setup_viewer_assets.mjs (~142MB)
+.viewer-assets-cache/
+
+# timelapse output (tools/timelapse.mjs)
+recordings/
+scratchpad/

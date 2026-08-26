@@ -65,6 +65,46 @@ export function recordId(kind, key) {
     return `${kind}:${key}`;
 }
 
+/** Kinds whose lines are prose, not name/value pairs - rendered without a key. */
+const PROSE_KINDS = new Set([KIND.LESSON, KIND.NOTE]);
+
+/**
+ * Collapse a key to its identity, so re-summarising updates a fact instead of duplicating it.
+ *
+ * Live memory had grown to 66 records, mostly near-duplicates, because each summarisation
+ * invents slightly different wording for the same fact and every variant became its own row:
+ *
+ *     "Coal: 7-8 blk W/SW of base, 7 down"      vs  "Coal ore: 7-8 blocks W/SW of base, 7 down"
+ *     "Chests: x3391-3395, y62, z4886"          vs  "5 chests: x3391-3395, y62, z4886"
+ *     "Torches: 3393,62,4887; 3391,62,4887"     vs  "Torches inside: 3393,62,4887 and ..."
+ *
+ * Nothing was lost, but recall bloats and the prompt fills with the same fact three times. So
+ * strip the parts that vary without changing meaning: leading counts, the "ore" suffix, plural
+ * s, and positional qualifiers.
+ */
+export function normalizeKey(key) {
+    return String(key ?? '')
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]+/g, ' ')          // punctuation is never identity
+        .replace(/^\s*\d+\s+/, '')              // "5 chests" -> "chests"
+        .replace(/\b(ore|ores|block|blocks)\b/g, '')
+        .replace(/\b(inside|nearby|location|locations|here|area|spot)\b/g, '')
+        .replace(/s\b/g, '')                    // crude plural fold; identity only, never displayed
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+/** Collapse a value the same way, to catch two keys carrying one fact. */
+export function normalizeValue(value) {
+    return String(value ?? '')
+        .toLowerCase()
+        .replace(/\b(and|the|of|at|approximately|approx|about|around)\b/g, ' ')
+        .replace(/\bblk\b/g, '')
+        .replace(/\b(block|blocks)\b/g, '')
+        .replace(/[^a-z0-9]+/g, '')
+        .trim();
+}
+
 export class MemoryStore {
     /**
      * @param {object} [opts]
@@ -95,7 +135,19 @@ export class MemoryStore {
         if (!kind || typeof kind !== 'string') return this._reject('missing kind');
         if (typeof value !== 'string' || !value.trim()) return this._reject('empty value');
         if (!Object.values(ORIGIN).includes(origin)) return this._reject(`bad origin "${origin}"`);
-        const k = String(key ?? 'current').trim() || 'current';
+        let k = String(key ?? 'current').trim() || 'current';
+
+        // Fold onto an existing row that means the same thing, so a re-worded restatement UPDATES
+        // the fact rather than adding a third copy of it. Match on the normalised key first, then
+        // on the normalised value - two different keys can carry one fact ("Coal" / "Coal ore").
+        if (kind !== KIND.GOAL) {
+            const nk = normalizeKey(k), nv = normalizeValue(value);
+            for (const r of this.records.values()) {
+                if (r.kind !== kind) continue;
+                if (normalizeKey(r.key) === nk || (nv && normalizeValue(r.value) === nv)) { k = r.key; break; }
+            }
+        }
+
         const id = recordId(kind, k);
         const existing = this.records.get(id);
 
@@ -187,6 +239,10 @@ export class MemoryStore {
             if (!rows.length) continue;
             if (kind === KIND.GOAL) {
                 parts.push(`## ${HEADINGS[kind]}\n${rows[0].value}`);
+            } else if (PROSE_KINDS.has(kind)) {
+                // Their keys are content hashes for dedup, not names - printing them would repeat
+                // the sentence back at itself.
+                parts.push(`## ${HEADINGS[kind]}\n` + rows.map(r => `- ${r.value}`).join('\n'));
             } else {
                 parts.push(`## ${HEADINGS[kind]}\n` + rows.map(r => `- ${r.key}: ${r.value}`).join('\n'));
             }
@@ -247,9 +303,23 @@ export class MemoryStore {
             for (const line of body.split('\n')) {
                 const clean = line.replace(/^[-*]\s*/, '').trim();
                 if (!clean) continue;
-                const m = clean.match(/^([^:]{1,40}):\s*(.+)$/);
-                const key = m ? m[1].trim() : clean.slice(0, 32);
-                const value = m ? m[2].trim() : clean;
+
+                let key, value;
+                if (PROSE_KINDS.has(kind)) {
+                    // Lessons and notes are sentences, not name/value pairs. Splitting them on the
+                    // first colon produced rows like
+                    //   "goToSurface unreliable; climbOut: goToSurface unreliable; c"
+                    // where the key was a TRUNCATED PREFIX OF ITS OWN VALUE, displayed twice.
+                    // Key them by normalised content instead - identity only, never rendered.
+                    value = clean;
+                    key = normalizeKey(clean).slice(0, 48) || clean.slice(0, 32);
+                } else {
+                    const m = clean.match(/^([^:]{1,40}):\s*(.+)$/);
+                    key = m ? m[1].trim() : clean.slice(0, 32);
+                    value = m ? m[2].trim() : clean;
+                    // "Parched:: Parched:" came from a value that just restates its own key.
+                    if (normalizeValue(value) === normalizeKey(key)) value = clean;
+                }
                 if (this.put({ kind, key, value, origin: ORIGIN.AGENT }).ok) imported++;
             }
         }

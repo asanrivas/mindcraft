@@ -1,21 +1,19 @@
 {
     "name": "andy",
     "model": {
-        "api": "openrouter",
-        "model": "stealth/ox-alpha",
+        "api": "digitalocean",
+        "model": "llama-4-maverick",
         "params": {
-            "max_tokens": 2048,
+            "max_tokens": 4096,
             "temperature": 0.7
         }
     },
     "backup_model": [
         {
-            "api": "fireworks",
-            "model": "deepseek-v4-flash-0731",
-            "url": "https://api.fireworks.ai/inference/v1",
+            "api": "google",
+            "model": "gemini-2.5-flash",
             "params": {
-                "max_tokens": 1024,
-                "reasoning_effort": "low",
+                "max_tokens": 4096,
                 "temperature": 0.7
             }
         },

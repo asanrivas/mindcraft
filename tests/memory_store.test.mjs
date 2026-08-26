@@ -7,7 +7,7 @@
  * ("travel west to red bed at -2572,63,5269"), and the overwrite reloaded on every restart.
  * That must now be structurally impossible, not merely discouraged.
  */
-import { MemoryStore, ORIGIN, KIND, recordId } from '../src/agent/memory_store.js';
+import { MemoryStore, ORIGIN, KIND, recordId, normalizeKey, normalizeValue } from '../src/agent/memory_store.js';
 
 let failures = 0;
 const check = (label, got, want) => {
@@ -50,6 +50,71 @@ const mk = (opts = {}) => new MemoryStore({ now: () => ++clock, ...opts });
     check('user overrides an agent goal', s.setGoal('come home', ORIGIN.USER).ok, true);
     check('user value wins', s.goal(), 'come home');
     check('agent cannot take it back', s.setGoal('explore west again', ORIGIN.AGENT).ok, false);
+}
+
+// --- DEDUP: the second live defect ----------------------------------------------------------------
+// Live memory reached 66 records, mostly near-duplicates: every summarisation re-worded the same
+// fact and each variant became its own row. Nothing was lost, but recall bloats and the prompt
+// carries the same fact three times.
+check('ore suffix folds', normalizeKey('Coal ore'), normalizeKey('Coal'));
+check('leading count folds', normalizeKey('5 chests'), normalizeKey('Chests'));
+check('qualifier folds', normalizeKey('Torches inside'), normalizeKey('Torches'));
+check('distinct keys stay distinct', normalizeKey('Coal') === normalizeKey('Copper'), false);
+check('blk/blocks fold in values', normalizeValue('7-8 blk W of base'), normalizeValue('7-8 blocks W of base'));
+check('connector words fold', normalizeValue('a and b'), normalizeValue('a b'));
+
+{
+    const s = mk();
+    s.put({ kind: KIND.LOCATION, key: 'Coal', value: '7-8 blk W/SW of base, 7 down', origin: ORIGIN.AGENT });
+    s.put({ kind: KIND.LOCATION, key: 'Coal ore', value: '7-8 blocks W/SW of base, 7 down', origin: ORIGIN.AGENT });
+    check('re-worded key updates in place', s.list(KIND.LOCATION).length, 1);
+    check('newest wording wins', s.list(KIND.LOCATION)[0].value, '7-8 blocks W/SW of base, 7 down');
+    check('it is an update, not an insert', s.list(KIND.LOCATION)[0].revision, 2);
+
+    s.put({ kind: KIND.LOCATION, key: 'Copper', value: '14 blocks W, 12 down', origin: ORIGIN.AGENT });
+    check('genuinely different facts still added', s.list(KIND.LOCATION).length, 2);
+}
+{
+    // Two different keys can carry one fact; value folding catches those.
+    const s = mk();
+    s.put({ kind: KIND.LOCATION, key: 'Chests', value: 'x3391-3395, y62, z4886', origin: ORIGIN.AGENT });
+    s.put({ kind: KIND.LOCATION, key: '5 chests', value: 'x3391-3395, y62, z4886', origin: ORIGIN.AGENT });
+    check('duplicate fact folds to one row', s.list(KIND.LOCATION).length, 1);
+}
+{
+    // A goal must never be folded into some other row by key similarity.
+    const s = mk();
+    s.setGoal('do the thing', ORIGIN.USER);
+    s.put({ kind: KIND.GOAL, key: 'goals', value: 'sneaky', origin: ORIGIN.AGENT });
+    check('goal is not fold-merged away', s.goal(), 'do the thing');
+}
+
+// --- prose kinds: keys are identity, not display ------------------------------------------------------
+{
+    // The live bug: splitting a sentence on its first colon made the key a TRUNCATED PREFIX of its
+    // own value, then rendered both -> "goToSurface unreliable; climbOut: goToSurface unreliable; c"
+    const s = mk();
+    s.importLegacyBlob('## Lessons\n- goToSurface unreliable; climbOut is better.');
+    const out = s.render(500);
+    check('lesson renders once', (out.match(/goToSurface/g) || []).length, 1);
+    check('lesson keeps its full text', /climbOut is better/.test(out), true);
+    check('no key prefix is printed', /climbOut: goToSurface/.test(out), false);
+}
+{
+    // "Parched:: Parched:" - a value that merely restates its key.
+    const s = mk();
+    s.importLegacyBlob('## Players\n- Parched: Parched');
+    const out = s.render(500);
+    check('self-restating value is not doubled', /Parched:: /.test(out), false);
+}
+{
+    // Re-importing the same summary twice must not double the store.
+    const s = mk();
+    const blob = '## Locations\n- Base: 3391,62,4890\n## Lessons\n- travel beats navTo here.';
+    s.importLegacyBlob(blob);
+    const after1 = s.records.size;
+    s.importLegacyBlob(blob);
+    check('re-import is idempotent', s.records.size, after1);
 }
 
 // --- validation ---------------------------------------------------------------------------------
@@ -116,7 +181,9 @@ const mk = (opts = {}) => new MemoryStore({ now: () => ++clock, ...opts });
 {
     // A store full of user rows must not spin trying to evict what it may not evict.
     const s = mk({ maxRecords: 2 });
-    for (let i = 0; i < 6; i++) s.put({ kind: KIND.NOTE, key: `u${i}`, value: 'x', origin: ORIGIN.USER });
+    // Distinct values: identical ones would (correctly) fold into a single row, which is the
+    // dedup test above, not this one.
+    for (let i = 0; i < 6; i++) s.put({ kind: KIND.NOTE, key: `u${i}`, value: `fact number ${i}`, origin: ORIGIN.USER });
     check('user rows are never evicted', s.records.size, 6);
 }
 
@@ -136,7 +203,7 @@ const mk = (opts = {}) => new MemoryStore({ now: () => ++clock, ...opts });
     // The budget must never be the thing that loses the goal.
     const s = mk();
     s.setGoal('CRITICAL GOAL', ORIGIN.USER);
-    for (let i = 0; i < 40; i++) s.put({ kind: KIND.NOTE, key: `n${i}`, value: 'x'.repeat(60), origin: ORIGIN.AGENT });
+    for (let i = 0; i < 40; i++) s.put({ kind: KIND.NOTE, key: `n${i}`, value: `distinct note ${i} ` + 'y'.repeat(50), origin: ORIGIN.AGENT });
     const out = s.render(200);
     check('render respects the budget', out.length <= 200, true);
     check('goal survives truncation', /CRITICAL GOAL/.test(out), true);

@@ -461,6 +461,19 @@ export function truncCommandMessage(message) {
     return message;
 }
 
+/**
+ * Would running this command take the bot over - stop what it is doing and drive it?
+ *
+ * Set by `runAsAction`, so it is true exactly for the commands that call
+ * `agent.actions.runAction` and therefore cancel whatever is already running. A command that
+ * only reads state (!marathonStatus) is in the action list but takes nothing over, and must not
+ * be blocked by the user-ownership guard - the model still needs to see what is happening.
+ */
+export function takesOverBot(name) {
+    const command = getCommand(name);
+    return !!command && command.perform?.takesOverBot === true;
+}
+
 export function isAction(name) {
     return actionsList.find(action => action.name === name) !== undefined;
 }

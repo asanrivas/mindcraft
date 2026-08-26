@@ -70,6 +70,11 @@ function runAsAction (actionFn, resume = false, timeout = -1) {
         return code_return.message;
     }
 
+    // Mark it as taking over the bot. `agent.js` refuses a MODEL-issued command of this kind
+    // while a user-issued action is running - but only this kind. A command that merely reads
+    // state (!marathonStatus) cannot cancel anything, and blocking it left the model unable to
+    // find out what was going on, which is the opposite of what the guard is for.
+    wrappedAction.takesOverBot = true;
     return wrappedAction;
 }
 
@@ -127,12 +132,159 @@ export const actionsList = [
             const t0 = Date.now();
             const probe = nav.planPath(agent.bot, new Vec3(x, y, z));
             console.warn(`[navTo] plan took ${Date.now() - t0}ms length=${probe ? probe.length : 'null'} first=${probe && probe[1] ? JSON.stringify(probe[1]) : '-'} last=${probe && probe.length ? JSON.stringify(probe[probe.length-1]) : '-'}`);
-            const res = await nav.navigateTo(agent.bot, new Vec3(x, y, z), {});
+            // `debug` on for the manual command: !navTo is the tool you reach for when the bot
+            // will not move, and without the per-second pos/fwd/onGround/vel line there is
+            // nothing to distinguish "no plan" from "plan fine, executor stuck".
+            const res = await nav.navigateTo(agent.bot, new Vec3(x, y, z), { debug: true });
             const p = agent.bot.entity.position;
             return `NAV: arrived=${res.arrived} covered=${res.covered.toFixed(1)} replans=${res.replans} `
                 + `from=(${start.x.toFixed(0)},${start.y.toFixed(0)},${start.z.toFixed(0)}) `
                 + `to=(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`;
         }, true, 10)
+    },
+    {
+        name: '!climbBankTest',
+        description: 'Debug: repeatedly attempt swim.climbBank toward a compass direction for N seconds.',
+        params: {
+            'direction': { type: 'string', description: 'west/east/north/south' },
+            'seconds': { type: 'int', description: 'how long to keep trying', domain: [1, 120] }
+        },
+        perform: runAsAction(async (agent, direction, seconds) => {
+            const swimMod = await import('../library/swim.js');
+            const dirs = { west: [-1, 0], east: [1, 0], north: [0, -1], south: [0, 1] };
+            const d = dirs[String(direction).toLowerCase()];
+            if (!d) return `Unknown direction "${direction}".`;
+            const bot = agent.bot;
+            const start = bot.entity.position.clone();
+            const deadline = Date.now() + seconds * 1000;
+            let tries = 0, out = false;
+            while (Date.now() < deadline && !bot.interrupt_code) {
+                tries++;
+                const r = await swimMod.climbBank(bot, d[0], d[1], { timeoutMs: 6000 });
+                if (r.out) { out = true; break; }
+                await new Promise((res) => setTimeout(res, 200));
+            }
+            const p = bot.entity.position;
+            return `CLIMBOUT: out=${out} tries=${tries} y ${start.y.toFixed(2)} -> ${p.y.toFixed(2)} `
+                + `pos=(${p.x.toFixed(1)}, ${p.y.toFixed(2)}, ${p.z.toFixed(1)})`;
+        }, false, 3)
+    },
+    {
+        name: '!buildFooting',
+        description: 'Debug: while afloat, place blocks on the pool floor beneath you until you can stand.',
+        perform: runAsAction(async (agent) => {
+            const before = agent.bot.entity.position.clone();
+            const placed = await skills.buildFootingBelow(agent.bot, 3);
+            const p = agent.bot.entity.position;
+            return `FOOTING: placed ${placed}, y ${before.y.toFixed(2)} -> ${p.y.toFixed(2)}, `
+                + `at (${p.x.toFixed(1)}, ${p.y.toFixed(2)}, ${p.z.toFixed(1)})`;
+        }, false, 1)
+    },
+    {
+        name: '!marathonPlan',
+        description: 'Lay out a ring of checkpoints around where you are standing, as a route you can then run with !marathonRun.',
+        params: {
+            'checkpoints': { type: 'int', description: 'How many checkpoints.', domain: [2, 12] },
+            'maxTotal': { type: 'int', description: 'Straight-line budget for the whole route, in blocks.', domain: [50, 20000] },
+            'startAngleDeg': { type: 'int', description: 'Rotate the ring; 0 puts checkpoint 1 due east.', domain: [0, 359] }
+        },
+        perform: async (agent, checkpoints, maxTotal, startAngleDeg) => {
+            const marathon = await import('../library/marathon.js');
+            const p = agent.bot.entity.position;
+            const center = { x: Math.round(p.x), z: Math.round(p.z) };
+            const { radius, checkpoints: cps } = marathon.planLoop(center, {
+                count: checkpoints, maxTotal, startAngleDeg,
+            });
+            const length = marathon.routeLength(center, cps);
+            // Refuse rather than quietly overspend: the budget is the whole point of the route.
+            if (length > maxTotal)
+                return `Planned route is ${Math.round(length)} blocks, over the ${maxTotal} budget. Nothing saved.`;
+            const state = {
+                created: new Date().toISOString(),
+                start: { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) },
+                center, radius: Math.round(radius), plannedLength: length,
+                checkpoints: cps, finishedAt: null,
+            };
+            marathon.saveState(agent.name, state);
+            return `Planned ${cps.length} checkpoints on a ${Math.round(radius)}-block ring, `
+                + `${Math.round(length)} blocks of route (budget ${maxTotal}).\n`
+                + marathon.describe(state, agent.bot);
+        }
+    },
+    {
+        name: '!marathonRoute',
+        description: 'Set an explicit checkpoint marathon from coordinates, e.g. "4412,4934 4362,5021 ...".',
+        params: {
+            'points': { type: 'string', description: 'Space-separated x,z pairs, in running order.' },
+            'maxTotal': { type: 'int', description: 'Straight-line budget for the whole route, in blocks.', domain: [50, 20000] }
+        },
+        perform: async (agent, points, maxTotal) => {
+            const marathon = await import('../library/marathon.js');
+            const parsed = marathon.routeFromPairs(points);
+            if (parsed.error) return parsed.error;
+            const p = agent.bot.entity.position;
+            const start = { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
+            const length = marathon.routeLength(start, parsed.checkpoints);
+            if (length > maxTotal)
+                return `That route is ${Math.round(length)} blocks, over the ${maxTotal} budget. Nothing saved.`;
+            const state = {
+                created: new Date().toISOString(),
+                start, center: { x: start.x, z: start.z }, radius: null,
+                plannedLength: length, checkpoints: parsed.checkpoints, finishedAt: null,
+            };
+            marathon.saveState(agent.name, state);
+            return `Route set: ${parsed.checkpoints.length} checkpoints, ${Math.round(length)} blocks `
+                + `(budget ${maxTotal}).\n` + marathon.describe(state, agent.bot);
+        }
+    },
+    {
+        name: '!marathonRun',
+        description: 'Run the planned checkpoint marathon on foot, in order, resuming where a previous run left off.',
+        perform: runAsAction(async (agent) => {
+            const marathon = await import('../library/marathon.js');
+            const state = marathon.loadState(agent.name);
+            if (!state) return 'No marathon planned. Use !marathonPlan first.';
+            if (state.finishedAt) return `Marathon already finished at ${state.finishedAt}. !marathonPlan again to start a new one.`;
+
+            const t0 = Date.now();
+            const res = await marathon.runMarathon(agent.bot, state, {
+                name: agent.name,
+                // Checkpoint-level events go to the model AND the console; per-leg detail goes
+                // to the console only. bot.output is fed to the LLM and is budgeted, so a
+                // 40-minute run's worth of leg lines would crowd out everything else.
+                onProgress: (msg) => { skills.log(agent.bot, msg); console.log(`[${agent.name}] marathon: ${msg}`); },
+                onDetail: (msg) => console.log(`[${agent.name}] marathon: ${msg}`),
+            });
+            const mins = ((Date.now() - t0) / 60000).toFixed(1);
+            const head = res.finished
+                ? `MARATHON FINISHED: all ${state.checkpoints.length} checkpoints in ${mins} min.`
+                : `MARATHON ${res.reason.toUpperCase()} after ${mins} min`
+                    + (res.stuckAt ? ` at checkpoint #${res.stuckAt}, still ${Math.round(res.remaining)} blocks out` : '')
+                    + '. Run !marathonRun again to continue.';
+            // The OUTCOME has to reach the log too. This string is returned to the model and
+            // routed to chat; every per-checkpoint line goes to the console, but the one line
+            // that says whether the whole route finished did not - so the service log showed six
+            // checkpoints reached and never said "finished", and anything watching for that
+            // waited forever.
+            console.log(`[${agent.name}] marathon: ${head}`);
+            return `${head}\n${marathon.describe(state, agent.bot)}`;
+        }, true, 120)   // resume=true so an interrupt can be continued; 2h ceiling
+    },
+    {
+        name: '!marathonStatus',
+        description: 'Report progress through the checkpoint marathon.',
+        perform: async (agent) => {
+            const marathon = await import('../library/marathon.js');
+            return marathon.describe(marathon.loadState(agent.name), agent.bot);
+        }
+    },
+    {
+        name: '!marathonReset',
+        description: 'Forget the planned checkpoint marathon.',
+        perform: async (agent) => {
+            const marathon = await import('../library/marathon.js');
+            return marathon.clearState(agent.name) ? 'Marathon cleared.' : 'There was no marathon to clear.';
+        }
     },
     {
         name: '!climbOut',

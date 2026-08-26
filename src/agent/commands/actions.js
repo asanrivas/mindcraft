@@ -1099,6 +1099,9 @@ export const actionsList = [
             if (!fs.existsSync(marker))
                 return 'Refused: rescue teleport is disabled. Walk there instead.';
             fs.unlinkSync(marker); // single use - re-arm deliberately, never by accident
+            // We are about to cause a teleport on purpose. Without this, the detector would
+            // report it as somebody moving the bot and cancel this very action mid-rescue.
+            agent.expectTeleport(5000, 'serverTp');
             agent.bot.chat(`/tp ${agent.name} ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)}`);
             await new Promise(r => setTimeout(r, 1200));
             const p = agent.bot.entity.position;
@@ -1303,6 +1306,30 @@ export const actionsList = [
                     + `Fix the missing blocks, then re-run the fill to re-verify.`;
             }
             agent.self_prompter.stop();
+
+            // AND CLEAR THE PERSISTED GOAL. Stopping the self-prompt loop is only half of
+            // "end the goal": the goal also lives as a record in the typed memory store, which
+            // renders into `$MEMORY` and is injected into EVERY conversing prompt. Leaving it
+            // there meant a goal the user had cancelled was handed back to the model on every
+            // single turn, so it kept resuming the work - and `load_memory` restored it after a
+            // restart. Observed live: `self_prompt: null, self_prompting_state: 0` on disk while
+            // `goal:current` still read "Mine minerals below the base at 3391,62,4890...".
+            //
+            // Authority is deliberately NOT symmetric, and mirrors `!goal` above. A user-origin
+            // goal may only be cleared by the user; the store refuses an agent delete against a
+            // user row, which is the entire point of the typed store - the model must not be
+            // able to erase what a person asked for. It may drop a goal it set itself.
+            const by = agent.command_author === 'model' ? MEM_ORIGIN.AGENT : MEM_ORIGIN.USER;
+            const cleared = agent.history.clearGoal(by);
+            if (cleared.ok && cleared.cleared) {
+                return `Self-prompting stopped, and the goal is cleared: "${cleared.cleared}"`;
+            }
+            if (!cleared.ok) {
+                // The model trying to end a goal a person set. Say so plainly rather than
+                // reporting success - it would otherwise keep the goal AND believe it was done.
+                return 'Self-prompting stopped, but the goal was set by a player and stays in '
+                     + `memory: "${agent.history.store.goal()}". Ask them to end or change it.`;
+            }
             return 'Self-prompting stopped.';
         }
     },

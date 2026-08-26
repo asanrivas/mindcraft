@@ -252,7 +252,8 @@ Travel west to red bed at -2572,63,5269.
 ## Players
 - Parched: hostile skeleton, killed me once.`;
 
-    const n = s.importLegacyBlob(legacy);
+    // allowGoal: this is the one-time MIGRATION path, where the blob is the previous state.
+    const n = s.importLegacyBlob(legacy, { allowGoal: true });
     check('imports every fact', n, 5);
     check('goal imported', /red bed/.test(s.goal()), true);
     check('locations parsed into keys', s.get(KIND.LOCATION, 'Red bed')?.value, '-2572,63,5269');
@@ -269,6 +270,127 @@ Travel west to red bed at -2572,63,5269.
     check('empty legacy blob imports nothing', mk().importLegacyBlob(''), 0);
     check('null legacy blob is survivable', mk().importLegacyBlob(null), 0);
     check('unknown headings become notes', mk().importLegacyBlob('## Weird\n- a: b') > 0, true);
+}
+
+
+// --- ENDING a goal, which is the other half of setting one -------------------------------------
+// The bug: `!endGoal` only ever stopped the self-prompt LOOP. The goal ALSO lives here, and this
+// record renders into `$MEMORY`, which is injected into every conversing prompt - so a goal the
+// user had cancelled was handed back to the model on every turn and it kept resuming the work.
+// On disk: `self_prompt: null, self_prompting_state: 0` while `goal:current` still read
+// "Mine minerals below the base at 3391,62,4890...", reloaded by `load_memory` after a restart.
+//
+// Authority is deliberately asymmetric, exactly as for `put`: "delete then re-add" must not be a
+// way around "cannot overwrite".
+{
+    const s = mk();
+    s.setGoal('Mine minerals below the base and deposit them in the 5 chests', ORIGIN.USER);
+
+    check('the agent cannot delete a user goal',
+        s.delete(KIND.GOAL, 'current', ORIGIN.AGENT).ok, false);
+    check('...and it is still there afterwards',
+        s.goal(), 'Mine minerals below the base and deposit them in the 5 chests');
+
+    check('the user can delete their own goal',
+        s.delete(KIND.GOAL, 'current', ORIGIN.USER).ok, true);
+    check('...and it is gone from the store', s.goal(), null);
+    check('...and gone from the rendered $MEMORY', /Goal/.test(s.render(2000)), false);
+}
+
+// An agent-origin goal is the model's own and it may drop it.
+{
+    const s = mk();
+    s.setGoal('wander around looking for copper', ORIGIN.AGENT);
+    check('the agent can delete a goal it set itself',
+        s.delete(KIND.GOAL, 'current', ORIGIN.AGENT).ok, true);
+    check('...and it is gone', s.goal(), null);
+}
+
+// Clearing a goal that is not there is not an error worth surfacing.
+{
+    const s = mk();
+    check('deleting a missing goal reports not-ok', s.delete(KIND.GOAL, 'current', ORIGIN.USER).ok, false);
+    check('...and goal() stays null', s.goal(), null);
+}
+
+// A cleared goal must not come back when the model next summarises. replaceAgentRecords is what
+// summarisation calls, and it must not resurrect a goal from lesson/location rows.
+{
+    const s = mk();
+    s.setGoal('old cancelled goal', ORIGIN.USER);
+    s.delete(KIND.GOAL, 'current', ORIGIN.USER);
+    s.replaceAgentRecords(KIND.LESSON, [['a', 'water is fast'], ['b', 'trees are cheap to walk around']]);
+    check('summarising does not resurrect the goal', s.goal(), null);
+}
+
+
+// --- SUMMARISATION MUST NOT MINT GOALS ---------------------------------------------------------
+// The store already refuses to let the model OVERWRITE a user's goal. Nothing stopped it
+// INVENTING one where none stood - and importLegacyBlob is what every periodic summarisation
+// calls, with an LLM writing markdown under a template that literally contains a `## Goal`
+// header. Observed: a user cleared the goal with !endGoal, and the very next summarisation
+// re-created "Mine minerals below the base at 3391,62,4890..." as an agent record, out of the
+// recent turns alone. A goal is a directive; it arrives through !goal or not at all.
+{
+    const s = mk();
+    const summary = `## Goal
+Mine minerals below the base at 3391,62,4890 and deposit them in the 5 chests
+
+## Locations
+- Base: 3391,62,4890
+
+## Lessons
+- Water is faster than walking.`;
+
+    const n = s.importLegacyBlob(summary);
+    check('a cleared goal is NOT re-minted by summarisation', s.goal(), null);
+    check('...and the skip is counted so it can be logged', s.skippedGoals, 1);
+    check('...while the other facts still import', n, 2);
+    check('...locations survive', s.get(KIND.LOCATION, 'Base')?.value, '3391,62,4890');
+    check('...lessons survive', s.list(KIND.LESSON).length, 1);
+}
+
+// A goal already standing is untouched by summarisation, whoever set it.
+{
+    const s = mk();
+    s.setGoal('follow asanrivas', ORIGIN.USER);
+    s.importLegacyBlob('## Goal\nGo mine at the base instead');
+    check('summarisation cannot replace a user goal', s.goal(), 'follow asanrivas');
+
+    const t = mk();
+    t.setGoal('explore west', ORIGIN.AGENT);
+    t.importLegacyBlob('## Goal\nGo mine at the base instead');
+    check('nor an agent goal it set through !goal', t.goal(), 'explore west');
+}
+
+// The migration path still wants the goal - there the blob IS the previous state.
+{
+    const s = mk();
+    check('migration imports the goal', s.importLegacyBlob('## Goal\nBuild a base', { allowGoal: true }), 1);
+    check('...and it lands as agent origin', s.get(KIND.GOAL).origin, ORIGIN.AGENT);
+}
+
+
+// --- the call sites, because the flag only matters if it is passed correctly ------------------
+// The unit tests above prove importLegacyBlob honours allowGoal. What they cannot prove is that
+// summarisation omits it and the migration passes it - and getting that backwards restores the
+// exact bug (a cleared goal re-minted on the next summary) with every test still green.
+{
+    const src = await (await import('fs')).promises.readFile(
+        new URL('../src/agent/history.js', import.meta.url), 'utf8');
+
+    // Match the actual call, not the word where it appears in a nearby comment.
+    const callWith = (arg) => {
+        const m = new RegExp(`importLegacyBlob\\(${arg}[^)]*\\)`).exec(src);
+        return m ? m[0] : null;
+    };
+    const summariseCall = callWith('summary');
+    check('summarisation calls importLegacyBlob at all', summariseCall !== null, true);
+    check('summarisation does NOT allow goals', /allowGoal/.test(summariseCall ?? ''), false);
+
+    const migrateCall = callWith('legacyBlob');
+    check('the migration calls importLegacyBlob at all', migrateCall !== null, true);
+    check('the migration DOES allow goals', /allowGoal:\s*true/.test(migrateCall ?? ''), true);
 }
 
 if (failures) {

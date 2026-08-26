@@ -282,10 +282,25 @@ export class MemoryStore {
      * The legacy format is markdown `## Section` blocks. Everything imported is AGENT origin -
      * we cannot know what a human actually asked for from prose written by a model, and marking
      * it USER would grant the very immunity this class exists to withhold.
+     *
+     * `allowGoal` DEFAULTS TO FALSE, and that default is the load-bearing part. This method is
+     * called on every periodic summarisation, and the summariser is an LLM writing markdown
+     * under a template that literally contains a `## Goal` header - so with goals allowed, the
+     * model mints itself a goal out of whatever it happened to be talking about. Observed: a
+     * user cleared the goal with `!endGoal`, and the very next summarisation re-created
+     * "Mine minerals below the base at 3391,62,4890..." as an agent record, from the recent
+     * turns alone. The store already refuses to let the model OVERWRITE a user's goal; nothing
+     * stopped it INVENTING one where none stood, which is the same self-corruption wearing a
+     * different hat.
+     *
+     * A goal is a directive, not a memory. It arrives through `!goal` - explicit, authored and
+     * logged - or not at all. Only the one-time legacy migration passes `allowGoal: true`,
+     * because there the blob IS the previous state rather than a fresh invention.
      */
-    importLegacyBlob(text) {
+    importLegacyBlob(text, { allowGoal = false } = {}) {
         if (typeof text !== 'string' || !text.trim()) return 0;
         let imported = 0;
+        this.skippedGoals = 0;
         const sections = text.split(/^##\s+/m).filter(s => s.trim());
         const byHeading = Object.fromEntries(Object.entries(HEADINGS).map(([k, v]) => [v.toLowerCase(), k]));
 
@@ -297,6 +312,7 @@ export class MemoryStore {
             const kind = byHeading[heading] || KIND.NOTE;
 
             if (kind === KIND.GOAL) {
+                if (!allowGoal) { this.skippedGoals++; continue; }
                 if (this.put({ kind: KIND.GOAL, key: 'current', value: body, origin: ORIGIN.AGENT }).ok) imported++;
                 continue;
             }

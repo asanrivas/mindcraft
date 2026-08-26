@@ -118,7 +118,9 @@ export class History {
         try {
             this.store = loadStore(this.store_fp);
             if (this.store.records.size === 0 && legacyBlob) {
-                const n = this.store.importLegacyBlob(legacyBlob);
+                // allowGoal: this blob is the previous state being migrated, not a fresh
+                // invention by the summariser - see importLegacyBlob.
+                const n = this.store.importLegacyBlob(legacyBlob, { allowGoal: true });
                 console.log(`[History] migrated ${n} fact(s) from the legacy memory blob (all agent-origin).`);
                 this.saveStore();
             }
@@ -139,6 +141,34 @@ export class History {
         return r;
     }
 
+    /**
+     * Drop the goal record entirely.
+     *
+     * This is the counterpart `setUserGoal` was missing, and its absence was a real bug: the
+     * goal is rendered into `$MEMORY`, which is injected into EVERY conversing prompt, so a
+     * goal the user had verbally cancelled kept being handed back to the model on every turn
+     * and it kept resuming the work. `!endGoal` only ever stopped the self-prompt LOOP - a
+     * different thing - so `self_prompt` went null while `goal:current` stayed, and
+     * `load_memory` restored it on the next restart.
+     *
+     * Authority matters here and is not symmetric. A USER-origin goal may only be cleared by
+     * the user; the store refuses an agent delete against a user row, and that refusal is the
+     * whole reason the typed store exists - the model must not be able to erase what a person
+     * asked for. An agent-origin goal is the model's own and it may drop it.
+     *
+     * @param {string} by ORIGIN.USER or ORIGIN.AGENT - who is asking
+     * @returns {{ok: boolean, reason?: string, cleared?: string}}
+     */
+    clearGoal(by = ORIGIN.AGENT) {
+        const had = this.store.goal();
+        if (!had) return { ok: true, cleared: null };
+        const r = this.store.delete(KIND.GOAL, 'current', by);
+        if (!r.ok) return r;
+        this.memory = this.store.render(getBudget().memory_chars);
+        this.saveStore();
+        return { ok: true, cleared: had };
+    }
+
     async summarizeMemories(turns) {
         console.log("Storing memories...");
         const summary = stripGroundedFacts(await this.agent.prompter.promptMemSaving(turns));
@@ -148,10 +178,17 @@ export class History {
         // rather than silently winning, which is the whole point of the store.
         const before = this.store.goal();
         const rejectedBefore = this.store.rejections;
+        // No allowGoal. A goal is a directive that arrives through `!goal`, never something
+        // derived from chat history - otherwise a goal the user just ended is re-minted on the
+        // next summarisation out of the very turns in which they ended it.
         this.store.importLegacyBlob(summary);
         const blocked = this.store.rejections - rejectedBefore;
         if (blocked > 0) {
             console.log(`[History] memory store rejected ${blocked} agent write(s) against user-authored records.`);
+        }
+        if (this.store.skippedGoals > 0) {
+            console.log(`[History] ignored ${this.store.skippedGoals} goal(s) the summariser tried `
+                + `to invent; goals come from !goal only. Current goal: ${this.store.goal() ?? 'none'}.`);
         }
         if (before && this.store.goal() !== before) {
             console.warn('[History] user goal changed during summarisation - this should be impossible.');

@@ -102,6 +102,22 @@ const settings = {
                       // NOTE: this closes ONE entry point, not the bug. !goToPlayer and
                       // !followPlayer still drive through pathfinder and can hang the same way.
                       "!goToCoordinates"],
+
+    // Hidden from the model's command docs, but STILL CALLABLE from chat - unlike
+    // blocked_actions, which calls blacklistCommands() and deletes the command from
+    // commandMap for everyone. These are measurement harnesses a person drives by hand
+    // (CLAUDE.md documents !swimProbe and !creativeIdSweep as exactly that). The model
+    // must not see them: each burns a whole action slot producing numbers it cannot act
+    // on, and !climbBankTest rendered in the compact docs as "Debug: repeatedly attempt
+    // swim" - which reads like an ordinary swim command.
+    hidden_actions: ["!climbBankTest", "!buildFooting", "!swimProbe", "!creativeIdSweep",
+                     // !goToSurface is skills.goToSurface -> goToPosition -> bot.pathfinder,
+                     // the same executor !goToCoordinates was blocked for, and it is registered
+                     // with runAsAction(fn) i.e. timeout -1. A hang therefore pins
+                     // currentActionLabel forever and NO action can ever start again. !climbOut
+                     // does the same job through our own navigator. Hidden rather than blocked
+                     // so it stays available by hand for comparison.
+                     "!goToSurface"],
     code_timeout_mins: 10, // minutes code is allowed to run. -1 for no timeout (leaves runaway generated code unbounded)
     relevant_docs_count: "auto", // "auto" scales with context window; or a number, -1 for all
 

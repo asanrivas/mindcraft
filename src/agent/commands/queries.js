@@ -129,7 +129,7 @@ export const queryList = [
     },
     {
         name: "!nearbyBlocks",
-        description: "Get the blocks near the bot, including important blocks with distance/direction.",
+        description: "List the block types within reach of the bot, each with a distance and compass direction. Use to find out what is available nearby; !surroundings instead when you need to know what is directly in front of you.",
         perform: function (agent) {
             let bot = agent.bot;
             let res = 'NEARBY_BLOCKS';
@@ -168,7 +168,7 @@ export const queryList = [
     },
     {
         name: "!surroundings",
-        description: "Get a 3D view of blocks in each direction (front/back/left/right/up/down) based on where the bot is facing.",
+        description: "Report what is immediately front/back/left/right/up/down of the bot, relative to its facing. Use before stepping, digging or placing; !nearbyBlocks for what exists in the area at all.",
         perform: function (agent) {
             let bot = agent.bot;
             let dirBlocks = world.getDirectionalBlocks(bot, 4);
@@ -409,7 +409,7 @@ export const queryList = [
     },
     {
         name: '!buildStatus',
-        description: 'Diff the world against a blueprint placements JSON: how much is built, and the nearest blocks still wrong, as concrete Place/Replace fixes.',
+        description: 'Diff the world against a blueprint JSON: how much is built, and the nearest wrong blocks as Place/Replace fixes.',
         params: {
             'file': { type: 'string', description: 'Placements JSON path relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
             'x': { type: 'int', description: 'World X of the blueprint origin.' },
@@ -429,7 +429,7 @@ export const queryList = [
     },
     {
         name: '!scanArea',
-        description: 'Scan a rectangular area and report what blocks are present. Useful for understanding surroundings before building or planting.',
+        description: 'List which block types fill a rectangle, with counts and percentages, at one Y level. Use to check the ground before building or planting. Use !gridView instead when you need each block\'s exact position.',
         params: {
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
             'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
@@ -452,7 +452,7 @@ export const queryList = [
     },
     {
         name: '!gridView',
-        description: 'Generate an ASCII grid view of blocks in an area. Perfect for verifying builds - shows exact block positions as characters.',
+        description: 'Draw one Y level of a rectangle as an ASCII map, one character per block. Use to verify a build or find the exact block that is wrong. Use !scanArea instead when you only need which blocks are present.',
         params: {
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
             'z1': { type: 'int', description: 'Z coordinate of the first corner.' },

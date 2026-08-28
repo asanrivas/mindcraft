@@ -2,7 +2,7 @@
     "name": "andy",
     "model": {
         "api": "digitalocean",
-        "model": "llama-4-maverick",
+        "model": "deepseek-v4-flash-0731",
         "params": {
             "max_tokens": 4096,
             "temperature": 0.7

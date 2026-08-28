@@ -13,7 +13,13 @@ for (let command of commandList) {
 
 // ============= COMMAND ALIASES =============
 // Short aliases map to full command names (saves tokens in prompts)
-const COMMAND_ALIASES = {
+// An alias must resolve to a command the caller can actually reach. 'ca' -> !fill and
+// 'gtc' -> !goToCoordinates were left behind when those two were added to blocked_actions,
+// so they expanded into a name that blacklistCommands had already spliced out of commandMap
+// (expandCommandAlias resolves against its own table and never consults commandMap), leaving
+// a command that cannot be looked up. tests/command_docs.test.mjs fails the build if a new
+// dangling alias appears.
+export const COMMAND_ALIASES = {
     // Chest commands (all start with 'c' prefix)
     'cp': 'chestPut',
     'ct': 'chestTake',
@@ -22,18 +28,23 @@ const COMMAND_ALIASES = {
     'cl': 'chestList',
     'cn': 'chestName',
     'cln': 'chestListNamed',
-    'cf': 'chestForget',
+    // 'cf' USED TO MEAN chestForget, one letter from 'cfi' = chestFind - two commands that do
+    // opposite things (look an item up vs drop a saved chest name), and not the prefix pattern
+    // cp/cpn and ct/ctn follow. A model reaching for "chest find" and emitting !cf dropped a
+    // name instead. forgetChest deletes only the label, not the container - but it persists
+    // through saveNamedChestsCallback, so the name is gone across restarts. 'cf' now points at
+    // the READ-ONLY command, and chestForget has no alias at all: it is rare, it is the only
+    // one here that discards state, and an unrecognised !cfg is a harmless error.
+    'cf': 'chestFind',
     'cpn': 'chestPutNamed',
     'ctn': 'chestTakeNamed',
     'cvn': 'chestViewNamed',
     'cds': 'chestDepositSorted',
-    'cfi': 'chestFind',
     'ctr': 'chestTransfer',
     'dis': 'discard',
     
     // Movement commands
     'gtp': 'goToPlayer',
-    'gtc': 'goToCoordinates',
     'fp': 'followPlayer',
     'ma': 'moveAway',
     'sfb': 'searchForBlock',
@@ -48,7 +59,6 @@ const COMMAND_ALIASES = {
     'eat': 'consume',
     'ph': 'placeHere',
     'gtb': 'goToBed',
-    'ca': 'fill',
     'pt': 'plantTrees',
     
     // Info commands
@@ -545,6 +555,52 @@ function getCommandAlias(commandName) {
 }
 
 /**
+ * Whether a command should be left out of the docs the model sees. blocked_actions are
+ * already gone from commandList (blacklistCommands splices them out), so this is really
+ * about hidden_actions - commands that stay callable from chat but must not be offered
+ * to the model.
+ * @param {Object} agent
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isHiddenFromDocs(agent, name) {
+    if (agent.blocked_actions?.includes(name)) return true;
+    if (agent.hidden_actions?.includes(name)) return true;
+    return false;
+}
+
+// The disambiguation in a command description lives in its SECOND sentence - "Use this
+// instead of !collectBlocks for ores", "Do NOT use to build structures", "Disabled unless a
+// marker file is present". Truncating to the first sentence deleted all of it, and the model
+// was left choosing between commands that read identically.
+const KEEP_SENTENCE = /^(Use|Do NOT|Do not|Don't|Prefer|Refuses|Refused|Needs|Requires|Takes|Will|Only|Disabled|Set up|Pauses)\b/;
+const DESC_FIRST_MAX = 120;   // first sentence
+const DESC_TOTAL_MAX = 210;   // first sentence + any kept follow-ups
+
+/**
+ * Shorten a command description for compact docs without losing the clause that
+ * distinguishes it from its neighbours.
+ * @param {string} description
+ * @returns {string}
+ */
+export function compactDescription(description) {
+    // A sentence ends at ". " followed by a CAPITAL or a "!command" - never at a bare "."
+    // ("swim.climbBank") and never mid-abbreviation ("e.g. \"4412,4934 ...\"", which is the
+    // only place !marathonRoute's argument format is documented).
+    const sentences = description.trim().split(/(?<=\.)\s+(?=[A-Z!])/);
+
+    let out = sentences[0];
+    if (out.length > DESC_FIRST_MAX) out = out.substring(0, DESC_FIRST_MAX - 3) + '...';
+
+    for (const sentence of sentences.slice(1)) {
+        if (!KEEP_SENTENCE.test(sentence)) continue;
+        if (out.length + sentence.length + 1 > DESC_TOTAL_MAX) break;
+        out += ' ' + sentence;
+    }
+    return out;
+}
+
+/**
  * Generate command documentation based on mode setting
  * @param {Object} agent 
  * @returns {string} command documentation
@@ -572,7 +628,7 @@ export function getCommandDocs(agent) {
         
         const cmdNames = [];
         for (let command of commandList) {
-            if (agent.blocked_actions.includes(command.name)) continue;
+            if (isHiddenFromDocs(agent, command.name)) continue;
             const alias = getCommandAlias(command.name);
             const aliasStr = (showAliases && alias) ? `[${alias}]` : '';
             cmdNames.push(`${command.name}${aliasStr}`);
@@ -586,14 +642,12 @@ export function getCommandDocs(agent) {
         docs += `*\n`;
         
         for (let command of commandList) {
-            if (agent.blocked_actions.includes(command.name)) continue;
+            if (isHiddenFromDocs(agent, command.name)) continue;
             
             const alias = getCommandAlias(command.name);
             const aliasStr = (showAliases && alias) ? `[${alias}]` : '';
             
-            // Shorten description to first sentence or 60 chars
-            let shortDesc = command.description.split('.')[0];
-            if (shortDesc.length > 60) shortDesc = shortDesc.substring(0, 57) + '...';
+            let shortDesc = compactDescription(command.description);
             
             // Inline params
             let paramStr = '';
@@ -615,7 +669,7 @@ export function getCommandDocs(agent) {
         docs += `\nUse double quotes for strings. One command per response.\n`;
         
         for (let command of commandList) {
-            if (agent.blocked_actions.includes(command.name)) continue;
+            if (isHiddenFromDocs(agent, command.name)) continue;
             
             const alias = getCommandAlias(command.name);
             const aliasStr = (showAliases && alias) ? ` [${alias}]` : '';

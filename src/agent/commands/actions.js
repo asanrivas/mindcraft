@@ -81,7 +81,7 @@ function runAsAction (actionFn, resume = false, timeout = -1) {
 export const actionsList = [
     {
         name: '!newAction',
-        description: 'Perform new and unknown custom behaviors that are not available as a command.', 
+        description: 'Write and run new code for a behavior no other command covers. Use only as a last resort, after checking that no command above does the job - it is slower and far more likely to fail than a real command.', 
         params: {
             'prompt': { type: 'string', description: 'A natural language prompt to guide code generation. Make a detailed step-by-step plan.' }
         },
@@ -119,7 +119,7 @@ export const actionsList = [
     },
     {
         name: '!navTo',
-        description: 'Go to x y z using the built-in navigator (own A* + raw movement, does not use mineflayer-pathfinder).',
+        description: 'Walk to exact coordinates you already know. Use this for any trip to a specific x y z; !travel is for heading off in a compass direction with no fixed destination. Climbs, bridges and digs its way there.',
         params: {
             'x': { type: 'int', description: 'target x' },
             'y': { type: 'int', description: 'target y' },
@@ -654,7 +654,7 @@ export const actionsList = [
     },
     {
         name: '!chestList',
-        description: 'List all storage containers (chests, barrels, shulker boxes) within range, sorted by distance.',
+        description: 'List the storage containers physically nearby (chests, barrels, shulker boxes), sorted by distance. Use to discover containers you have not seen before; it does not say what is inside them.',
         params: {
             'range': { type: 'int', description: 'Search radius in blocks. Default 32.', optional: true, domain: [1, 128] }
         },
@@ -698,7 +698,7 @@ export const actionsList = [
     },
     {
         name: '!chestListNamed',
-        description: 'List all named chests that have been saved.',
+        description: 'List the chests you have given names to, wherever they are. Use to recall a name for !chestPutNamed or !chestTakeNamed; !chestList instead for containers that happen to be nearby.',
         params: {},
         perform: runAsAction(async (agent) => {
             skills.listNamedChests(agent.bot);
@@ -706,7 +706,7 @@ export const actionsList = [
     },
     {
         name: '!chestForget',
-        description: 'Remove a named chest from memory.',
+        description: 'Forget the name you gave a chest. Only the label is lost - the container and everything in it is untouched, but the name does not come back on restart.',
         params: {
             'name': { type: 'string', description: 'Name of the chest to forget.' }
         },
@@ -782,7 +782,7 @@ export const actionsList = [
     },
     {
         name: '!chestFind',
-        description: 'Search for an item across all nearby chests and report which containers have it.',
+        description: 'Search for one item across every nearby chest and report which containers hold it. Use when you know what you want but not where it is; !chestList instead when you want the containers themselves.',
         params: {
             'item_name': { type: 'ItemName', description: 'The item to search for.' },
             'range': { type: 'int', description: 'Search radius in blocks. Default 32.', optional: true, domain: [1, 128] }
@@ -825,7 +825,7 @@ export const actionsList = [
     },
     {
         name: '!collectBlocks',
-        description: 'Collect the nearest blocks of a given type.',
+        description: 'Collect the nearest blocks of a given type. Do NOT use for ores - use !branchMine, which digs down to the ore layer instead of searching for exposed ore.',
         params: {
             'type': { type: 'BlockName', description: 'The block type to collect.' },
             'num': { type: 'int', description: 'The number of blocks to collect.', domain: [1, Number.MAX_SAFE_INTEGER] }
@@ -899,7 +899,7 @@ export const actionsList = [
     },
     {
         name: '!buildBlueprint',
-        description: 'Hand-build a blueprint placements JSON block by block: fly to each position (creative), auto-compute the look angle and click face, place with own hands. No server /setblock.',
+        description: 'Hand-build a blueprint JSON block by block, flying to each position and placing by hand. Takes longer than !serverFill but leaves a survival-legal build.',
         params: {
             'file': { type: 'string', description: 'Path to the placements JSON, relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
             'x': { type: 'int', description: 'World X of the blueprint origin (its local 0,0,0 min-corner).' },
@@ -1114,7 +1114,7 @@ export const actionsList = [
         // by other means; an explicit, separately-named command keeps the refusal meaningful
         // while leaving the operator (and a model that has been told why) a way through.
         name: '!forceFill',
-        description: 'Like !serverFill but ignores the protection guard. Only for edits you have checked yourself.',
+        description: 'Like !serverFill but ignores the guard protecting beds, chests, furnaces and the respawn point. Only use when a person has told you to override a specific refusal.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
             'x1': { type: 'int', description: 'X of first corner.' },
@@ -1133,7 +1133,7 @@ export const actionsList = [
     },
     {
         name: '!forceSetblock',
-        description: 'Like !serverSetblock but ignores the protection guard.',
+        description: 'Like !serverSetblock but ignores the protection guard that protects beds, chests, furnaces and the respawn point. Only use when a person has told you to override a specific refusal.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
             'x': { type: 'int', description: 'X coordinate.' },
@@ -1432,7 +1432,7 @@ export const actionsList = [
     },
     {
         name: '!goToSurface',
-        description: 'Moves the bot to the highest block above it (usually the surface).',
+        description: 'Moves the bot to the highest block above it (usually the surface). Uses mineflayer-pathfinder and has no timeout, so it can hang - prefer !climbOut. Hidden from the model via settings.hidden_actions.',
         params: {},
         perform: runAsAction(async (agent) => {
             await skills.goToSurface(agent.bot);
@@ -1513,15 +1513,22 @@ export const actionsList = [
     },
     {
         name: '!branchMine',
-        description: 'Dig down and branch-mine for ores, then return to where you started. Use this instead of !collectBlocks for ores.',
+        // Compact command docs render params as `name:type` only - the param DESCRIPTIONS are
+        // never shown. So this was reaching the model as `!branchMine(depth:num,length:num)`,
+        // where "depth" means the opposite of what it does: it is an absolute Y level, and
+        // !dive's `depth` right above IS a distance to descend. Measured against gemini flash,
+        // the model avoided the command rather than guess the argument - 4 of 5 runs escalated
+        // to !goal instead. The param is named `y` and the semantics live in the description,
+        // where compact mode will actually print them.
+        description: 'Dig down and branch-mine for ores, then return to where you started. Use this for ores instead of !collectBlocks. Takes an absolute Y level to mine at, not a distance down - use -12 unless told otherwise.',
         params: {
-            'depth': { type: 'int', description: 'Y level to mine at, e.g. -12 for diamonds.', domain: [-60, 60] },
+            'y': { type: 'int', description: 'Absolute Y level to mine at (NOT a distance down). -12 is the default compromise: deep enough for diamond/redstone/lapis/gold, shallow enough to walk home from.', domain: [-60, 60] },
             'length': { type: 'int', description: 'Length of the main corridor in blocks.', domain: [4, 64] }
         },
-        perform: runAsAction(async (agent, depth, length) => {
-            console.log(`[mine] perform entered depth=${depth} length=${length}`);
+        perform: runAsAction(async (agent, y, length) => {
+            console.log(`[mine] perform entered y=${y} length=${length}`);
             try {
-                const r = await mining.branchMine(agent.bot, { targetY: depth, mainLength: length });
+                const r = await mining.branchMine(agent.bot, { targetY: y, mainLength: length });
                 console.log('[mine] branchMine returned');
                 return mining.formatMineReport(r);
             } catch (err) {

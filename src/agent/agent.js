@@ -121,6 +121,9 @@ export class Agent {
         this.task = new Task(this, settings.task, taskStart);
         this.blocked_actions = settings.blocked_actions.concat(this.task.blocked_actions || []);
         blacklistCommands(this.blocked_actions);
+        // Hidden, not blocked: kept in commandMap so a person can still call them from chat,
+        // but omitted from the docs the model sees. See settings.hidden_actions.
+        this.hidden_actions = settings.hidden_actions || [];
 
         console.log(this.name, 'logging into minecraft...');
         this.bot = initBot(this.name);

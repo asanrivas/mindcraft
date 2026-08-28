@@ -3,6 +3,8 @@ import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
 import { digWithTool, equipBestTool, isFallingBlockName, isTreeTrunk, isWaterName } from './tools.js';
 import * as swim from './swim.js';
+import * as chest from './chest.js';
+import * as nav from './nav.js';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { existsSync, readFileSync } from 'fs';
@@ -617,15 +619,17 @@ export async function defendSelf(bot, range=9) {
         await equipHighestAttack(bot);
         if (bot.entity.position.distanceTo(enemy.position) >= 4 && enemy.name !== 'creeper' && enemy.name !== 'phantom') {
             try {
-                bot.pathfinder.setMovements(new pf.Movements(bot));
-                await bot.pathfinder.goto(new pf.goals.GoalFollow(enemy, 3.5), true);
+                // Closing on the enemy: an ordinary move, so the navigator handles it.
+                await nav.navigateTo(bot, {
+                    x: enemy.position.x, y: enemy.position.y, z: enemy.position.z,
+                }, { arriveDist: 3.5, maxReplans: 2, waypointMs: 1500 });
             } catch (err) {/* might error if entity dies, ignore */}
         }
         if (bot.entity.position.distanceTo(enemy.position) <= 2) {
             try {
-                bot.pathfinder.setMovements(new pf.Movements(bot));
-                let inverted_goal = new pf.goals.GoalInvert(new pf.goals.GoalFollow(enemy, 2));
-                await bot.pathfinder.goto(inverted_goal, true);
+                // Too close - back off to swing range. Short budget: this runs inside the
+                // attack loop and a long retreat would stop us fighting back.
+                await fleeFrom(bot, enemy.position.clone(), 2, { timeoutMs: 1500 });
             } catch (err) {/* might error if entity dies, ignore */}
         }
         bot.pvp.attack(enemy);
@@ -1061,11 +1065,9 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         'powered_rail', 'activator_rail', 'tripwire_hook', 'tripwire', 'water_bucket', 'string'];
     if (!dont_move_for.includes(item_name) && (pos.distanceTo(targetBlock.position) < 1.1 || pos_above.distanceTo(targetBlock.position) < 1.1)) {
         // too close - try to move away, but don't fail if pathfinding has issues
-        let goal = new pf.goals.GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2);
-        let inverted_goal = new pf.goals.GoalInvert(goal);
-        bot.pathfinder.setMovements(new pf.Movements(bot));
-        if (!await gotoWithTimeout(bot, inverted_goal, 'move away from target')) {
-            // Pathfinding failed, but we can still try to place from current position
+        // "Step away from the cell I am about to fill" - a 2-block retreat, which is what
+        // GoalInvert(GoalNear) meant. fleeFrom supplies the heading the inverted goal lacks.
+        if (!await fleeFrom(bot, targetBlock.position.clone(), 2, { timeoutMs: 3000 })) {
             log(bot, `Couldn't move away from target, trying to place anyway.`);
         }
     }
@@ -1095,10 +1097,7 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         const now = bot.entity.position;
         const now_above = now.plus(Vec3(0, 1, 0));
         if (now.distanceTo(targetBlock.position) < 1.1 || now_above.distanceTo(targetBlock.position) < 1.1) {
-            const stand_clear = new pf.goals.GoalInvert(
-                new pf.goals.GoalNear(targetBlock.position.x, targetBlock.position.y, targetBlock.position.z, 2));
-            bot.pathfinder.setMovements(new pf.Movements(bot));
-            if (!await gotoWithTimeout(bot, stand_clear, 'step off target cell')) {
+            if (!await fleeFrom(bot, targetBlock.position.clone(), 2, { timeoutMs: 3000 })) {
                 log(bot, `Standing on ${target_dest} and could not step clear.`);
             }
         }
@@ -1574,600 +1573,324 @@ export async function discard(bot, itemName, num=-1) {
     return true;
 }
 
-// All storage container types in Minecraft (comprehensive list)
-const STORAGE_CONTAINERS = [
-    // Standard chests
-    'chest', 'trapped_chest', 'ender_chest', 'barrel',
-    // Shulker boxes (all 17 variants - default + 16 colors)
-    'shulker_box', 'white_shulker_box', 'orange_shulker_box', 'magenta_shulker_box',
-    'light_blue_shulker_box', 'yellow_shulker_box', 'lime_shulker_box', 'pink_shulker_box',
-    'gray_shulker_box', 'light_gray_shulker_box', 'cyan_shulker_box', 'purple_shulker_box',
-    'blue_shulker_box', 'brown_shulker_box', 'green_shulker_box', 'red_shulker_box', 'black_shulker_box',
-    // Utility containers (can store items)
-    'hopper', 'dispenser', 'dropper',
-    // 1.20+ containers
-    'decorated_pot', 'chiseled_bookshelf',
-    // 1.21+ containers
-    'crafter'
-];
+// ============= STORAGE CONTAINERS =============
+//
+// All container IO goes through library/chest.js. Nothing in this file may call
+// bot.openContainer directly: that call has no timeout and has killed the process
+// (see the header of chest.js for the three hangs it fixes). The functions here are
+// policy - which container, which items, what to say - and chest.js is mechanism.
 
-// Create a Set for O(1) lookup
-const STORAGE_CONTAINERS_SET = new Set(STORAGE_CONTAINERS);
-
-/**
- * Find the nearest storage container (chest, ender chest, shulker box, barrel, etc.)
- * Optimized to use a single search with filter function
- */
+/** Nearest openable container, or null. Sorted by real distance. */
 function getNearestStorageContainer(bot, range = CONSTANTS.DEFAULT_SEARCH_RANGE) {
-    // Use findBlock with a filter for better performance
-    const containerPositions = bot.findBlocks({
-        matching: (block) => STORAGE_CONTAINERS_SET.has(block.name),
-        maxDistance: range,
-        count: 10 // Get multiple candidates
-    });
+    const found = chest.findContainers(bot, range, 10);
+    return found.length ? found[0].block : null;
+}
 
-    if (containerPositions.length === 0) return null;
-
-    // Find the closest one
-    let nearestContainer = null;
-    let nearestDistance = range + 1;
-
-    for (const pos of containerPositions) {
-        const block = bot.blockAt(pos);
-        if (block) {
-            const distance = bot.entity.position.distanceTo(pos);
-            if (distance < nearestDistance) {
-                nearestDistance = distance;
-                nearestContainer = block;
-            }
+/** Resolve the container a command should act on, or return {error} with a reason to print. */
+function resolveContainer(bot, x, y, z, verb = 'use') {
+    if (x !== null && y !== null && z !== null) {
+        const hit = chest.containerAt(bot, x, y, z);
+        if (!hit) {
+            const b = bot.blockAt(new Vec3(x, y, z));
+            return { error: `No storage container at (${x}, ${y}, ${z}) - there is ${b ? `a ${b.name}` : 'nothing loaded'} there.` };
         }
+        if (hit.unopenable) {
+            return { error: `A ${hit.unopenable} at (${x}, ${y}, ${z}) has no inventory screen; I cannot ${verb} it.` };
+        }
+        return { block: hit.block };
     }
-    return nearestContainer;
+    const near = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
+    if (!near) {
+        return { error: `Could not find any storage container within ${CONSTANTS.DEFAULT_SEARCH_RANGE} blocks. Place a chest, barrel or shulker box nearby.` };
+    }
+    return { block: near };
 }
 
-/**
- * Get a storage container at specific coordinates
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {number} x - x coordinate
- * @param {number} y - y coordinate
- * @param {number} z - z coordinate
- * @returns {Block|null} - the container block or null if not a valid container
- */
-function getStorageContainerAt(bot, x, y, z) {
-    const block = bot.blockAt(new Vec3(x, y, z));
-    if (block && STORAGE_CONTAINERS_SET.has(block.name)) {
-        return block;
-    }
-    return null;
-}
-
-/**
- * List all storage containers within range, sorted by distance
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {number} range - search radius (default 32)
- * @returns {Array} - array of {block, distance, position} objects
- */
 export function listNearbyChests(bot, range = CONSTANTS.DEFAULT_SEARCH_RANGE) {
-    const containerPositions = bot.findBlocks({
-        matching: (block) => STORAGE_CONTAINERS_SET.has(block.name),
-        maxDistance: range,
-        count: 50
-    });
-
-    const containers = [];
-    for (const pos of containerPositions) {
-        const block = bot.blockAt(pos);
-        if (block) {
-            const distance = bot.entity.position.distanceTo(pos);
-            containers.push({
-                block,
-                distance: Math.round(distance * 10) / 10,
-                position: { x: pos.x, y: pos.y, z: pos.z },
-                type: block.name
-            });
-        }
-    }
-
-    // Sort by distance
-    containers.sort((a, b) => a.distance - b.distance);
-    return containers;
+    return chest.findContainers(bot, range, 50);
 }
 
 export async function putInChest(bot, itemName, num=-1, x=null, y=null, z=null) {
     /**
-     * Put the given item in a storage container (chest, ender chest, shulker box, barrel, etc.).
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} itemName, the item or block name to put in the container.
-     * @param {number} num, the number of items to put. Defaults to -1, which puts all items.
-     * @param {number} x, optional x coordinate of the chest. If null, uses nearest chest.
-     * @param {number} y, optional y coordinate of the chest.
-     * @param {number} z, optional z coordinate of the chest.
-     * @returns {Promise<boolean>} true if the item was put in the container, false otherwise.
-     * @example
-     * await skills.putInChest(bot, "oak_log");
-     * await skills.putInChest(bot, "cobblestone", 64, 100, 65, 200); // Put in chest at specific location
+     * Put the given item in a storage container.
+     * Reports what ACTUALLY moved, measured from the inventory, not what was requested.
+     * @returns {Promise<boolean>} true if any item was deposited.
      **/
-    let container;
-    if (x !== null && y !== null && z !== null) {
-        container = getStorageContainerAt(bot, x, y, z);
-        if (!container) {
-            log(bot, `No storage container found at (${x}, ${y}, ${z}). Check the coordinates.`);
-            return false;
-        }
+    const target = resolveContainer(bot, x, y, z, 'put items in');
+    if (target.error) { log(bot, target.error); return false; }
+
+    const held = bot.inventory.items().filter(i => i.name === itemName);
+    if (held.length === 0) {
+        const similar = bot.inventory.items().filter(i => i.name.includes(itemName.split('_')[0])).map(i => i.name);
+        const summary = bot.inventory.items().sort((a, b) => b.count - a.count).slice(0, 10)
+            .map(i => `${i.name}(${i.count})`).join(', ');
+        let msg = `You do not have any ${itemName} in inventory.`;
+        if (similar.length) msg += ` Similar: ${[...new Set(similar)].join(', ')}.`;
+        if (summary) msg += ` You have: ${summary}`;
+        log(bot, msg);
+        return false;
+    }
+
+    const res = await chest.withContainer(bot, target.block, async (ctx) => {
+        const r = await ctx.deposit(itemName, num);
+        return { ...r, type: ctx.type, used: ctx.usedSlots(), total: ctx.totalSlots };
+    }, { fallback: goToPosition });
+
+    if (!res.ok) { log(bot, chest.explainFailure(res, `(${target.block.position.x}, ${target.block.position.y}, ${target.block.position.z})`)); return false; }
+
+    const { moved, asked, reason, type, used, total } = res.value;
+    if (moved === 0) {
+        log(bot, `Could not deposit any ${itemName}. The ${type} is ${reason === 'timeout' ? 'not responding' : 'full'}.`);
+        return false;
+    }
+    const left = bot.inventory.items().filter(i => i.name === itemName).reduce((s, i) => s + i.count, 0);
+    if (moved < asked) {
+        log(bot, `Deposited ${moved}/${asked} ${itemName} in ${type} (${used}/${total} slots). ${left} left in inventory.`);
     } else {
-        container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-        if (!container) {
-            log(bot, `Could not find any storage container within ${CONSTANTS.DEFAULT_SEARCH_RANGE} blocks. Place a chest, barrel, or shulker box nearby.`);
-            return false;
-        }
-    }
-
-    // Get ALL matching items in inventory (may be spread across multiple slots)
-    const matchingItems = bot.inventory.items().filter(item => item.name === itemName);
-    if (matchingItems.length === 0) {
-        const similarItems = bot.inventory.items().filter(i => i.name.includes(itemName.split('_')[0])).map(i => i.name);
-        const inventorySummary = bot.inventory.items()
-            .sort((a, b) => b.count - a.count)
-            .slice(0, 10)
-            .map(i => `${i.name}(${i.count})`)
-            .join(', ');
-
-        let errorMsg = `You do not have any ${itemName} in inventory.`;
-        if (similarItems.length > 0) {
-            errorMsg += ` Similar: ${similarItems.join(', ')}.`;
-        }
-        if (inventorySummary) {
-            errorMsg += ` You have: ${inventorySummary}`;
-        }
-        log(bot, errorMsg);
-        return false;
-    }
-
-    // Calculate total items across all slots
-    const totalInInventory = matchingItems.reduce((sum, item) => sum + item.count, 0);
-    const to_put = num === -1 ? totalInInventory : Math.min(num, totalInInventory);
-
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
-
-    // Check container capacity before deposit
-    const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
-    const isDoubleChest = totalSlots === 54;
-    const chestType = isDoubleChest ? 'double chest' : container.name;
-
-    // Pre-check: does the chest have room for this item?
-    // If not, skip the deposit() call entirely — avoids 20s updateSlot timeout on full chests
-    const chestContents = openedContainer.containerItems();
-    const occupiedSlots = chestContents.length;
-    const emptySlots = totalSlots - occupiedSlots;
-    const existingStacks = chestContents.filter(i => i.name === itemName);
-    const hasPartialStack = existingStacks.some(i => i.count < i.stackSize);
-    if (emptySlots === 0 && !hasPartialStack) {
-        await openedContainer.close();
-        log(bot, `Could not deposit any ${itemName}. The ${chestType} is full.`);
-        return false;
-    }
-
-    // Count items BEFORE deposit
-    const countBefore = matchingItems.reduce((sum, item) => sum + item.count, 0);
-    const itemType = matchingItems[0].type;
-
-    try {
-        // Deposit all at once - mineflayer waits for slot updates on chest windows
-        await openedContainer.deposit(itemType, null, to_put);
-    } catch (err) {
-        // "destination full" = chest filled mid-deposit, some items may have been deposited already
-        console.log(`[putInChest] Deposit threw: ${err.message}`);
-    }
-
-    // Count items AFTER deposit - this tells us what ACTUALLY moved regardless of errors
-    const countAfter = bot.inventory.items()
-        .filter(item => item.name === itemName)
-        .reduce((sum, item) => sum + item.count, 0);
-    const actualDeposited = countBefore - countAfter;
-
-    // Get current slot usage
-    const slotsUsedAfter = openedContainer.containerItems().length;
-    await openedContainer.close();
-
-    if (actualDeposited === 0) {
-        log(bot, `Could not deposit any ${itemName}. The ${chestType} is full.`);
-        return false;
-    } else if (actualDeposited < to_put) {
-        log(bot, `Deposited ${actualDeposited}/${to_put} ${itemName} in ${chestType} (${slotsUsedAfter}/${totalSlots} slots). ${countAfter} left in inventory.`);
-    } else {
-        log(bot, `Successfully put ${actualDeposited} ${itemName} in ${chestType}. (${slotsUsedAfter}/${totalSlots} slots used)`);
+        log(bot, `Successfully put ${moved} ${itemName} in ${type}. (${used}/${total} slots used)`);
     }
     return true;
 }
 
 export async function takeFromChest(bot, itemName, num=-1, x=null, y=null, z=null) {
     /**
-     * Take the given item from a storage container, potentially from multiple slots.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} itemName, the item or block name to take from the container.
-     * @param {number} num, the number of items to take. Defaults to -1, which takes all items.
-     * @param {number} x, optional x coordinate of the chest. If null, uses nearest chest.
-     * @param {number} y, optional y coordinate of the chest.
-     * @param {number} z, optional z coordinate of the chest.
-     * @returns {Promise<boolean>} true if the item was taken, false otherwise.
-     * @example
-     * await skills.takeFromChest(bot, "oak_log");
-     * await skills.takeFromChest(bot, "diamond", 10, 100, 65, 200); // Take from chest at specific location
+     * Take the given item from a storage container.
+     * The count reported is measured from the inventory: the old version added up what it
+     * asked for, so a full bag reported a successful withdrawal of nothing.
      **/
-    let container;
-    if (x !== null && y !== null && z !== null) {
-        container = getStorageContainerAt(bot, x, y, z);
-        if (!container) {
-            log(bot, `No storage container found at (${x}, ${y}, ${z}). Check the coordinates.`);
-            return false;
+    const target = resolveContainer(bot, x, y, z, 'take items from');
+    if (target.error) { log(bot, target.error); return false; }
+
+    const res = await chest.withContainer(bot, target.block, async (ctx) => {
+        const present = ctx.contents();
+        if (!present.some(i => i.name === itemName)) {
+            const available = [...new Set(present.map(i => i.name))];
+            return { missing: true, available, type: ctx.type };
         }
-    } else {
-        container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-        if (!container) {
-            log(bot, `Could not find any storage container within ${CONSTANTS.DEFAULT_SEARCH_RANGE} blocks.`);
-            return false;
-        }
-    }
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
-    
-    // Find all matching items in the container
-    let matchingItems = openedContainer.containerItems().filter(item => item.name === itemName);
-    if (matchingItems.length === 0) {
-        // List available items as suggestion
-        const availableItems = [...new Set(openedContainer.containerItems().map(i => i.name))];
-        if (availableItems.length > 0) {
-            log(bot, `Could not find ${itemName} in ${container.name}. Available: ${availableItems.slice(0, 5).join(', ')}${availableItems.length > 5 ? '...' : ''}`);
-        } else {
-            log(bot, `The ${container.name} is empty.`);
-        }
-        await openedContainer.close();
+        const r = await ctx.withdraw(itemName, num);
+        return { ...r, type: ctx.type };
+    }, { fallback: goToPosition });
+
+    if (!res.ok) { log(bot, chest.explainFailure(res, `(${target.block.position.x}, ${target.block.position.y}, ${target.block.position.z})`)); return false; }
+
+    const v = res.value;
+    if (v.missing) {
+        if (v.available.length === 0) log(bot, `The ${v.type} is empty.`);
+        else log(bot, `Could not find ${itemName} in the ${v.type}. Available: ${v.available.slice(0, 5).join(', ')}${v.available.length > 5 ? '...' : ''}`);
         return false;
     }
-    
-    let totalAvailable = matchingItems.reduce((sum, item) => sum + item.count, 0);
-    let remaining = num === -1 ? totalAvailable : Math.min(num, totalAvailable);
-    let totalTaken = 0;
-    
-    // Take items from each slot until we've taken enough or run out
-    for (const item of matchingItems) {
-        if (remaining <= 0) break;
-        
-        let toTakeFromSlot = Math.min(remaining, item.count);
-        await openedContainer.withdraw(item.type, null, toTakeFromSlot);
-        
-        totalTaken += toTakeFromSlot;
-        remaining -= toTakeFromSlot;
+    if (v.moved === 0) {
+        log(bot, v.reason === 'inventory_full'
+            ? `Could not take ${itemName}: my inventory is full.`
+            : `Could not take any ${itemName} from the ${v.type} (${v.reason}).`);
+        return false;
     }
-    
-    await openedContainer.close();
-    log(bot, `Successfully took ${totalTaken} ${itemName} from the ${container.name}.`);
-    return totalTaken > 0;
+    if (v.moved < v.asked) {
+        log(bot, `Took ${v.moved}/${v.asked} ${itemName} from the ${v.type} - inventory ran out of room.`);
+    } else {
+        log(bot, `Successfully took ${v.moved} ${itemName} from the ${v.type}.`);
+    }
+    return true;
 }
 
 export async function viewChest(bot, x=null, y=null, z=null) {
-    /**
-     * View the contents of a storage container (chest, ender chest, shulker box, barrel, etc.).
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {number} x, optional x coordinate of the chest. If null, uses nearest chest.
-     * @param {number} y, optional y coordinate of the chest.
-     * @param {number} z, optional z coordinate of the chest.
-     * @returns {Promise<boolean>} true if the container was viewed, false otherwise.
-     * @example
-     * await skills.viewChest(bot);
-     * await skills.viewChest(bot, 100, 65, 200); // View chest at specific location
-     **/
-    let container;
-    if (x !== null && y !== null && z !== null) {
-        container = getStorageContainerAt(bot, x, y, z);
-        if (!container) {
-            log(bot, `No storage container found at (${x}, ${y}, ${z}). Check the coordinates.`);
-            return false;
-        }
-    } else {
-        container = getNearestStorageContainer(bot, CONSTANTS.DEFAULT_SEARCH_RANGE);
-        if (!container) {
-            log(bot, `Could not find any storage container nearby (chest, ender chest, shulker box, barrel).`);
-            return false;
-        }
-    }
-    await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-    const openedContainer = await bot.openContainer(container);
+    /** View the contents of a storage container. */
+    const target = resolveContainer(bot, x, y, z, 'look inside');
+    if (target.error) { log(bot, target.error); return false; }
 
-    // Determine container type and capacity
-    const totalSlots = openedContainer.slots.length - 36; // Subtract player inventory slots
-    const isDoubleChest = totalSlots === 54;
-    const chestType = isDoubleChest ? 'double chest' : container.name;
+    const res = await chest.withContainer(bot, target.block, async (ctx) => ({
+        items: ctx.contents().map(i => ({ name: i.name, count: i.count })),
+        type: ctx.type, total: ctx.totalSlots,
+    }), { fallback: goToPosition });
 
-    let items = openedContainer.containerItems();
-    const usedSlots = items.length;
-    const emptySlots = totalSlots - usedSlots;
+    if (!res.ok) { log(bot, chest.explainFailure(res, `(${target.block.position.x}, ${target.block.position.y}, ${target.block.position.z})`)); return false; }
 
+    const { items, type, total } = res.value;
     if (items.length === 0) {
-        log(bot, `The ${chestType} is empty. (0/${totalSlots} slots used)`);
+        log(bot, `The ${type} is empty. (0/${total} slots used)`);
+    } else {
+        log(bot, `The ${type} contains (${items.length}/${total} slots used, ${total - items.length} empty):`);
+        for (const item of items) log(bot, `${item.count} ${item.name}`);
     }
-    else {
-        log(bot, `The ${chestType} contains (${usedSlots}/${totalSlots} slots used, ${emptySlots} empty):`);
-        for (let item of items) {
-            log(bot, `${item.count} ${item.name}`);
-        }
-    }
-    await openedContainer.close();
     return true;
+}
+
+/** Items that stay in the bag no matter what. */
+const ALWAYS_KEEP = ['netherite_pickaxe', 'netherite_sword', 'netherite_axe', 'netherite_shovel',
+                     'diamond_pickaxe', 'diamond_sword', 'diamond_axe', 'diamond_shovel'];
+const isWornArmor = name => name.includes('helmet') || name.includes('chestplate')
+                         || name.includes('leggings') || name.includes('boots');
+
+/**
+ * What may be deposited, AGGREGATED BY NAME - one entry per item type, not per slot.
+ *
+ * Per-slot is wrong and it costs a chest: 200 cobblestone occupies four slots, the first
+ * deposit moves all four stacks, and the next three entries then find nothing left to deposit.
+ * A deposit of zero is indistinguishable from a full container, so the loop declares the chest
+ * full and walks to the next one with a bag that is already empty.
+ */
+function depositableItems(bot, keepItems) {
+    const byName = new Map();
+    for (const i of bot.inventory.items()) {
+        if (keepItems.has(i.name) || isWornArmor(i.name)) continue;
+        byName.set(i.name, (byName.get(i.name) ?? 0) + i.count);
+    }
+    return [...byName].map(([name, count]) => ({ name, count }));
 }
 
 export async function depositAllItems(bot, excludeItems = [], x=null, y=null, z=null) {
     /**
-     * Deposit all items from inventory to a storage container.
-     * Will try multiple chests if the first one is full (unless specific location given).
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string[]} excludeItems, items to keep in inventory (e.g., tools, weapons, food).
-     * @param {number} x, optional x coordinate of the chest. If null, uses nearest chest.
-     * @param {number} y, optional y coordinate of the chest.
-     * @param {number} z, optional z coordinate of the chest.
-     * @returns {Promise<boolean>} true if items were deposited, false otherwise.
-     * @example
-     * await skills.depositAllItems(bot, ["diamond_pickaxe", "diamond_sword", "cooked_beef"]);
-     * await skills.depositAllItems(bot, [], 100, 65, 200); // Deposit to chest at specific location
+     * Deposit everything except tools and worn armour, spilling into further containers when
+     * one fills up. A container that cannot be opened is SKIPPED with its reason logged, not
+     * retried forever - that is the difference between "this chest is blocked" and a hung bot.
      **/
-
-    // Default items to always keep
-    const defaultKeep = ['netherite_pickaxe', 'netherite_sword', 'netherite_axe', 'netherite_shovel',
-                         'diamond_pickaxe', 'diamond_sword', 'diamond_axe', 'diamond_shovel'];
-    const keepItems = new Set([...excludeItems, ...defaultKeep]);
-
-    let totalDeposited = 0;
-    let allDepositedTypes = [];
-    const usedContainers = new Set();
-    const maxChests = 5; // Try up to 5 chests
+    const keepItems = new Set([...excludeItems, ...ALWAYS_KEEP]);
     const hasSpecificLocation = x !== null && y !== null && z !== null;
+    const used = new Set();
+    const failures = [];
+    let totalDeposited = 0;
+    const depositedTypes = [];
 
-    for (let chestAttempt = 0; chestAttempt < maxChests; chestAttempt++) {
-        // Check if we still have items to deposit
-        const itemsToDeposit = bot.inventory.items().filter(item => {
-            if (keepItems.has(item.name)) return false;
-            if (item.name.includes('helmet') || item.name.includes('chestplate') ||
-                item.name.includes('leggings') || item.name.includes('boots')) return false;
-            return true;
-        });
+    for (let attempt = 0; attempt < 5; attempt++) {
+        if (bot.interrupt_code) break;
+        if (depositableItems(bot, keepItems).length === 0) break;
 
-        if (itemsToDeposit.length === 0) {
-            break; // Nothing left to deposit
-        }
-
-        // Find container to use
-        let container = null;
-
-        // On first attempt, if specific location provided, use that chest
-        if (chestAttempt === 0 && hasSpecificLocation) {
-            container = getStorageContainerAt(bot, x, y, z);
-            if (!container) {
-                log(bot, `No storage container found at (${x}, ${y}, ${z}). Check the coordinates.`);
-                return false;
-            }
-            usedContainers.add(`${x},${y},${z}`);
+        let block = null;
+        if (attempt === 0 && hasSpecificLocation) {
+            const target = resolveContainer(bot, x, y, z, 'deposit into');
+            if (target.error) { log(bot, target.error); return false; }
+            block = target.block;
+            used.add(`${x},${y},${z}`);
         } else {
-            // Find nearest container we haven't used yet
-            const nearbyContainers = world.getNearestBlocks(bot, STORAGE_CONTAINERS, CONSTANTS.DEFAULT_SEARCH_RANGE, 10);
-            for (const c of nearbyContainers) {
-                const posKey = `${c.position.x},${c.position.y},${c.position.z}`;
-                if (!usedContainers.has(posKey)) {
-                    container = c;
-                    usedContainers.add(posKey);
-                    break;
+            for (const c of chest.findContainers(bot, CONSTANTS.DEFAULT_SEARCH_RANGE, 10)) {
+                const key = `${c.position.x},${c.position.y},${c.position.z}`;
+                if (used.has(key)) continue;
+                block = c.block; used.add(key); break;
+            }
+        }
+        if (!block) {
+            if (attempt === 0) { log(bot, `Could not find any storage container nearby.`); return false; }
+            break;
+        }
+
+        const pos = block.position;
+        const res = await chest.withContainer(bot, block, async (ctx) => {
+            // A double chest is one inventory behind two blocks; without this the second half
+            // is visited as a "fresh" container and reported full all over again.
+            if (ctx.isDouble) {
+                for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
+                    const n = bot.blockAt(new Vec3(pos.x+dx, pos.y, pos.z+dz));
+                    if (n && (n.name === 'chest' || n.name === 'trapped_chest')) {
+                        used.add(`${pos.x+dx},${pos.y},${pos.z+dz}`); break;
+                    }
                 }
             }
-        }
-
-        if (!container) {
-            if (chestAttempt === 0) {
-                log(bot, `Could not find any storage container nearby.`);
-                return false;
+            let moved = 0, full = false;
+            for (const item of depositableItems(bot, keepItems)) {
+                if (bot.interrupt_code) break;
+                const r = await ctx.deposit(item.name, item.count);
+                moved += r.moved;
+                if (r.moved > 0) { depositedTypes.push(item.name); continue; }
+                // Nothing held is not a full chest - it just means another entry already moved
+                // it. Only a refusal by the container ends this chest's turn.
+                if (r.reason === 'none_held') continue;
+                full = true; break;
             }
-            break; // No more unused chests
+            return { moved, full, type: ctx.type };
+        }, { fallback: goToPosition });
+
+        if (!res.ok) {
+            failures.push(chest.explainFailure(res, `(${pos.x}, ${pos.y}, ${pos.z})`));
+            continue; // try the next container rather than giving up
         }
-
-        await goToPosition(bot, container.position.x, container.position.y, container.position.z, CONSTANTS.INTERACT_DISTANCE);
-        const openedContainer = await bot.openContainer(container);
-
-        // Determine container type
-        const totalSlots = openedContainer.slots.length - 36;
-        const isDoubleChest = totalSlots === 54;
-        const chestType = isDoubleChest ? 'double chest' : container.name;
-
-        // If double chest, mark the partner half as used too so we don't revisit it
-        if (isDoubleChest) {
-            const pos = container.position;
-            for (const [dx, dz] of [[1,0],[-1,0],[0,1],[0,-1]]) {
-                const neighbor = bot.blockAt({x: pos.x+dx, y: pos.y, z: pos.z+dz});
-                if (neighbor && neighbor.name === 'chest') {
-                    usedContainers.add(`${pos.x+dx},${pos.y},${pos.z+dz}`);
-                    break;
-                }
-            }
-        }
-
-        let deposited = 0;
-        let chestFull = false;
-
-        for (const item of bot.inventory.items()) {
-            // Skip items we want to keep
-            if (keepItems.has(item.name)) continue;
-            // Skip equipped armor
-            if (item.name.includes('helmet') || item.name.includes('chestplate') ||
-                item.name.includes('leggings') || item.name.includes('boots')) continue;
-
-            // Pre-check capacity to avoid 20s updateSlot timeout on full chests
-            const chestContents = openedContainer.containerItems();
-            const emptySlots = totalSlots - chestContents.length;
-            const hasPartialStack = chestContents.some(i => i.name === item.name && i.count < i.stackSize);
-            if (emptySlots === 0 && !hasPartialStack) {
-                log(bot, `${chestType} at (${container.position.x}, ${container.position.y}, ${container.position.z}) is full, trying next chest...`);
-                chestFull = true;
-                break;
-            }
-
-            try {
-                await openedContainer.deposit(item.type, null, item.count);
-                deposited += item.count;
-                allDepositedTypes.push(item.name);
-            } catch (e) {
-                log(bot, `${chestType} at (${container.position.x}, ${container.position.y}, ${container.position.z}) is full, trying next chest...`);
-                chestFull = true;
-                break;
-            }
-        }
-
-        await openedContainer.close();
-        totalDeposited += deposited;
-
-        if (!chestFull) {
-            break; // Successfully deposited everything
-        }
+        totalDeposited += res.value.moved;
+        if (!res.value.full) break;
+        log(bot, `${res.value.type} at (${pos.x}, ${pos.y}, ${pos.z}) is full, trying the next one...`);
     }
 
+    for (const f of failures) log(bot, f);
     if (totalDeposited === 0) {
-        log(bot, `No items to deposit (or all items are in the keep list).`);
+        log(bot, failures.length ? `Deposited nothing - no container I could open had room.`
+                                 : `No items to deposit (or all items are in the keep list).`);
         return false;
     }
-
-    const uniqueTypes = [...new Set(allDepositedTypes)];
-    log(bot, `Deposited ${totalDeposited} items (${uniqueTypes.length} types) total.`);
+    log(bot, `Deposited ${totalDeposited} items (${new Set(depositedTypes).size} types) total.`);
     return true;
 }
 
 // ============= CHEST MASTER SYSTEM =============
+//
+// Names and persistence only. Every open below goes through chest.withContainer via the
+// functions above, so a named chest that has been broken, buried or blocked reports that
+// instead of hanging.
 
-// In-memory storage for named chests (persisted to memory.json)
 const namedChests = new Map();
-
-// Callback to trigger save when named chests change
 let saveNamedChestsCallback = null;
 
-/**
- * Set the callback function to trigger when named chests change
- * @param {Function} callback - function to call when chests are modified
- */
 export function setNamedChestsSaveCallback(callback) {
     saveNamedChestsCallback = callback;
 }
 
-/**
- * Get named chests as JSON for persistence
- * @returns {Object} - named chests data
- */
 export function getNamedChestsJson() {
     const result = {};
-    for (const [key, value] of namedChests.entries()) {
-        result[key] = value;
-    }
+    for (const [key, value] of namedChests.entries()) result[key] = value;
     return result;
 }
 
-/**
- * Load named chests from JSON (called on agent startup)
- * @param {Object} json - named chests data from saved file
- */
 export function loadNamedChestsFromJson(json) {
     namedChests.clear();
     if (json && typeof json === 'object') {
-        for (const [key, value] of Object.entries(json)) {
-            namedChests.set(key, value);
-        }
+        for (const [key, value] of Object.entries(json)) namedChests.set(key, value);
         console.log(`[ChestMaster] Loaded ${namedChests.size} named chests`);
     }
 }
 
-/**
- * Load named chests from a memory.json file
- * @param {string} filePath - path to memory.json file
- */
 export function loadNamedChestsFromFile(filePath) {
     try {
         if (existsSync(filePath)) {
             const data = JSON.parse(readFileSync(filePath, 'utf8'));
-            if (data.named_chests) {
-                loadNamedChestsFromJson(data.named_chests);
-            }
+            if (data.named_chests) loadNamedChestsFromJson(data.named_chests);
         }
     } catch (error) {
         console.log(`[ChestMaster] Could not load named chests: ${error.message}`);
     }
 }
 
-/**
- * Remember a chest with a custom name for easy access later
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string} name - friendly name for the chest (e.g., "ores", "food", "building")
- * @param {number} x - x coordinate
- * @param {number} y - y coordinate
- * @param {number} z - z coordinate
- */
 export function nameChest(bot, name, x, y, z) {
-    const container = getStorageContainerAt(bot, x, y, z);
-    if (!container) {
-        log(bot, `No storage container found at (${x}, ${y}, ${z}). Cannot name it.`);
-        return false;
-    }
+    const hit = chest.containerAt(bot, x, y, z);
+    if (!hit) { log(bot, `No storage container found at (${x}, ${y}, ${z}). Cannot name it.`); return false; }
+    if (hit.unopenable) { log(bot, `A ${hit.unopenable} cannot be used as a storage chest.`); return false; }
     const key = `chest:${name.toLowerCase()}`;
-    namedChests.set(key, { x, y, z, type: container.name });
-    log(bot, `Named the ${container.name} at (${x}, ${y}, ${z}) as "${name}".`);
-    // Trigger save to persist the change
-    if (saveNamedChestsCallback) {
-        saveNamedChestsCallback();
-    }
+    namedChests.set(key, { x, y, z, type: hit.block.name });
+    log(bot, `Named the ${hit.block.name} at (${x}, ${y}, ${z}) as "${name}".`);
+    if (saveNamedChestsCallback) saveNamedChestsCallback();
     return true;
 }
 
-/**
- * Get a named chest's location
- * @param {string} name - the name of the chest
- * @returns {Object|null} - {x, y, z, type} or null if not found
- */
 export function getNamedChest(name) {
-    const key = `chest:${name.toLowerCase()}`;
-    return namedChests.get(key) || null;
+    return namedChests.get(`chest:${name.toLowerCase()}`) || null;
 }
 
-/**
- * List all named chests
- * @returns {Array} - array of {name, x, y, z, type}
- */
 export function listNamedChests(bot) {
     const chests = [];
     for (const [key, value] of namedChests.entries()) {
-        if (key.startsWith('chest:')) {
-            chests.push({
-                name: key.substring(6),
-                ...value
-            });
-        }
+        if (key.startsWith('chest:')) chests.push({ name: key.substring(6), ...value });
     }
     if (chests.length === 0) {
-        log(bot, `No named chests. Use !nameChest to name a chest first.`);
+        log(bot, `No named chests. Use !chestName to name a chest first.`);
     } else {
         log(bot, `Named chests (${chests.length}):`);
-        for (const c of chests) {
-            log(bot, `  "${c.name}" - ${c.type} at (${c.x}, ${c.y}, ${c.z})`);
-        }
+        for (const c of chests) log(bot, `  "${c.name}" - ${c.type} at (${c.x}, ${c.y}, ${c.z})`);
     }
     return chests;
 }
 
-/**
- * Remove a named chest
- * @param {string} name - the name of the chest to forget
- */
 export function forgetChest(bot, name) {
     const key = `chest:${name.toLowerCase()}`;
     if (namedChests.has(key)) {
         namedChests.delete(key);
         log(bot, `Forgot chest named "${name}".`);
-        // Trigger save to persist the change
-        if (saveNamedChestsCallback) {
-            saveNamedChestsCallback();
-        }
+        if (saveNamedChestsCallback) saveNamedChestsCallback();
         return true;
     }
     log(bot, `No chest named "${name}" to forget.`);
@@ -2203,335 +1926,189 @@ const ITEM_CATEGORIES = {
             'netherite_helmet', 'netherite_chestplate', 'netherite_leggings', 'netherite_boots', 'turtle_helmet', 'elytra']
 };
 
-/**
- * Get the category of an item
- * @param {string} itemName - name of the item
- * @returns {string} - category name or 'misc' if not categorized
- */
 function getItemCategory(itemName) {
     for (const [category, items] of Object.entries(ITEM_CATEGORIES)) {
-        if (items.includes(itemName)) {
-            return category;
-        }
+        if (items.includes(itemName)) return category;
     }
-    // Try partial matching for variants
     for (const [category, items] of Object.entries(ITEM_CATEGORIES)) {
         for (const item of items) {
-            if (itemName.includes(item.split('_')[0]) || item.includes(itemName.split('_')[0])) {
-                return category;
-            }
+            if (itemName.includes(item.split('_')[0]) || item.includes(itemName.split('_')[0])) return category;
         }
     }
     return 'misc';
 }
 
-/**
- * Auto-sort inventory items into named chests by category
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string[]} excludeItems - items to keep in inventory
- */
 export async function depositAllSorted(bot, excludeItems = []) {
-    const defaultKeep = ['netherite_pickaxe', 'netherite_sword', 'netherite_axe', 'netherite_shovel',
-                         'diamond_pickaxe', 'diamond_sword', 'diamond_axe', 'diamond_shovel'];
-    const keepItems = new Set([...excludeItems, ...defaultKeep]);
+    /** Auto-sort inventory into named chests by category. */
+    const keepItems = new Set([...excludeItems, ...ALWAYS_KEEP]);
 
-    // Get all named chests
     const chestsByCategory = {};
     for (const [key, value] of namedChests.entries()) {
-        if (key.startsWith('chest:')) {
-            const name = key.substring(6);
-            chestsByCategory[name] = value;
-        }
+        if (key.startsWith('chest:')) chestsByCategory[key.substring(6)] = value;
+    }
+    if (Object.keys(chestsByCategory).length === 0) {
+        log(bot, `No named chests configured. Use !chestName first (e.g. !chestName("ores", x, y, z)).`);
+        return { success: false, deposits: [] };
     }
 
-    if (Object.keys(chestsByCategory).length === 0) {
-        log(bot, `No named chests configured. Use !nameChest first to set up category chests (e.g., !nameChest("ores", x, y, z)).`);
-        return false;
+    const itemsByCategory = {};
+    for (const item of depositableItems(bot, keepItems)) {
+        const category = getItemCategory(item.name);
+        (itemsByCategory[category] ??= []).push({ name: item.name, count: item.count });
     }
 
     let totalDeposited = 0;
     const depositedByCategory = {};
+    const deposits = [];
 
-    // Group items by category
-    const itemsByCategory = {};
-    for (const item of bot.inventory.items()) {
-        if (keepItems.has(item.name)) continue;
-        if (item.name.includes('helmet') || item.name.includes('chestplate') ||
-            item.name.includes('leggings') || item.name.includes('boots')) continue;
-
-        const category = getItemCategory(item.name);
-        if (!itemsByCategory[category]) {
-            itemsByCategory[category] = [];
-        }
-        itemsByCategory[category].push(item);
-    }
-
-    // Deposit items to their respective category chests
     for (const [category, items] of Object.entries(itemsByCategory)) {
-        const chest = chestsByCategory[category];
-        if (!chest) {
-            // Try to find a 'misc' or 'other' or 'dump' chest
-            const fallbackChest = chestsByCategory['misc'] || chestsByCategory['other'] || chestsByCategory['dump'];
-            if (!fallbackChest) continue;
+        if (bot.interrupt_code) break;
+        const target = chestsByCategory[category]
+            ?? chestsByCategory['misc'] ?? chestsByCategory['other'] ?? chestsByCategory['dump'];
+        if (!target) continue;
+        const label = chestsByCategory[category] ? category : 'misc';
 
-            // Use fallback chest
-            await goToPosition(bot, fallbackChest.x, fallbackChest.y, fallbackChest.z, CONSTANTS.INTERACT_DISTANCE);
-            const container = getStorageContainerAt(bot, fallbackChest.x, fallbackChest.y, fallbackChest.z);
-            if (!container) continue;
+        const hit = chest.containerAt(bot, target.x, target.y, target.z);
+        if (!hit || hit.unopenable) {
+            log(bot, `Chest "${label}" at (${target.x}, ${target.y}, ${target.z}) is not there any more.`);
+            continue;
+        }
 
-            const openedContainer = await bot.openContainer(container);
+        const res = await chest.withContainer(bot, hit.block, async (ctx) => {
+            let moved = 0;
+            const placed = [];
             for (const item of items) {
-                try {
-                    await openedContainer.deposit(item.type, null, item.count);
-                    totalDeposited += item.count;
-                    depositedByCategory['misc'] = (depositedByCategory['misc'] || 0) + item.count;
-                } catch (e) {
-                    break; // Chest full
-                }
-            }
-            await openedContainer.close();
-            continue;
-        }
-
-        await goToPosition(bot, chest.x, chest.y, chest.z, CONSTANTS.INTERACT_DISTANCE);
-        const container = getStorageContainerAt(bot, chest.x, chest.y, chest.z);
-        if (!container) {
-            log(bot, `Chest "${category}" at (${chest.x}, ${chest.y}, ${chest.z}) no longer exists.`);
-            continue;
-        }
-
-        const openedContainer = await bot.openContainer(container);
-        for (const item of items) {
-            try {
-                await openedContainer.deposit(item.type, null, item.count);
-                totalDeposited += item.count;
-                depositedByCategory[category] = (depositedByCategory[category] || 0) + item.count;
-            } catch (e) {
-                log(bot, `${category} chest is full.`);
+                if (bot.interrupt_code) break;
+                const r = await ctx.deposit(item.name, item.count);
+                moved += r.moved;
+                if (r.moved > 0) { placed.push({ name: item.name, count: r.moved }); continue; }
+                if (r.reason === 'none_held') continue;
+                log(bot, `The ${label} chest is full.`);
                 break;
             }
-        }
-        await openedContainer.close();
+            return { moved, placed };
+        }, { fallback: goToPosition });
+
+        if (!res.ok) { log(bot, chest.explainFailure(res, `the "${label}" chest`)); continue; }
+        if (res.value.moved === 0) continue;
+
+        totalDeposited += res.value.moved;
+        depositedByCategory[label] = (depositedByCategory[label] || 0) + res.value.moved;
+        deposits.push({ chestName: label, location: { x: target.x, y: target.y, z: target.z }, items: res.value.placed });
     }
 
     if (totalDeposited === 0) {
-        log(bot, `No items to sort (or all items are kept).`);
+        log(bot, `Sorted nothing - no items to sort, or no category chest could take them.`);
         return { success: false, deposits: [] };
     }
-
-    const summary = Object.entries(depositedByCategory)
-        .map(([cat, count]) => `${cat}: ${count}`)
-        .join(', ');
-    log(bot, `Auto-sorted ${totalDeposited} items. ${summary}`);
-
-    // Return detailed info for Mem0 storage
-    const deposits = [];
-    for (const [category, items] of Object.entries(itemsByCategory)) {
-        const chest = chestsByCategory[category] || chestsByCategory['misc'] || chestsByCategory['other'] || chestsByCategory['dump'];
-        if (chest) {
-            deposits.push({
-                chestName: category,
-                location: { x: chest.x, y: chest.y, z: chest.z },
-                items: items.map(i => ({ name: i.name, count: i.count }))
-            });
-        }
-    }
+    log(bot, `Auto-sorted ${totalDeposited} items. ${Object.entries(depositedByCategory).map(([c, n]) => `${c}: ${n}`).join(', ')}`);
     return { success: true, deposits, totalDeposited };
 }
 
-/**
- * Search for an item across all nearby chests
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string} itemName - name of the item to find
- * @param {number} range - search range (default 32)
- */
 export async function findItemInChests(bot, itemName, range = CONSTANTS.DEFAULT_SEARCH_RANGE) {
-    const containers = listNearbyChests(bot, range);
+    /** Search every reachable container in range for an item. Unopenable ones are reported, not retried. */
+    const containers = chest.findContainers(bot, range, 50);
     if (containers.length === 0) {
         log(bot, `No storage containers found within ${range} blocks.`);
         return [];
     }
 
     const results = [];
+    const skipped = [];
     const startPos = bot.entity.position.clone();
 
     for (const c of containers) {
-        await goToPosition(bot, c.position.x, c.position.y, c.position.z, CONSTANTS.INTERACT_DISTANCE);
+        if (bot.interrupt_code) break;
+        const res = await chest.withContainer(bot, c.block, async (ctx) => {
+            const matching = ctx.contents().filter(i => i.name === itemName || i.name.includes(itemName));
+            return matching.reduce((s, i) => s + i.count, 0);
+        }, { fallback: goToPosition });
 
-        try {
-            const openedContainer = await bot.openContainer(c.block);
-            const matchingItems = openedContainer.containerItems().filter(item =>
-                item.name === itemName || item.name.includes(itemName)
-            );
-
-            if (matchingItems.length > 0) {
-                const totalCount = matchingItems.reduce((sum, item) => sum + item.count, 0);
-                results.push({
-                    position: c.position,
-                    type: c.type,
-                    count: totalCount,
-                    distance: c.distance
-                });
-            }
-            await openedContainer.close();
-        } catch (e) {
-            // Skip this container if we can't open it
-            continue;
-        }
+        if (!res.ok) { skipped.push(`${c.type} at (${c.position.x}, ${c.position.y}, ${c.position.z}): ${res.detail}`); continue; }
+        if (res.value > 0) results.push({ position: c.position, type: c.type, count: res.value, distance: c.distance });
     }
 
-    // Return to start position
-    await goToPosition(bot, startPos.x, startPos.y, startPos.z, 1);
+    if (!bot.interrupt_code) await goToPosition(bot, startPos.x, startPos.y, startPos.z, 1);
 
     if (results.length === 0) {
-        log(bot, `Could not find "${itemName}" in any of the ${containers.length} containers searched.`);
+        log(bot, `Could not find "${itemName}" in any of the ${containers.length - skipped.length} containers I could open.`);
     } else {
-        const totalFound = results.reduce((sum, r) => sum + r.count, 0);
-        log(bot, `Found ${totalFound} "${itemName}" in ${results.length} container(s):`);
-        for (const r of results) {
-            log(bot, `  ${r.count}x in ${r.type} at (${r.position.x}, ${r.position.y}, ${r.position.z})`);
-        }
+        log(bot, `Found ${results.reduce((s, r) => s + r.count, 0)} "${itemName}" in ${results.length} container(s):`);
+        for (const r of results) log(bot, `  ${r.count}x in ${r.type} at (${r.position.x}, ${r.position.y}, ${r.position.z})`);
     }
-
+    if (skipped.length) log(bot, `Skipped ${skipped.length} container(s) I could not open: ${skipped.slice(0, 3).join('; ')}`);
     return results;
 }
 
-/**
- * Transfer items from one chest to another
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string} itemName - name of the item to transfer (or "all" for everything)
- * @param {number} num - number of items to transfer (-1 for all)
- * @param {number} fromX - source chest x
- * @param {number} fromY - source chest y
- * @param {number} fromZ - source chest z
- * @param {number} toX - destination chest x
- * @param {number} toY - destination chest y
- * @param {number} toZ - destination chest z
- */
 export async function transferBetweenChests(bot, itemName, num, fromX, fromY, fromZ, toX, toY, toZ) {
-    // Verify both containers exist
-    const fromContainer = getStorageContainerAt(bot, fromX, fromY, fromZ);
-    const toContainer = getStorageContainerAt(bot, toX, toY, toZ);
+    /**
+     * Move items from one container to another. Carries only what it actually withdrew - the
+     * old version deposited the amounts it had asked for, which invented items when the bag
+     * was full at the source.
+     */
+    const src = resolveContainer(bot, fromX, fromY, fromZ, 'take items from');
+    if (src.error) { log(bot, `Source: ${src.error}`); return false; }
+    const dst = resolveContainer(bot, toX, toY, toZ, 'put items in');
+    if (dst.error) { log(bot, `Destination: ${dst.error}`); return false; }
 
-    if (!fromContainer) {
-        log(bot, `No storage container found at source (${fromX}, ${fromY}, ${fromZ}).`);
-        return false;
-    }
-    if (!toContainer) {
-        log(bot, `No storage container found at destination (${toX}, ${toY}, ${toZ}).`);
-        return false;
-    }
+    const takeAll = String(itemName).toLowerCase() === 'all';
+    const pickup = await chest.withContainer(bot, src.block, async (ctx) => {
+        const names = [...new Set(ctx.contents()
+            .filter(i => takeAll || i.name === itemName || i.name.includes(itemName))
+            .map(i => i.name))];
+        if (names.length === 0) return { taken: [], empty: true };
 
-    // Go to source chest and take items
-    await goToPosition(bot, fromX, fromY, fromZ, CONSTANTS.INTERACT_DISTANCE);
-    const openedFrom = await bot.openContainer(fromContainer);
-
-    let itemsToTransfer = [];
-    if (itemName.toLowerCase() === 'all') {
-        itemsToTransfer = openedFrom.containerItems();
-    } else {
-        itemsToTransfer = openedFrom.containerItems().filter(item =>
-            item.name === itemName || item.name.includes(itemName)
-        );
-    }
-
-    if (itemsToTransfer.length === 0) {
-        log(bot, `No ${itemName === 'all' ? 'items' : itemName} found in source chest.`);
-        await openedFrom.close();
-        return false;
-    }
-
-    // Calculate how many to take
-    let remaining = num === -1 ? Infinity : num;
-    let totalTaken = 0;
-    const takenItems = [];
-
-    for (const item of itemsToTransfer) {
-        if (remaining <= 0) break;
-        const toTake = Math.min(remaining, item.count);
-        try {
-            await openedFrom.withdraw(item.type, null, toTake);
-            totalTaken += toTake;
-            remaining -= toTake;
-            takenItems.push({ name: item.name, count: toTake, type: item.type });
-        } catch (e) {
-            break; // Inventory full
+        let budget = num === -1 || num == null ? Infinity : num;
+        const taken = [];
+        for (const name of names) {
+            if (budget <= 0 || bot.interrupt_code) break;
+            const r = await ctx.withdraw(name, budget === Infinity ? -1 : budget);
+            if (r.moved > 0) { taken.push({ name, count: r.moved }); budget -= r.moved; }
+            if (r.reason === 'inventory_full') break;
         }
-    }
-    await openedFrom.close();
+        return { taken, empty: false };
+    }, { fallback: goToPosition });
 
-    if (totalTaken === 0) {
-        log(bot, `Could not take any items from source chest.`);
+    if (!pickup.ok) { log(bot, `Source: ${chest.explainFailure(pickup, `(${fromX}, ${fromY}, ${fromZ})`)}`); return false; }
+    if (pickup.value.empty) { log(bot, `No ${takeAll ? 'items' : itemName} in the source container.`); return false; }
+    const taken = pickup.value.taken;
+    if (taken.length === 0) { log(bot, `Could not take any items from the source container - my inventory is full.`); return false; }
+
+    const drop = await chest.withContainer(bot, dst.block, async (ctx) => {
+        let moved = 0;
+        for (const t of taken) {
+            if (bot.interrupt_code) break;
+            const r = await ctx.deposit(t.name, t.count);
+            moved += r.moved;
+            if (r.moved < t.count) { log(bot, `Destination container is full. ${t.count - r.moved} ${t.name} left in my inventory.`); break; }
+        }
+        return moved;
+    }, { fallback: goToPosition });
+
+    if (!drop.ok) {
+        log(bot, `Took ${taken.reduce((s, t) => s + t.count, 0)} items but ${chest.explainFailure(drop, `(${toX}, ${toY}, ${toZ})`)} They are in my inventory.`);
         return false;
     }
-
-    // Go to destination chest and deposit items
-    await goToPosition(bot, toX, toY, toZ, CONSTANTS.INTERACT_DISTANCE);
-    const openedTo = await bot.openContainer(toContainer);
-
-    let totalDeposited = 0;
-    for (const item of takenItems) {
-        const invItem = bot.inventory.findInventoryItem(item.name);
-        if (invItem) {
-            try {
-                await openedTo.deposit(invItem.type, null, item.count);
-                totalDeposited += item.count;
-            } catch (e) {
-                log(bot, `Destination chest is full. ${item.count} ${item.name} left in inventory.`);
-                break;
-            }
-        }
-    }
-    await openedTo.close();
-
-    log(bot, `Transferred ${totalDeposited} items from (${fromX}, ${fromY}, ${fromZ}) to (${toX}, ${toY}, ${toZ}).`);
-    return true;
+    log(bot, `Transferred ${drop.value} items from (${fromX}, ${fromY}, ${fromZ}) to (${toX}, ${toY}, ${toZ}).`);
+    return drop.value > 0;
 }
 
-/**
- * Put items into a named chest
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string} chestName - the name of the chest
- * @param {string} itemName - the item to put
- * @param {number} num - number of items (-1 for all)
- */
 export async function putInNamedChest(bot, chestName, itemName, num = -1) {
-    const chest = getNamedChest(chestName);
-    if (!chest) {
-        log(bot, `No chest named "${chestName}". Use !listNamedChests to see available chests.`);
-        return false;
-    }
-    return await putInChest(bot, itemName, num, chest.x, chest.y, chest.z);
+    const c = getNamedChest(chestName);
+    if (!c) { log(bot, `No chest named "${chestName}". Use !chestListNamed to see available chests.`); return false; }
+    return await putInChest(bot, itemName, num, c.x, c.y, c.z);
 }
 
-/**
- * Take items from a named chest
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string} chestName - the name of the chest
- * @param {string} itemName - the item to take
- * @param {number} num - number of items (-1 for all)
- */
 export async function takeFromNamedChest(bot, chestName, itemName, num = -1) {
-    const chest = getNamedChest(chestName);
-    if (!chest) {
-        log(bot, `No chest named "${chestName}". Use !listNamedChests to see available chests.`);
-        return false;
-    }
-    return await takeFromChest(bot, itemName, num, chest.x, chest.y, chest.z);
+    const c = getNamedChest(chestName);
+    if (!c) { log(bot, `No chest named "${chestName}". Use !chestListNamed to see available chests.`); return false; }
+    return await takeFromChest(bot, itemName, num, c.x, c.y, c.z);
 }
 
-/**
- * View contents of a named chest
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @param {string} chestName - the name of the chest
- */
 export async function viewNamedChest(bot, chestName) {
-    const chest = getNamedChest(chestName);
-    if (!chest) {
-        log(bot, `No chest named "${chestName}". Use !listNamedChests to see available chests.`);
-        return false;
-    }
-    return await viewChest(bot, chest.x, chest.y, chest.z);
+    const c = getNamedChest(chestName);
+    if (!c) { log(bot, `No chest named "${chestName}". Use !chestListNamed to see available chests.`); return false; }
+    return await viewChest(bot, c.x, c.y, c.z);
 }
 
 // ============= END CHEST MASTER SYSTEM =============
@@ -2692,6 +2269,61 @@ export async function giveToPlayer(bot, itemType, username, num=1) {
     return false;
 }
 
+/**
+ * Translate a mineflayer-pathfinder goal into a target our own navigator can steer at.
+ *
+ * THE POINT OF THIS SEAM. `settings.js` already blacklists `!goToCoordinates` with the note
+ * "mineflayer-pathfinder ... cannot move this bot" - but the blacklist only hid the COMMANDS.
+ * Every skill that walks somewhere still went through `goToGoal` -> `bot.pathfinder.goto`,
+ * i.e. the same executor, reached by a different door. Measured with tools/pathfinder_probe.mjs:
+ *
+ *     plan:  status=success  nodes=3  in 6ms        <- planning is FINE
+ *     goto:  timeout after 30.0s, moved 3.1 blocks  <- execution is not
+ *
+ * PLANNING is not the broken half, so `getPathTo` calls (world.isClearPath, the destructive /
+ * non-destructive probe below) are left alone, and so are `stop()` / `setGoal(null)`, which
+ * STAND pathfinder DOWN and are the cure rather than the disease.
+ *
+ * @returns {{x:number,y:number,z:number,dist:number,xzOnly:boolean}|null} null when the goal
+ *   shape has no straightforward target - GoalInvert is "get AWAY from", not "go to".
+ */
+function navTargetFor(goal) {
+    if (!goal) return null;
+    const n = goal.constructor?.name;
+    const range = goal.rangeSq != null ? Math.sqrt(goal.rangeSq) : 1;
+    switch (n) {
+        case 'GoalBlock':   return { x: goal.x, y: goal.y, z: goal.z, dist: 1, xzOnly: false };
+        case 'GoalNear':    return { x: goal.x, y: goal.y, z: goal.z, dist: Math.max(1, range), xzOnly: false };
+        case 'GoalXZ':      return { x: goal.x, y: 0, z: goal.z, dist: 1, xzOnly: true };
+        case 'GoalNearXZ':  return { x: goal.x, y: 0, z: goal.z, dist: Math.max(1, range), xzOnly: true };
+        case 'GoalFollow': {
+            // Re-read the entity: a GoalFollow caches x/y/z at construction and the target moves.
+            const e = goal.entity;
+            const p = e?.position;
+            if (!p) return null;
+            return { x: p.x, y: p.y, z: p.z, dist: Math.max(1, range), xzOnly: false };
+        }
+        default: return null;   // GoalInvert and anything else: caller falls back
+    }
+}
+
+/**
+ * Walk to a pathfinder-shaped goal using OUR navigator.
+ * Returns false when the goal shape is not expressible, so the caller can fall back.
+ */
+async function navToGoal(bot, goal, timeoutMs = 0, opts = {}) {
+    const t = navTargetFor(goal);
+    if (!t) return null;
+    const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Infinity;
+    const res = await nav.navigateTo(bot, { x: t.x, y: t.y, z: t.z }, {
+        arriveDist: t.dist,
+        goalXZOnly: t.xzOnly,
+        ...opts,
+    });
+    if (Date.now() > deadline && !res.arrived) return false;
+    return res.arrived;
+}
+
 export async function goToGoal(bot, goal, timeoutMs = 0) {
     /**
      * Navigate to the given goal. Use doors and attempt minimally destructive movements.
@@ -2701,6 +2333,16 @@ export async function goToGoal(bot, goal, timeoutMs = 0) {
      *   Callers on a per-block budget (e.g. placeBlock) should pass one, since goto()
      *   never resolves when no route exists.
      **/
+
+    // OUR NAVIGATOR FIRST. Only goal shapes it cannot express (GoalInvert = "get away from")
+    // fall through to the pathfinder path below, which is kept precisely for them.
+    const doorCheckForNav = startDoorInterval(bot);
+    try {
+        const navResult = await navToGoal(bot, goal, timeoutMs);
+        if (navResult !== null) return navResult;
+    } finally {
+        clearInterval(doorCheckForNav);
+    }
 
     const nonDestructiveMovements = new pf.Movements(bot);
     const dontBreakBlocks = [
@@ -3348,7 +2990,18 @@ export async function followPlayer(bot, username, distance=4) {
     bot.pathfinder.setMovements(move);
     let doorCheckInterval = startDoorInterval(bot);
 
-    bot.pathfinder.setGoal(new pf.goals.GoalFollow(player, distance), true);
+    // LAND DRIVING IS OURS NOW. This used to be `bot.pathfinder.setGoal(GoalFollow, true)`,
+    // which is the executor `settings.js` already blacklists `!goToCoordinates` over -
+    // "mineflayer-pathfinder ... cannot move this bot". Follow was the last command still on
+    // it, because GoalFollow had no equivalent here and so was never swapped out. Its executor
+    // gates on `onGround` (false on this server while the bot is provably standing) and, at
+    // mineflayer-pathfinder/index.js:629, clears the jump key UNCONDITIONALLY every tick -
+    // and jump is the only propulsion this server actually gives us. Reported as "andy didn't
+    // jump when I ask followme"; the truth is he was barely being driven at all.
+    // Pathfinder must be fully stood down, not merely out-prioritised: it rewrites control
+    // states every tick and silently cancels ours.
+    bot.pathfinder.setGoal(null);
+    bot.pathfinder.stop();
     log(bot, `You are now actively following player ${username}.`);
 
     // Follow has TWO drivers. mineflayer-pathfinder cannot follow anyone underwater - its
@@ -3358,8 +3011,53 @@ export async function followPlayer(bot, username, distance=4) {
     // is wet we stand pathfinder down and hand over to the swim stack instead.
     let swimming = false;
 
+    // Consecutive failed water-exit attempts. Capped so a bot pressed against a bank it
+    // genuinely cannot climb - a two-block face, a corner it is wedged into - stops retrying
+    // the same eight-second climb forever and falls back to normal driving, which has a whole
+    // dig/detour/bridge ladder behind it.
+    let exitFails = 0;
+
     while (!bot.interrupt_code) {
         const distance_from_player = bot.entity.position.distanceTo(player.position);
+        const botWet = swim.inWater(bot);
+        if (!botWet) exitFails = 0;
+
+        // GET OUT OF THE WATER FIRST - and do it REGARDLESS OF `distance`.
+        //
+        // The land leg below is gated on `distance_from_player > max(1.5, distance)`, so a bot
+        // treading water three blocks off the bank the player is standing on has ALREADY
+        // ARRIVED: it asks the navigator for nothing, and `followPath` - which carries the
+        // per-tick water-exit branch - is only ever reached by way of a plan. Following works
+        // perfectly; the bot just never comes ashore.
+        //
+        // Measured on gym lane 5 with the other player PINNED at 3.1 blocks (a live agent walks
+        // off and hides this): with this branch disabled the bot took 15.6s to get out, with it
+        // 1.0s. It is not a deadlock, and the 15.6s is the interesting part - what eventually
+        // freed it was DRIFT. The bot sank to y=109, which pushed the 3D distance past 4 and
+        // finally earned it a leg. That is not a recovery so much as a coincidence, and it
+        // arrives in the worst possible state: the first climb from down there reported
+        // "no reachable bank in the forward cone", because sinking had put the bank out of reach.
+        //
+        // Only when the player is DRY. A swimming player is a player to swim after, and the swim
+        // branch below owns that case.
+        //
+        // Gated on a bank actually being within reach (pure block reads, ~free) rather than on
+        // calling climbBank and letting it refuse: mid-lake there is nothing to climb, and
+        // spinning on refusals here would stop the bot swimming toward the player at all.
+        if (botWet && !entityInWater(bot, player) && exitFails < 3) {
+            const [cx, cz] = nearestCompass(
+                player.position.x - bot.entity.position.x,
+                player.position.z - bot.entity.position.z);
+            // climbBank aims itself at the cell it picks and searches a +-45 degree cone around
+            // this heading, refusing anything it cannot actually swim to - so a heading pointing
+            // at a two-block cliff still finds the one-block shore beside it.
+            if (swim.bankTargetAhead(bot, cx, cz)) {
+                const r = await swim.climbBank(bot, cx, cz);
+                if (r.out) exitFails = 0; else exitFails++;
+                await new Promise(resolve => setTimeout(resolve, SWIM_POLL_MS));
+                continue;
+            }
+        }
 
         if (entityInWater(bot, player) && distance_from_player < FOLLOW_SWIM_RANGE) {
             if (!swimming) {
@@ -3401,10 +3099,24 @@ export async function followPlayer(bot, username, distance=4) {
             continue;
         }
         if (swimming) {
-            swimming = false;
-            bot.pathfinder.setGoal(new pf.goals.GoalFollow(player, distance), true);
+            swimming = false;   // land driving resumes below; nothing to re-arm
         }
 
+        // Walk one short leg toward the player with OUR navigator, then re-evaluate. Legs are
+        // short because the target moves; navigateTo replans internally anyway, and a long leg
+        // would chase a stale position. `arriveDist` is the follow distance, so a bot already
+        // close does nothing and simply polls.
+        if (distance_from_player > Math.max(1.5, distance)) {
+            await nav.navigateTo(bot, {
+                x: player.position.x, y: player.position.y, z: player.position.z,
+            }, { arriveDist: Math.max(1.5, distance), maxReplans: 2, waypointMs: 1500 });
+        }
+
+        // Always yield a real macrotask. Same trap as the swim branch above: navigateTo can
+        // return through purely microtask paths (already inside arriveDist, or a plan of
+        // length < 2), and a loop of microtasks never lets the event loop reach its timer/IO
+        // phases - the socket goes unread and the SERVER drops us with `lost connection:
+        // Timed out`, which from outside looks like the bot dying.
         await new Promise(resolve => setTimeout(resolve, 500));
         // in cheat mode, if the distance is too far, teleport to the player
 
@@ -3446,6 +3158,58 @@ export async function followPlayer(bot, username, distance=4) {
     return true;
 }
 
+
+/**
+ * Retreat from a point, using our navigator.
+ *
+ * `GoalInvert` is the one pathfinder goal shape the `navToGoal` seam cannot translate: it says
+ * "get AWAY from", so there is no target to steer at. This supplies the missing half - a flee
+ * HEADING - and then steers at a point along it like any other move.
+ *
+ * Fans out rather than committing to the single directly-opposite bearing: the straight-away
+ * line is very often into the wall the bot has just been cornered against, and a flee that
+ * fails because the one direction it tried was blocked is worse than no flee at all. Cardinal
+ * offsets first (cheapest moves), widening to a full reversal.
+ *
+ * XZ-only on purpose - "away" is a compass direction; insisting on a Y as well makes a retreat
+ * fail on any slope.
+ *
+ * @param {MinecraftBot} bot
+ * @param {Vec3} from - the thing being fled
+ * @param {number} distance - how far away is far enough
+ * @param {object} opts - {timeoutMs}
+ * @returns {Promise<boolean>} whether we ended up at least `distance` from `from`
+ */
+export async function fleeFrom(bot, from, distance = 16, opts = {}) {
+    const timeoutMs = opts.timeoutMs ?? 6000;
+    const deadline = Date.now() + timeoutMs;
+    const start = bot.entity.position.clone();
+
+    const far = () => bot.entity.position.distanceTo(from) >= distance;
+    if (far()) return true;
+
+    let ax = start.x - from.x, az = start.z - from.z;
+    const len = Math.hypot(ax, az);
+    // Standing exactly on top of it (a mob inside our own hitbox) gives no bearing at all;
+    // pick one rather than dividing by zero and steering at NaN.
+    if (len < 0.01) { ax = 1; az = 0; }
+    else { ax /= len; az /= len; }
+
+    for (const deg of [0, 45, -45, 90, -90]) {
+        if (Date.now() > deadline || bot.interrupt_code) break;
+        const r = deg * Math.PI / 180;
+        const dx = ax * Math.cos(r) - az * Math.sin(r);
+        const dz = ax * Math.sin(r) + az * Math.cos(r);
+        const reach = distance + 2;   // overshoot, so arriving is genuinely outside the radius
+        await nav.navigateTo(bot, {
+            x: Math.floor(start.x + dx * reach),
+            y: Math.floor(start.y),
+            z: Math.floor(start.z + dz * reach),
+        }, { arriveDist: 2, goalXZOnly: true, maxReplans: 2, planRange: 48 });
+        if (far()) return true;
+    }
+    return far();
+}
 
 export async function moveAway(bot, distance) {
     /**
@@ -3503,10 +3267,8 @@ export async function moveAwayFromEntity(bot, entity, distance=16) {
      * @param {number} distance, the distance to move away.
      * @returns {Promise<boolean>} true if the bot moved away, false otherwise.
      **/
-    let goal = new pf.goals.GoalFollow(entity, distance);
-    let inverted_goal = new pf.goals.GoalInvert(goal);
-    bot.pathfinder.setMovements(new pf.Movements(bot));
-    await bot.pathfinder.goto(inverted_goal);
+    // Was GoalInvert(GoalFollow) on pathfinder's executor, which cannot move this bot.
+    await fleeFrom(bot, entity.position.clone(), distance, { timeoutMs: 8000 });
     return true;
 }
 
@@ -3522,10 +3284,9 @@ export async function avoidEnemies(bot, distance=16) {
     bot.modes.pause('self_preservation'); // prevents damage-on-low-health from interrupting the bot
     let enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), distance);
     while (enemy) {
-        const follow = new pf.goals.GoalFollow(enemy, distance+1); // move a little further away
-        const inverted_goal = new pf.goals.GoalInvert(follow);
-        bot.pathfinder.setMovements(new pf.Movements(bot));
-        bot.pathfinder.setGoal(inverted_goal, true);
+        // Short flee legs, then re-look: the enemy is chasing, so a long leg runs from where
+        // it used to be. `distance+1` keeps the old "move a little further away" margin.
+        await fleeFrom(bot, enemy.position.clone(), distance + 1, { timeoutMs: 2500 });
         await new Promise(resolve => setTimeout(resolve, 500));
         enemy = world.getNearestEntityWhere(bot, entity => mc.isHostile(entity), distance);
         if (bot.interrupt_code) {
@@ -3588,10 +3349,20 @@ export async function useDoor(bot, door_pos=null) {
         return false;
     }
 
-    bot.pathfinder.setGoal(new pf.goals.GoalNear(door_pos.x, door_pos.y, door_pos.z, 1));
-    await new Promise((resolve) => setTimeout(resolve, 1000));
-    while (bot.pathfinder.isMoving()) {
-        await new Promise((resolve) => setTimeout(resolve, 100));
+    // Was `setGoal(GoalNear, 1)` followed by polling `pathfinder.isMoving()` - which on this
+    // server never becomes true, because its executor gates on `onGround` and never starts
+    // moving. The poll therefore fell through instantly and the bot reached for a door it was
+    // still 16 blocks from. navigateTo is synchronous-until-arrival, so the wait IS the walk
+    // and there is nothing to poll.
+    await nav.navigateTo(bot, { x: door_pos.x, y: door_pos.y, z: door_pos.z },
+                         { arriveDist: 1.5, maxReplans: 3 });
+
+    // Verify rather than assume: a door we could not reach cannot be opened, and activating a
+    // block out of range fails silently, which reads as "the door is stuck".
+    const reach = bot.entity.position.distanceTo(door_pos.offset(0.5, 0.5, 0.5));
+    if (reach > 4.5) {
+        log(bot, `Could not reach the door at ${door_pos} - stopped ${reach.toFixed(1)} blocks away.`);
+        return false;
     }
     
     let door_block = bot.blockAt(door_pos);

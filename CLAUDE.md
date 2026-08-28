@@ -218,6 +218,57 @@ us), the `position`-packet rate limiting the 50ms throttle in `src/mc/backends/m
 exists to survive, or ViaVersion sitting in the packet path. **Investigate the server, not the
 client library.**
 
+### Nothing EXECUTES on mineflayer-pathfinder any more
+
+`settings.js` already blacklisted `!goToCoordinates` with the note *"mineflayer-pathfinder ...
+cannot move this bot"* - but **the blacklist only hid the COMMANDS**. Every skill that walked
+somewhere still reached the same executor through `goToGoal` -> `bot.pathfinder.goto`. Reported
+as *"andy didn't jump when I ask followme"*; the truth was he was barely being driven at all.
+
+**Only the EXECUTOR is broken. Planning is fine.** So these stay and are not bugs:
+
+| still calls pathfinder | why it is correct |
+|---|---|
+| `getPathTo` - `world.isClearPath`, `goToGoal`'s destructive/non-destructive probe, `moveAway`'s cheat branch | planning works: `status=success nodes=3 in 6ms` |
+| `stop()` / `setGoal(null)` - `followPath`, `agent.js`, `hopForward`, `walkForward`, `followPlayer` | this STANDS PATHFINDER DOWN. It rewrites control states every tick and silently cancels ours, so it must be stopped, not out-prioritised. The cure, not the disease. |
+
+**`navToGoal` (skills.js) is the seam.** It translates a pathfinder goal into a target our
+navigator can steer at - `GoalBlock`, `GoalNear`, `GoalXZ`, `GoalNearXZ`, `GoalFollow` (re-reading
+the entity: `GoalFollow` caches x/y/z at construction and the target moves). `goToGoal` tries it
+first, so nine functions converted in one edit: `goToPosition`, `goToPlayer`, `pickupNearbyItems`,
+`breakBlockAt`, `placeBlock`, `tillAndSow`, `fillBucket`, `activateNearestBlock`,
+`findAndGoToVillager`.
+
+**`GoalInvert` is the one shape the seam cannot translate** - it means "get AWAY from", so there
+is no target to steer at. `skills.fleeFrom(bot, from, distance)` supplies the missing half, a
+flee HEADING, and then steers at a point along it. It **fans out** (0, +-45, +-90 degrees) rather
+than committing to the directly-opposite bearing, because the straight-away line is very often
+into the wall the bot was cornered against, and it is XZ-only because "away" is a compass
+direction - insisting on a Y makes every retreat fail on a slope. Converted:
+`moveAwayFromEntity`, `avoidEnemies`, `defendSelf` (both the close and the back-off branch), and
+`placeBlock`'s two "step clear of the cell I am about to fill" retreats.
+
+**`useDoor` was worse than slow - it was silently skipping the walk.** It did
+`setGoal(GoalNear, 1)` and then polled `while (bot.pathfinder.isMoving())`. That never becomes
+true here, because the executor never starts moving, so the poll fell through instantly and the
+bot reached for a door it was still 16 blocks from. `navigateTo` is synchronous-until-arrival,
+so the wait IS the walk; it now also verifies reach before activating, since activating a block
+out of range fails silently and reads as "the door is stuck".
+
+`followPlayer` keeps its swim branch untouched, **including the macrotask yield** - a bare
+`continue` there starved the event loop and the server dropped the bot
+(`andy lost connection: Timed out`, 70s into a follow). The new land leg carries the same yield
+for the same reason: `navigateTo` can return through pure microtasks when already inside
+`arriveDist`.
+
+Two `pathfinder.goto` calls remain, in `gotoWithTimeout` and `goToGoal`, as the fallback for a
+goal shape the seam cannot express. **No caller constructs one any more**, so they are dead
+defensive paths rather than live routes.
+
+Measured live after the conversion: a 1-block step that the pathfinder-driven command cannot
+climb at all is cleared in **1.4s** (`y` 111 -> 112.25 mid-step, plan 6ms), and `!moveAway(8)`
+covers 7.6 blocks in ~2s across that same step.
+
 ### The stack we run instead
 
 Built only on primitives that *do* work here - walking, raw jumping, block reads, mining:
@@ -475,6 +526,101 @@ column, **phase 3 - the one that cuts through the ceiling - never ran at all**. 
 `surface()` returning `timeout, rose -0.2` with a single diggable stone block directly overhead.
 Phase 2 is now capped at 4s.
 
+#### The exit decision is made every tick, not after the stall ladder
+
+`nav.waterExitVerdict()` - pure, `tests/water_exit.test.mjs`.
+
+Getting out of water used to be decided by `followPath`'s stall ladder, whose branch order is
+`progress -> waypointMs(6000) -> afloat -> pinnedMs(2500) && hops>=2 -> hop(700ms)`. From a dead
+stop that is a hop at 700ms, a hop at 1400ms, and the **first climb attempt at 2500ms**. Measured
+on one real bank at (4434, 62, 4682):
+
+```
+16:02:02  leg 3 ends
+16:02:05  pinned   :07 pinned   :11 pinned   :13 pinned
+16:02:14  leg 4: moved=-0.01 -> RECOVERY     <- 12s spent CONCLUDING it was stuck
+16:02:14  climbBank attempt 1 -> jammed
+16:02:20  climbBank attempt 2 -> OUT
+```
+
+**Twelve seconds of detection for six seconds of climbing.** And the routine the 2500ms branch
+reaches is `climbAhead`, which only handles rises of **2 or 3** - so a ONE-block bank fell
+through to `digAhead` and the bot mined the shore at water level. That is the canal-digging
+behaviour, still live in the wading path; `swim.climbBank`, the routine that actually works, was
+gated behind the 6000ms leg timeout and `travelToward`'s recovery ladder.
+
+Every input the decision needs is already recomputed every tick (`isInWater` is an AABB scan,
+block reads are synchronous), so it now runs on **every loop iteration (~100ms)** and routes
+straight to `climbBank`. Gated by a 1200ms cooldown and a 3-attempt cap, because a failed climb
+must not re-fire every 100ms and the existing ladder must still get its turn.
+
+**A false positive costs a whole leg** - `climbBank` is an 8s commitment - so the refusals are
+the tested surface: not wet, lava (both fluids share one physics branch), nothing solid ahead,
+rise != 1, no landing, no headroom, bank further than 1.6 blocks.
+
+#### climbBank maintains its standoff - it is not a one-shot back-off
+
+The 400ms back-off was necessary and not sufficient: `forward` was then held for the whole climb,
+so the bot walked straight back into the face it had just left. That made the climb a RACE
+between rising (the `JUMP_IMPULSE` duty cycle) and closing (`forward` at ~0.1 b/t). Same target,
+same heading, 4 seconds apart:
+
+```
+t=1.0s fwd=true pos=(4434.31, 62.42) vel=(0.000, 0.000, 0.000)  <- flush, ALL axes dead -> jammed
+[retry] t=1.0s  pos=(4434.30, 62.72) vel=(0.000,-0.078, 0.001)  -> OUT
+```
+
+The face is x=4434.0 and the bot is 0.6 wide, so flush is 4434.30. **Both runs arrived flush; only
+the height at contact differed - 62.42 vs 62.72.** Three tenths of a block decided it, which is
+why retry counts looked like nondeterministic physics.
+
+Now sequenced: hold `FACE_GAP + 0.30` while below the lip, press `forward` only once over it.
+**The progress metric had to follow** - it was `rise + closing`, and backing off increases the
+gap, so a correct back-off scored as negative progress and could trip the 2.5s jam bail on the
+very move that unsticks the bot. Below the lip progress is height; above it, closing.
+
+Measured live, gym lane 3, one-block bank: **2.8s end to end, one climbBank attempt of 413ms, no
+`pinned` lines, 0 blocks mined** - against a 45.2s baseline for the same lane. One lane, one run;
+the full 10-lane sweep has not been re-run.
+
+#### The lip is TWO thresholds, and the step over it has to be DRIVEN (2026-08-27)
+
+The 10-lane sweep, re-run: **10/10, every lane in 1-4s, one `climbBank` call per lane, zero
+jams.** Getting there took three fixes, and the first sweep that passed 10/10 still had 15s,
+20s and 43s outliers that moved lane to lane between runs - that flakiness was the real bug.
+
+**A single `target.y - 0.05` was deciding two opposite questions.** Captured on lane 7:
+
+```
+t=2.0s pos=(4508.36, 111.05) wet=false   <- above the lip, so `forward` went on
+t=3.0s pos=(4508.68, 110.97) wet=true    <- fell back in; STILL counted as "over"
+t=4.1s pos=(4508.70, 110.97) vel=(0.000, -0.078, 0.000)  -> flush, jammed
+```
+
+At 111.05 the bot was five hundredths above the face and standing over WATER, with ~0.55 blocks
+still to walk - six ticks, in which an unsupported body falls most of a block. It could never
+have made it. Then, having fallen to 110.97, the same tolerance still read "over", so `forward`
+stayed on and drove it flush, while the rise impulse - gated on `y < target.y - 0.05` - was
+switched off by that very number. **A 0.05-block dead band in which the bot may not climb and
+must not stop pressing.** Now `LIP_CLEAR` separates them: walking in needs real clearance, the
+impulse keeps firing right up to it, and *dry and level with the face is not the same as
+supported* - only a solid block under the feet (`standingOnSolid`) proves the bot is on the bank.
+
+**`STEP_IN_SPEED` - the run-up, for the same reason `JUMP_IMPULSE` is the jump.** Over the lip
+the bot is above the water and above nothing, so it has about a third of a second of fall to
+cover the last half block - and `onGround` being false means prismarine-physics grants it only
+AIRBORNE acceleration for the one moment it most needs to run. It reached y=111.46 with
+`forward` held and moved **0.04 blocks** horizontally before falling back, five times in one
+lane. 0.14 b/tick is a vanilla walk; this is not a boost, it is the run-up the broken ground
+flag denies us, applied only while over the lip and only until the bot is over the target cell.
+
+**The dip is ONE-SHOT.** `submergeUntil` alone was not, and that is what made the whole routine
+stochastic: reaching submersion clears it, the next tick sees the bot still below the lip,
+`!submergeUntil` is true again, and it arms another 1.5 seconds of *sinking*. Lane 5 fell to
+y=109.20 from a start of 110.35 - a block the wrong way - and the same lane cleared in 0.4s on
+one run and took 18s on the next. Nothing about it was depth-specific; it was whether a dip
+happened to submerge.
+
 #### Climbing out of the water onto a bank
 
 Getting *out* of water was the single biggest source of stuck bots - it is what produced the
@@ -649,6 +795,72 @@ Scan the column **downward**; do not bisect. Columns are not monotonic here - ca
 put air under stone - and a bisection over [-64, 250] converges on a cave roof 50 blocks below
 the real surface. Use ONE persistent RCON connection: reconnecting per command stalls the
 server after ~13 rapid cycles, and `socket.setTimeout` does not fire on it.
+
+## Chests and containers
+
+Full engine: **`src/agent/library/chest.js`**. `skills.js` holds only the policy (which
+container, which items, what to say); **nothing outside `chest.js` may call `bot.openContainer`.**
+
+### `bot.openContainer` has no timeout, and that killed the process
+
+`mineflayer/lib/plugins/inventory.js:385` is `activateBlock()` + `await once(bot, 'windowOpen')`.
+There is no deadline. **Every reason the server declines to send a window is an infinite hang**,
+and an action that never returns pins `currentActionLabel` forever - after which no action can
+ever start again. From the log:
+
+```
+ChestView at (4727,68,4764) caused code execution timeout and process kill
+Chest viewing at (4557,68,4862) times out after 20s - pathfinding fails to reach it
+```
+
+Three separate causes, all fixed in `chest.js`, all previously the same symptom:
+
+- **The approach was never verified.** Every old chest function called `goToPosition` - which
+  drives **mineflayer-pathfinder, whose executor does not work on this server** (`onGround`
+  reads false while standing; see Movement) - then called `openContainer` unconditionally,
+  discarding the return value. A failed walk became a permanent hang instead of "I could not get
+  to the chest". Approach now runs through `nav.js` and the distance is **measured** before a
+  window is requested (`MAX_REACH = 3.5`). Same rule as everything else here: trust measured
+  state over reported state.
+- **Vanilla refuses to open some chests at all** - a solid cube directly above, or a cat sitting
+  on it. Only chests obey that rule; barrels and shulker boxes do not, so checking them all
+  would refuse containers that work.
+- **`decorated_pot` and `chiseled_bookshelf` were in the old `STORAGE_CONTAINERS` list.** They
+  store items but open **no window whatsoever**, so `!chestDepositAll` could pick one as "the
+  nearest container" and wait forever for a `windowOpen` that does not exist.
+
+`openObstruction()` is the pure predicate for the last two and **fails OPEN**: unknown block,
+unloaded chunk or missing entity list all fall through to "try it, and let the timeout bound the
+damage". A check that guessed *blocked* from missing data would disable the command in exactly
+the situations we cannot diagnose. Everything else is bounded by `withTimeout`.
+
+### A leaked window poisons every later container op
+
+`bot.openContainer` cannot be cancelled, so a window that arrives **after** we stopped waiting
+stays open as `bot.currentWindow` - and a stale `currentWindow` makes the *next* open never
+fire. That is one bad chest silently breaking every deposit for the rest of the session.
+`withContainer` closes in a `finally`, `safeClose` tolerates every way a close can fail and
+clears the field, and any leaked window is closed **pre-flight** before a new open.
+`idle_behavior.js`'s chest scanner had exactly this leak (its own `Promise.race` dropped the
+late window on the floor) and now goes through the same path.
+
+### Counts are measured, never requested
+
+`takeFromChest` did `totalTaken += toTakeFromSlot` immediately after `withdraw`, with no check -
+so a bot with a **full inventory** reported `Successfully took 64 diamond` having taken none.
+`depositVerified`/`withdrawVerified` count the inventory before and after and report the
+difference; a partial transfer says so, and `planWithdraw` bounds the request by real inventory
+room up front. `transferBetweenChests` now carries only what it actually withdrew.
+
+### Deposit-all aggregates BY NAME, not by slot
+
+200 cobblestone is four slots. The first deposit moves all four stacks and the next three
+entries find nothing left - and **a deposit of zero is indistinguishable from a full
+container**, so the loop declared the chest full and walked to the next one with an empty bag.
+`depositableItems` returns one entry per item type; `none_held` is explicitly not `full`.
+
+Tests: `bun tests/chest.test.mjs` (pure, no server). The cases that must **not** refuse matter
+more than the ones that must.
 
 ## Creative mode
 
@@ -826,6 +1038,35 @@ resolved.
 `bot.clearControlStates()` unguarded - it fires after *every* action completes, which is most of
 the time a floating bot is idle at all - and jump is buoyancy, not a movement input. It now
 carries the same `!swim.inWater(bot)` guard that `self_preservation`'s idle branch already had.
+
+### Follow has to leave the water on its own - the follow distance hides the problem
+
+`followPlayer`'s land leg is gated on `distance_from_player > max(1.5, distance)`. With the
+default `distance` of 4, **a bot treading water three blocks off the bank the player is standing
+on has already arrived**: it asks the navigator for nothing, and `nav.followPath` - which carries
+the per-tick water-exit branch - is only ever reached by way of a plan. Following works
+perfectly; the bot just never comes ashore.
+
+So `followPlayer` now runs its own water exit, *before* the distance check and regardless of it,
+whenever the bot is wet and the player is not. Gated on `swim.bankTargetAhead` actually finding a
+bank (pure block reads, ~free) rather than on calling `climbBank` and letting it refuse - mid-lake
+there is nothing to climb, and spinning on refusals there would stop the bot swimming toward the
+player at all. Capped at 3 consecutive failures so a bank the bot genuinely cannot climb falls
+back to normal driving, which has a whole dig/detour/bridge ladder behind it.
+
+Measured on gym lane 5, **with the other player PINNED** at 3.1 blocks: **15.6s without this
+branch, 1.0-1.5s with it.** It is not a deadlock, and the 15.6s is the interesting half - what
+eventually freed the bot was DRIFT. It sank to y=109, which pushed the 3D distance past 4 and
+finally earned it a leg. That is a coincidence rather than a recovery, and it arrives in the
+worst possible state: the first climb from down there reported `no reachable bank in the forward
+cone`, because sinking had put the bank out of `bankTargetAhead`'s one-block reach.
+
+**Pin the other player when testing this.** The first control run measured nothing: bob is a live
+agent, and four seconds in he issued `!navTo(3371, 62, 4845)` and walked off - which pushed andy
+outside the follow distance and quietly converted the inside-follow-distance case into the
+ordinary one. `scratchpad/follow_water.mjs` re-teleports him every 500ms and reports the maximum
+gap actually observed, so a contaminated run is visible in the output rather than passing as a
+result.
 
 ## Memory
 

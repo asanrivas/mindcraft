@@ -90,6 +90,24 @@ export class AutoJump {
             if (--this.holding === 0) {
                 bot.setControlState('jump', false);
                 this.cooldown = this.opts.cooldownTicks;
+            } else if (bot.controlState?.jump !== true) {
+                // RE-ASSERT AGAINST THE REAL CONTROL STATE, never against `holding`.
+                // Same invariant SwimAssist's `_setJump` had to learn, different subsystem:
+                // trust the key, not our own belief about the key. Anything that calls
+                // `bot.clearControlStates()` - the action manager on an interrupt, a mode,
+                // another skill's cleanup - drops jump behind our back, and a `holding` counter
+                // that still says "mid-jump" then never presses again. Jump is the only
+                // propulsion this server gives us, so one silent drop is a stalled bot.
+                //
+                // HONESTY NOTE: this is defensive, not measured. It was written for a specific
+                // mechanism - mineflayer-pathfinder clearing jump unconditionally every tick at
+                // index.js:629 - and the A/B that was supposed to prove it measured nothing (the
+                // test drove `!goToCoordinates`, which settings.js blacklists, so the command was
+                // dropped before parsing and BOTH arms were void). That mechanism is in any case
+                // no longer live: nothing executes on pathfinder any more. Kept because the rule
+                // it encodes is right and the cost is one comparison; delete it freely if it
+                // ever gets in the way.
+                bot.setControlState('jump', true);
             }
             return;
         }

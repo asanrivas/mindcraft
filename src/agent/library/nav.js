@@ -1,5 +1,7 @@
 import { Vec3 } from 'vec3';
 import { digWithTool, isTreeTrunk, isLavaName, isSwimmable, isBubbleColumn, isWaterName } from './tools.js';
+// swim.js imports only tools.js, so this is not a cycle.
+import { climbBank } from './swim.js';
 
 /**
  * A self-contained navigator: A* planner + lookahead executor.
@@ -41,6 +43,7 @@ const DEFAULTS = {
     hopWhenStuck: true,  // see followPath: the only reliable way to move when onGround is wrong
     digWhenPinned: true, // mine the obstruction when hopping cannot free us
     climbWhenBlocked: true, // place blocks to get up a ledge too tall to jump
+    waterExit: true,     // recognise a one-block bank on the tick we stall, not 2.5s later
     pinnedMs: 2500,
     heuristicWeight: 1.25, // slight greediness; we replan often so optimality is not worth the nodes
 
@@ -540,6 +543,11 @@ export async function followPath(bot, path, opts = {}) {
     let dbgAt = 0;
     let lastProgress = Date.now();
     let hops = 0;
+    // Water-exit gate. `climbBank` is an 8s commitment, so a failed attempt must not re-fire on
+    // the next 100ms iteration; and after a few tries the existing ladder (dig, footing, replan)
+    // deserves its turn rather than us looping on a bank that will not take us.
+    let exitAttempts = 0;
+    let exitCooldownUntil = 0;
     const final = path[path.length - 1];
 
     try {
@@ -633,12 +641,38 @@ export async function followPath(bot, path, opts = {}) {
                     + `vel=(${bot.entity.velocity.x.toFixed(3)},${bot.entity.velocity.y.toFixed(3)},${bot.entity.velocity.z.toFixed(3)})`);
             }
 
+            // Evaluated EVERY iteration (~100ms) so the answer is available the instant the
+            // bot stops making progress, instead of after the 2500ms/6000ms stall timers.
+            const exitProbe = (o.waterExit && wet)
+                ? probeWaterExit(bot, yaw, wet, {
+                      cooldown: Date.now() < exitCooldownUntil,
+                      attemptsSpent: exitAttempts >= 3,
+                  })
+                : null;
+            const exitVerdict = exitProbe
+                ? waterExitVerdict(exitProbe)
+                : { climb: false, reason: 'dry' };
+
             const remaining = Math.hypot(final.x - p.x, final.z - p.z);
             if (remaining < bestRemaining - 0.25) {
                 bestRemaining = remaining;
                 stallSince = Date.now();
                 lastProgress = Date.now();
                 hops = 0;
+            } else if (exitVerdict.climb) {
+                // CLIMB OUT NOW - on the tick we stopped moving, not 2.5s later, and via
+                // climbBank rather than digAhead. See waterExitVerdict for why both matter.
+                exitAttempts++;
+                const r = await climbBank(bot, exitProbe.dx, exitProbe.dz);
+                exitCooldownUntil = Date.now() + 1200;
+                lastProgress = Date.now();
+                hops = 0;
+                // A successful climb changes the whole situation: give the steering a clean
+                // slate rather than letting the pre-climb stall immediately end the leg.
+                if (r.out) { stallSince = Date.now(); bestRemaining = Infinity; }
+                console.log(`[${bot.username ?? '?'}] waterExit: attempt ${exitAttempts} `
+                    + `-> ${r.out ? 'OUT' : 'still wet'}, gained ${r.gained.toFixed(2)} `
+                    + `(${exitVerdict.reason})`);
             } else if (Date.now() - stallSince > o.waypointMs) {
                 break; // not converging; let the caller replan
             } else if (wet && !wading) {
@@ -725,6 +759,88 @@ export async function followPath(bot, path, opts = {}) {
  *
  * @returns {Promise<boolean>} true if height was gained.
  */
+/**
+ * Should the bot stop trying to WALK and start climbing OUT of the water, right now?
+ *
+ * This is a per-tick predicate, and that is the entire point. The old answer arrived through
+ * the stall ladder in `followPath`, whose branch order is:
+ *
+ *     progress? -> waypointMs(6000) break -> afloat -> pinnedMs(2500) && hops>=2 -> hop(700ms)
+ *
+ * From a dead stop that is a hop at 700ms, a hop at 1400ms, and the FIRST climb attempt at
+ * 2500ms - and the routine it reaches then is `climbAhead`, which only handles rises of 2 or 3
+ * (see below). A one-block bank therefore falls through to `digAhead`, which mines the bank.
+ * That is the "Andy dug a canal" behaviour: failing to climb a 1-block bank fell through to the
+ * dig recovery and the bot cut a channel through the shore at water level instead of stepping
+ * over it. The routine that actually works for banks - `swim.climbBank` - was gated behind the
+ * 6000ms leg timeout and `travelToward`'s recovery ladder.
+ *
+ * Every input here is already recomputed every physics tick (`isInWater` is an AABB scan, block
+ * reads are synchronous), so the decision costs nothing and can be made the moment the bot stops
+ * making progress - ~100ms, the loop period - rather than 2.5s or 6s later.
+ *
+ * Pure so all the branches can be tested. The ones that must NOT fire matter most: a false
+ * positive hijacks a leg that was walking fine, and `climbBank` is an 8-second commitment.
+ *
+ * @returns {{climb: boolean, reason: string}}
+ */
+export function waterExitVerdict(s) {
+    if (!s.wet) return { climb: false, reason: 'not in water' };
+    // Both fluids share one physics branch and can read true at a boundary; every swim entry
+    // point refuses on lava and so does this one.
+    if (s.lava) return { climb: false, reason: 'lava' };
+    if (s.cooldown) return { climb: false, reason: 'attempt cooling down' };
+    if (s.attemptsSpent) return { climb: false, reason: 'attempts spent, leaving it to the ladder' };
+    if (!s.faceAhead) return { climb: false, reason: 'nothing solid ahead to climb' };
+    // climbBank caps at maxRise 1 by measurement, not by taste: at the surface the bot is in
+    // neither regime - not "in water" enough for the swim impulse, and onGround is false so the
+    // land jump is dead - and a 2-block bank is climbLedgeByPlacing's job.
+    if (s.riseNeeded !== 1) return { climb: false, reason: `rise is ${s.riseNeeded}, not a one-block bank` };
+    if (!s.landingStandable) return { climb: false, reason: 'nowhere to stand on top' };
+    if (!s.headroom) return { climb: false, reason: 'no headroom above the bank' };
+    // Beyond about a block and a half the thing ahead is not what is stopping us, and committing
+    // to an 8s climb against a wall we are not touching wastes the leg.
+    if (s.gapToFace > 1.6) return { climb: false, reason: `bank is ${s.gapToFace.toFixed(2)} away` };
+    return { climb: true, reason: `one-block bank at ${s.gapToFace.toFixed(2)}` };
+}
+
+/** Gather `waterExitVerdict`'s inputs from the world along the current heading. */
+function probeWaterExit(bot, yaw, wet, gate) {
+    // Quantise the heading to a block direction: every block-level helper indexes as p + d*n,
+    // and a fractional d reads the wrong column.
+    const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
+    const dx = Math.abs(fx) >= Math.abs(fz) ? Math.sign(fx) : 0;
+    const dz = Math.abs(fz) > Math.abs(fx) ? Math.sign(fz) : 0;
+    const p = bot.entity.position;
+    // Biased up 0.15 before flooring, for the same reason `wading` is: a surface float dips
+    // below the block boundary and flips the classification every few ticks.
+    const base = Math.floor(p.y + 0.15);
+    const x = Math.floor(p.x) + dx, z = Math.floor(p.z) + dz;
+    // Live reads, NOT through ctx.cache - that cache is per-plan and the shore may have changed.
+    const ctx = { bot, o: DEFAULTS, cache: new Map() };
+
+    // Lava and water share one physics branch and can both read true at a boundary, so decide
+    // it here from the block the body is actually in rather than trusting `isInWater` alone.
+    const feetName = bot.blockAt(new Vec3(Math.floor(p.x), base, Math.floor(p.z)))?.name;
+    const headName = bot.blockAt(new Vec3(Math.floor(p.x), base + 1, Math.floor(p.z)))?.name;
+    const lava = isLavaName(feetName ?? '') || isLavaName(headName ?? '');
+
+    const faceAhead = classify(ctx, x, base, z) === SOLID;
+    const landingStandable = standCost(ctx, x, base + 1, z) !== null;
+    const headroom = classify(ctx, x, base + 2, z) !== SOLID;
+    // Distance from the bot's centre to the near FACE of the bank column, along the heading.
+    const faceCoord = dx !== 0 ? (dx > 0 ? x : x + 1) : (dz > 0 ? z : z + 1);
+    const along = dx !== 0 ? p.x : p.z;
+    const gapToFace = Math.abs(faceCoord - along);
+
+    return {
+        wet, lava, faceAhead, landingStandable, headroom, gapToFace,
+        riseNeeded: 1,
+        cooldown: gate.cooldown, attemptsSpent: gate.attemptsSpent,
+        dx, dz,
+    };
+}
+
 async function climbAhead(bot, yaw) {
     const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
     const p = bot.entity.position;

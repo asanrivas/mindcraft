@@ -714,6 +714,48 @@ function corridorClear(bot, from, ax, az, n, dy) {
 // engine never fires the jump itself - see climbBank.
 const JUMP_IMPULSE = 0.42;
 
+// climbBank standoff geometry, in `gapTo` units (distance to the target block's CENTRE).
+// The face is 0.5 from the centre and the bot's hitbox half-width is 0.3, so the AABB is flush
+// at 0.80 - and flush is the state in which collision resolution cancels the entire move,
+// vertical included, leaving vel=(0.000, 0.000, 0.000) with forward held.
+const FACE_GAP = 0.80;
+const STANDOFF = FACE_GAP + 0.30;   // 1.10 - the clearance measured at 0.8s out vs 22s stuck
+
+// How far ABOVE the bank's top face the feet must be before walking in is worth trying.
+//
+// This used to be -0.05 - i.e. "close enough to the lip counts as over it" - and that tolerance
+// is a trap on both sides. Captured on gym lane 7 (the one run in ten that took 20s):
+//
+//   t=2.0s pos=(4508.36, 111.05) wet=false   <- above the lip, so `forward` went on
+//   t=3.0s pos=(4508.68, 110.97) wet=true    <- fell back in; STILL counted as "over"
+//   t=4.1s pos=(4508.70, 110.97) vel=(0.000, -0.078, 0.000)  -> flush, jammed
+//
+// Two separate mistakes, both from the same number. At 111.05 the bot was 0.05 above the face
+// and standing over WATER, and the walk-in is ~0.55 blocks at ~0.1 b/tick - six ticks, in which
+// an unsupported body falls the best part of a block. It could never have made it. And once it
+// had dropped to 110.97 the tolerance still read "over", so `forward` stayed on and drove it
+// flush into the face, while the rise impulse - gated on `y < target.y - 0.05` - was switched
+// off by the very same threshold. A 0.05-block dead band in which the bot may not climb and
+// must not stop pressing.
+//
+// So the two decisions get their own thresholds. Walking in needs real clearance (the impulse
+// lifts about a block, so this is affordable), and the impulse keeps firing right up to it.
+const LIP_CLEAR = 0.25;
+
+// Horizontal speed, in blocks/tick, supplied by hand for the step in over the lip.
+//
+// Same reason as JUMP_IMPULSE, one axis over: `onGround` reads false here permanently, so
+// prismarine-physics grants the bot AIRBORNE acceleration (a fraction of the ground figure)
+// for the one moment it most needs to run. Over the lip the bot is above the water and above
+// nothing - the column beneath it is still the pool - so it has about a third of a second of
+// fall in which to cover the last half block, and drifting at 0.02 b/tick does not do it.
+// The traces are unambiguous: it reached y=111.46 with `forward` held and moved 0.04 blocks
+// horizontally before falling back in, over and over, five times in one lane.
+//
+// 0.14 is a vanilla walk. This is not a speed boost - it is the run-up the broken ground flag
+// denies us, applied only while over the lip and only until the bot is over the target cell.
+const STEP_IN_SPEED = 0.14;
+
 /** Is there a full block directly beneath the feet? Then the water is stand-deep, not swim-deep. */
 function standingOnSolid(bot) {
     // The block BELOW THE FEET CELL, not 0.2 below the eye-position. A bot floating a third of
@@ -783,8 +825,38 @@ export async function climbBank(bot, dx, dz, opts = {}) {
     }
     setMode(bot, 'climb');
     let submergeUntil = 0;
+    // The dip is ONE-SHOT. `submergeUntil` alone is not, and that made the whole routine
+    // stochastic: reaching submersion clears it, the very next tick sees the bot still below
+    // the lip, `!submergeUntil` is true again, and it arms another 1.5 seconds of SINKING. In
+    // deep lanes the bot therefore dipped, rose, dipped again - measured on gym lane 5 falling
+    // to y=109.20 from a start of 110.35, a whole block the wrong way - and the same lane that
+    // cleared in 0.4s on one run took 18s on the next. Nothing about it was depth-specific;
+    // it was whether a dip happened to submerge.
+    let dipDone = false;
     let lastBoost = 0;
-    bot.setControlState('forward', true);
+    // RISE FIRST, THEN STEP IN - the standoff is MAINTAINED, not a one-shot at entry.
+    //
+    // The back-off above used to be the whole fix, and it is not enough: `forward` was then
+    // held for the entire climb, so the bot immediately walked back into the face it had just
+    // backed away from. That makes the climb a RACE between two continuous processes - rising
+    // (the JUMP_IMPULSE duty cycle) and closing (`forward` at ~0.1 b/t) - and whichever crosses
+    // first decides the outcome. Captured at (4434, 62, 4682), same target, same heading, 4s
+    // apart, one jam and one success:
+    //
+    //   t=0.0s fwd=true pos=(4434.76, 62.29) vel=(0.064, 0.405, -0.003)
+    //   t=1.0s fwd=true pos=(4434.31, 62.42) vel=(0.000, 0.000, 0.000)  <- flush, ALL axes dead
+    //   jammed - no measured progress in 2.5s
+    //   [retry] t=1.0s pos=(4434.30, 62.72) vel=(0.000,-0.078, 0.001) -> OUT, gained 1.56
+    //
+    // The target block's face is x=4434.0 and the bot is 0.6 wide, so flush is x=4434.30. Both
+    // runs arrived flush; the only difference was the HEIGHT at contact - 62.42 versus 62.72.
+    // Three tenths of a block decided it. That is a race, and a race explains the retry counts
+    // ("after 1 attempt(s)" / "after 2 attempt(s)") that looked like nondeterministic physics.
+    //
+    // So sequence it. Hold a gap while below the lip - the collision resolution cancels the
+    // whole move, VERTICAL INCLUDED, while the AABB is touching, so closing early destroys the
+    // rise it still needs - and press forward only once the hitbox is actually over the top.
+    bot.setControlState('forward', false);
     // Never sprint here: the boost is a horizontal acceleration and it drives the bot INTO the
     // bank face harder, which is the opposite of what is needed.
     bot.setControlState('sprint', false);
@@ -827,6 +899,7 @@ export async function climbBank(bot, dx, dz, opts = {}) {
             if (isSubmerged(bot)) {
                 setMode(bot, 'climb');
                 submergeUntil = 0;
+                dipDone = true;
             }
             // The impulse is not only for stand-deep water. At two blocks deep the bot can
             // neither submerge (buoyancy holds it above y=110, so its head never goes under)
@@ -834,7 +907,7 @@ export async function climbBank(bot, dx, dz, opts = {}) {
             // y=110.34 against a bank whose face is 111.0 - 0.66 short, pinned at x=4508.70.
             // Whenever we are in water, below the target, and not already rising, supply the
             // impulse the broken ground flag denies us.
-            if (inWater(bot) && bot.entity.position.y < target.y - 0.05) {
+            if (inWater(bot) && bot.entity.position.y < target.y + LIP_CLEAR) {
                 // A real player just jumps: the captured trace shows +0.75 in a single tick from
                 // `onGround=1`. Our `onGround` reads false permanently (see CLAUDE.md), so
                 // prismarine-physics never grants that impulse and buoyancy alone tops out ~0.2
@@ -850,15 +923,63 @@ export async function climbBank(bot, dx, dz, opts = {}) {
             if (bot.entity.position.y < target.y - 0.15) {
                 // Not under yet and not high enough: keep sinking, but never forever - a bot in
                 // water too shallow to submerge in must fall through to the caller's other moves.
-                if (!submergeUntil) submergeUntil = nowMs + 1500;
-                if (nowMs < submergeUntil) setMode(bot, 'sink');
-                else setMode(bot, 'climb');
+                if (dipDone) setMode(bot, 'climb');
+                else if (!submergeUntil) { submergeUntil = nowMs + 1500; setMode(bot, 'sink'); }
+                else if (nowMs < submergeUntil) setMode(bot, 'sink');
+                else { dipDone = true; setMode(bot, 'climb'); }
             } else {
                 setMode(bot, 'climb');
             }
 
             const flat = Math.hypot(target.x + 0.5 - now2.x, target.z + 0.5 - now2.z);
-            const progress = (now2.y - start.y) + (startFlat - flat);
+
+            // Standoff regulation. `flat` is measured to the target's CENTRE, so the face is
+            // 0.5 away and the 0.3 hitbox half-width puts flush at 0.80. The measured-good
+            // clearance is 0.3 blocks (x=4508.40 was out in 0.8s; x=4508.70, flush, held y
+            // 110.000 for 22 seconds), hence a standoff of 1.10 and a nudge back below 0.92.
+            // Over the lip, or already standing on the bank. `standingOnSolid` is the half that
+            // matters: being dry and level with the top face is NOT the same as being supported -
+            // on lane 7 the bot was dry at y=111.05 with nothing but water beneath it, walked in,
+            // and fell straight back. A solid block under the feet is the only proof.
+            const highEnough = now2.y >= target.y + LIP_CLEAR
+                || (standingOnSolid(bot) && now2.y >= target.y - 0.05);
+            if (highEnough) {
+                // Over the lip: now walking in is the whole remaining job.
+                bot.setControlState('back', false);
+                bot.setControlState('forward', true);
+                // ...and walking is exactly what this bot cannot do airborne. Drive it.
+                if (flat > 0.55) {
+                    const v = bot.entity.velocity;
+                    const ux = (target.x + 0.5 - now2.x) / flat;
+                    const uz = (target.z + 0.5 - now2.z) / flat;
+                    const along = v.x * ux + v.z * uz;
+                    if (along < STEP_IN_SPEED) {
+                        v.x += (STEP_IN_SPEED - along) * ux;
+                        v.z += (STEP_IN_SPEED - along) * uz;
+                    }
+                }
+            } else if (flat < FACE_GAP + 0.12) {
+                // Too close to rise. Back off rather than merely stopping: at this range the
+                // bot is already touching and staying still keeps it touching.
+                bot.setControlState('forward', false);
+                bot.setControlState('back', true);
+            } else if (flat < STANDOFF) {
+                // In the band - hold position and let the impulse do the work.
+                bot.setControlState('forward', false);
+                bot.setControlState('back', false);
+            } else {
+                bot.setControlState('back', false);
+                bot.setControlState('forward', true);
+            }
+
+            // Progress must follow the SEQUENCE, or the standoff looks like failure: backing
+            // off increases `flat`, so the old combined metric scored a deliberate, correct
+            // back-off as negative progress and could trip the 2.5s jam bail on the very move
+            // that unsticks the bot. Below the lip the job is height; above it, closing.
+            // A genuinely jammed bot - flush and not rising - still scores zero and still bails.
+            const progress = highEnough
+                ? (now2.y - start.y) + (startFlat - flat)
+                : (now2.y - start.y);
             if (progress > bestProgress + 0.05) { bestProgress = progress; lastGain = Date.now(); }
             else if (Date.now() - lastGain > 2500) {   // > one dip(250ms)+rise cycle, with slack
                 say(`jammed - no measured progress in 2.5s, giving up`);

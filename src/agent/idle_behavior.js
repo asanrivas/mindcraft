@@ -4,6 +4,7 @@
  */
 
 import * as skills from './library/skills.js';
+import * as chest from './library/chest.js';
 import Vec3 from 'vec3';
 
 export class IdleBehavior {
@@ -84,15 +85,20 @@ export class IdleBehavior {
     }
 
     /**
-     * Open container with timeout to prevent blocking keep-alive
+     * Open a container for a read-only peek.
+     *
+     * Delegates to chest.openContainerSafe rather than racing bot.openContainer directly: the
+     * race version leaked the window when it lost. `bot.openContainer` has no cancellation, so
+     * a window that arrives after the deadline stays open as `bot.currentWindow` - and a stale
+     * currentWindow makes the NEXT open never fire, which quietly broke every later deposit in
+     * the session. chest.openContainerSafe closes whatever appeared, and refuses up front for
+     * the reasons the server would silently drop (blocked chest, cat on top, out of reach,
+     * a decorated_pot that has no screen at all).
      */
     async openContainerWithTimeout(bot, block, timeout) {
-        return Promise.race([
-            bot.openContainer(block),
-            new Promise((_, reject) =>
-                setTimeout(() => reject(new Error('Container open timeout')), timeout)
-            )
-        ]);
+        const res = await chest.openContainerSafe(bot, block, { attempts: 1 });
+        if (!res.ok) throw new Error(res.detail ?? res.reason);
+        return res.window;
     }
 
     /**
@@ -188,13 +194,9 @@ export class IdleBehavior {
                 failedCount++;
             } finally {
                 // Always try to close the container
-                if (openedContainer) {
-                    try {
-                        await openedContainer.close();
-                    } catch (e) {
-                        // Ignore close errors
-                    }
-                }
+                // safeClose tolerates an already-closed window and clears bot.currentWindow,
+                // so a failed scan cannot poison the next one.
+                await chest.safeClose(bot, openedContainer);
             }
 
             // Yield to event loop to let keep-alive packets through

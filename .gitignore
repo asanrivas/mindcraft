@@ -40,6 +40,15 @@ minedmap_output/
 
 # timelapse output (tools/timelapse.mjs)
 recordings/
-scratchpad/
+# scratchpad/ used to be ignored wholesale. The gyms in it are the ONLY evidence behind most of
+# the measurements CLAUDE.md quotes - and CLAUDE.md cites them by path (scratchpad/boxed_gym.mjs,
+# scratchpad/sim/RESULTS.md, scratchpad/gap_gym.mjs, scratchpad/night_test.mjs,
+# scratchpad/restart_bot.sh), so a fresh clone read a doc pointing at files that were not there
+# and could not re-run a single number. The harnesses travel now; their OUTPUT still does not.
+scratchpad/*.log
+scratchpad/*.txt
+scratchpad/*.json
+scratchpad/*.mp4
+scratchpad/*.png
 data/
 bots/*/corpus/

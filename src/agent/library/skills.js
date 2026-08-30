@@ -1080,13 +1080,24 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         else {
             await bot.equip(block_item, 'hand');
             await bot.lookAt(buildOffBlock.position.offset(0.5, 0.5, 0.5));
-            await bot.placeBlock(buildOffBlock, faceVec);
-            await new Promise(resolve => setTimeout(resolve, 200));
+            // Through block_io, not bot.placeBlock, for three reasons - all of which showed up
+            // in one 13x13 floor bob laid on 2026-08-30:
+            //   - bot.placeBlock ends in an ack wait the server does not always satisfy
+            //     ("Event blockUpdate:(4718, 68, 4614) did not fire within timeout of 500ms"),
+            //     which is a throw for a block that landed fine. _genericPlace skips it.
+            //   - a FIXED 200ms settle then one read counts a block that arrives at 250ms as a
+            //     failure; placeVerified polls to its deadline instead.
+            //   - placing has an interaction RATE LIMIT and this path honoured none, so a fill
+            //     ran itself into the server's throttle. placeVerified paces at
+            //     MIN_PLACE_GAP_MS. (Same reason the terrain-clear loop sleeps 120ms.)
+            // Its own check is "something solid appeared"; ours below is "the RIGHT block
+            // appeared", so both still run.
+            const placement = await blockIO.placeVerified(bot, buildOffBlock, faceVec, { expectName: blockType });
             // Confirm against world state rather than trusting the API call. bot.placeBlock
             // can resolve without the block landing, so reporting success here unverified
             // let bogus placement counts propagate up through fill().
             if (!verifyBlockPlaced(bot, target_dest, blockType)) {
-                log(bot, `Tried to place ${blockType} at ${target_dest} but the block is not there.`);
+                log(bot, `Tried to place ${blockType} at ${target_dest} but the block is not there (${placement.why}).`);
                 return false;
             }
             log(bot, `Placed ${blockType} at ${target_dest}.`);

@@ -2,6 +2,7 @@ import { Vec3 } from 'vec3';
 import * as mc from '../../utils/mcdata.js';
 import * as nav from './nav.js';
 import { pillarUp } from './skills.js';
+import * as blockIO from './block_io.js';
 import fs from 'fs';
 
 /**
@@ -19,8 +20,9 @@ import fs from 'fs';
  *   - standing signs/banners: rotation quantised from yaw; look opposite the sign's front
  *   - half=top stairs/trapdoors: click the upper half of a side face (cursor option), or the
  *     underside of the block above
- * Look is set explicitly (bot.lookAt) before the place packet, and _placeBlockWithOptions is
- * called with forceLook:'ignore' so it cannot overwrite our computed angle.
+ * Look is set explicitly before the place packet, and the placement goes through
+ * `block_io.placeVerified` (which snaps the look itself and never turns smoothly), so nothing
+ * downstream can overwrite our computed angle.
  */
 
 const FACE = {
@@ -97,9 +99,33 @@ function isSolidRef(block) {
 // builder walks: to each column via the A* navigator, standing on the structure's own
 // lower layers as they rise. Cells out of reach fail into the retry pass and usually
 // become reachable as later layers add floor to stand on.
-async function goNear(bot, P, reach = 3.0) {
+// How far outside the blueprint's own footprint the bot may wander before a leg is treated as
+// lost. The navigator's stall ladder ends in `pinned: nothing worked - recentring`, which walks
+// somewhere else and tries again - correct for crossing open country, wrong inside a build,
+// where every cell it wants is behind it. Measured 2026-08-30 on a footprint spanning x
+// 4700-4731: bob reached x=4761 and the placement rate fell from 8.6 to 2.5 blocks/min, because
+// every subsequent cell then failed `out of reach (no walkable route)` from sixty blocks away.
+const SITE_LEASH = 24;
+
+// Is the bot so far outside the site that the next leg is hopeless? `box` is the blueprint's
+// world-space XZ bounds. Pure so the arithmetic is testable without a bot.
+export function offSite(pos, box, leash = SITE_LEASH) {
+    const dx = Math.max(box.minX - pos.x, 0, pos.x - box.maxX);
+    const dz = Math.max(box.minZ - pos.z, 0, pos.z - box.maxZ);
+    return Math.hypot(dx, dz) > leash;
+}
+
+async function goNear(bot, P, reach = 3.0, ctx = null) {
     const eyeDist = () => bot.entity.position.offset(0, 1.62, 0).distanceTo(P.offset(0.5, 0.5, 0.5));
     if (eyeDist() <= reach + 1.2) return true;
+    // Reel the bot back to the site BEFORE asking for another leg. Without this the recentring
+    // walks compound: each failed leg leaves it further out, and it never returns on its own.
+    if (ctx?.box && offSite(bot.entity.position, ctx.box)) {
+        ctx.leashed = (ctx.leashed || 0) + 1;
+        console.log(`[builder] leash: ${bot.entity.position.floored()} is outside the site - walking back`);
+        await nav.navigateTo(bot, { x: ctx.box.centreX, y: P.y, z: ctx.box.centreZ },
+            { arriveDist: 4, arriveY: 6, maxReplans: 4 });
+    }
     await nav.navigateTo(bot, { x: P.x, y: P.y, z: P.z },
         { arriveDist: reach, arriveY: 3, maxReplans: 3 });
     return eyeDist() <= 4.6;
@@ -290,14 +316,14 @@ async function placeOne(bot, P, p, ctx = null) {
     }
     let existing = bot.blockAt(P);
     if (!existing) {
-        await goNear(bot, P);
+        await goNear(bot, P, 3.0, ctx);
         existing = await waitForBlock(bot, P);
         if (!existing) return { ok: false, why: 'chunk not loaded' };
     }
     if (existing.name === p.name) return { ok: true, skipped: true };
     if (!REPLACEABLE.has(existing.name)) {
         // clear whatever occupies the cell first (instant in creative)
-        if (await goNear(bot, P)) {
+        if (await goNear(bot, P, 3.0, ctx)) {
             try { await bot.dig(existing, true); } catch (e) { /* keep going; place may still fail */ }
         }
     }
@@ -324,7 +350,7 @@ async function placeOne(bot, P, p, ctx = null) {
     } else if (SIDE_FACES.includes(choice.faceName)) {
         approach = P.plus(new Vec3(choice.faceVec.x * 2, 0, choice.faceVec.z * 2)); // in front of the clicked face
     }
-    if (!(await goNear(bot, approach)) && !(await goNear(bot, P))) {
+    if (!(await goNear(bot, approach, 3.0, ctx)) && !(await goNear(bot, P, 3.0, ctx))) {
         // above walking reach: pillar a dirt scaffold next to the work
         if (!(ctx && P.y > bot.entity.position.y + 1.5 && await scaffoldTo(bot, P, ctx)))
             return { ok: false, why: 'out of reach (no walkable route)' };
@@ -335,20 +361,36 @@ async function placeOne(bot, P, p, ctx = null) {
     if (!(await equip(bot, itemName))) return { ok: false, why: `no item ${itemName}` };
 
     try {
-        // default forceLook: the library looks at the (half-adjusted) click point itself,
-        // which passes validation; our standing side supplies the yaw for orientation
+        // Through block_io, which writes `block_place` itself with a real sequence and waits on
+        // the server's `acknowledge_player_digging`. `bot._placeBlockWithOptions` instead awaits
+        // a `blockUpdate` this server does not send for a correctly-predicted placement, which
+        // is every `Event blockUpdate:(x, y, z) did not fire within timeout of 500ms` in this
+        // builder's logs - a 500ms stall per block, reported as a failure for blocks that landed.
+        // Measured on the same server: 30-50ms and acknowledged, against 217-894ms.
+        // It paces itself (MIN_PLACE_GAP_MS), so the 250ms sleep that used to sit here is gone.
+        // expectName, not the default "something solid appeared": half this blueprint is
+        // trapdoors, fences and signs, whose boundingBox is never 'block'.
         const opts = { swingArm: 'right' };
         if (choice.half) opts.half = choice.half;
-        // PACE the packets. The server rate-limits interactions and silently DROPS the
-        // excess (observed: bursts of placements time out en masse while slow stretches
-        // succeed; a long chat reply got the bot kicked with disconnect.spam). A beat
-        // before each place keeps us under the limiter.
-        await new Promise(r => setTimeout(r, 250));
-        await bot._placeBlockWithOptions(choice.ref, choice.faceVec, opts);
+        const r = await blockIO.placeVerified(bot, choice.ref, choice.faceVec,
+            { placeOpts: opts, expectName: p.name });
+        if (!r.ok) throw new Error(r.why);
     } catch (e) {
-        // the API can throw after a successful placement - re-read before believing it
-        await new Promise(r => setTimeout(r, 200));
-        const now = bot.blockAt(P);
+        // The API can throw after a SUCCESSFUL placement, so re-read before believing it - but
+        // POLL, do not sample once. `_placeBlockWithOptions` ends in mineflayer's blockUpdate
+        // ack, which this server does not always send (1.17+ clients predict the click locally
+        // and the server answers only when the prediction is WRONG - the same unsatisfiable
+        // await container_io.js exists to route around). So the throw arrives at 500ms and the
+        // block often lands after it. A single read at +200ms scored those as failures:
+        // measured 2026-08-30, `FAIL cracked_stone_bricks@(4707,67,4607): Event blockUpdate
+        // did not fire within timeout of 500ms` for cells that were fine.
+        const deadline = Date.now() + 600;
+        let now = null;
+        while (Date.now() < deadline) {
+            now = bot.blockAt(P);
+            if (now && now.name === p.name) break;
+            await new Promise(r => setTimeout(r, 25));
+        }
         if (!now || now.name !== p.name) return { ok: false, why: e.message };
     }
 
@@ -454,6 +496,14 @@ export async function buildBlueprint(agent, filePath, origin) {
         agent,
         occupied: new Set(all.map(p => `${p.x},${p.y},${p.z}`)),
         pillar: [],
+        // world-space XZ bounds of the footprint, for the leash in goNear
+        box: (() => {
+            const xs = all.map(p => origin.x + p.x), zs = all.map(p => origin.z + p.z);
+            const minX = Math.min(...xs), maxX = Math.max(...xs);
+            const minZ = Math.min(...zs), maxZ = Math.max(...zs);
+            return { minX, maxX, minZ, maxZ,
+                     centreX: Math.round((minX + maxX) / 2), centreZ: Math.round((minZ + maxZ) / 2) };
+        })(),
     };
     // dirt for scaffolding, in a non-hand slot so equips of build blocks don't evict it
     try { await bot.creative.setInventorySlot(44, mc.makeItem('dirt', 64)); } catch (e) { /* pillarUp will report */ }
@@ -553,7 +603,7 @@ export async function buildBlueprint(agent, filePath, origin) {
                     }
                     const top = [...byWhy.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3)
                         .map(([w, n]) => `${n}x"${w}"`).join(' ');
-                    console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}] ${top} | scaffold ok=${ctx.scaffoldOk||0} short=${ctx.scaffoldShort||0} nocol=${ctx.scaffoldNoCol||0}`);
+                    console.log(`[builder] ${done}/${buildable.length} (${placed} placed, ${skipped} pre-existing, ${failures.length} failed) [${passName}] ${top} | scaffold ok=${ctx.scaffoldOk||0} short=${ctx.scaffoldShort||0} nocol=${ctx.scaffoldNoCol||0} leash=${ctx.leashed||0}`);
                 }
             }
         }
@@ -593,6 +643,7 @@ export async function buildBlueprint(agent, filePath, origin) {
     writeStatus(agent, { phase: 'done', verifiedPct: Number(pct), match, total: buildable.length });
     let out = `VERIFIED BUILD: ${match}/${buildable.length} blocks match (${pct}%) after ${mins} min. `
         + `${placed} placed, ${skipped} already correct, ${failures.length} failed.`;
+    if (ctx.leashed) out += ` Walked back to the site ${ctx.leashed}x.`;
     if (failures.length) {
         // aggregate failure reasons so the report explains itself instead of needing a
         // log dive - the mass-failure runs each had ONE dominant cause worth naming

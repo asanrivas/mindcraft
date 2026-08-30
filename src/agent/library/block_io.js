@@ -39,13 +39,26 @@
  * - Pace the packets. Also from `blueprint_builder.js`: the server rate-limits interactions and
  *   silently drops the excess, so bursts time out en masse while slow stretches succeed.
  *
- * WHY WE DO NOT HAND-WRITE THE PACKET. We stop at `_genericPlace` deliberately, rather than
- * dropping to `bot._client.write('block_place', ...)`. That packet's shape is version-dependent
- * (`blockPlaceHasHeldItem` vs `blockPlaceHasHandAndIntCursor`) and 1.19+ adds a `sequence` field
- * the server uses to acknowledge and roll back predictions. Getting either wrong fails silently
- * and corrupts state rather than throwing, and there is nothing here that a lower layer buys us.
+ * WE NOW HAND-WRITE THE PACKET (2026-08-30). This block used to say the opposite - that we stop
+ * at `_genericPlace` because the packet's shape is version-dependent and 1.19+ adds a `sequence`
+ * field, so a mistake would corrupt state silently. The reasoning was sound; the conclusion was
+ * wrong, and `tools/place_probe.mjs` is what overturned it:
+ *
+ *     ours:       6/6 acknowledged, avg ack 50ms
+ *     mineflayer: 212-914ms per placement
+ *
+ * That `sequence` field is not a hazard to avoid - it is the acknowledgement we were missing.
+ * The server replies to every placement with `acknowledge_player_digging { sequenceId }` in
+ * ~50ms; mineflayer sends `sequence: 0` hardcoded, never listens for the reply, and confirms
+ * instead by awaiting a `blockUpdate` a correctly-predicting server never sends. Point 1 above
+ * describes the symptom of exactly that.
+ *
+ * The version risk is now HANDLED rather than avoided: `place_packet.js` builds the body from
+ * the NEGOTIATED protocol schema, and hand-writes nothing at all on a protocol with no
+ * `sequence` to acknowledge - there, mineflayer's path is still what runs. See that file.
  */
 import { Vec3 } from 'vec3';
+import { placeFieldsFor, hasSequence, buildPlacePacket, faceToDirection, nextSequence, awaitPlaceAck } from './place_packet.js';
 
 /** Vanilla player hitbox height. The reason a pillar step needs a full block of clearance. */
 export const BODY_HEIGHT = 1.8;
@@ -111,6 +124,9 @@ export async function snapLook(bot, point) {
  * @param {object} [opts]
  * @param {number} [opts.verifyMs] how long to watch for the block to appear
  * @param {boolean} [opts.pace]    honour the interaction rate limit (default true)
+ * @param {string}  [opts.expectName] the exact block expected at dest; use for anything whose
+ *                                    boundingBox is not 'block' (signs, trapdoors, fences...)
+ * @param {number}  [opts.ackMs]   how long to wait for the server's sequence ack
  * @param {object} [opts.placeOpts] extra options forwarded to _genericPlace
  * @returns {Promise<{ok: boolean, why: string}>}
  */
@@ -119,9 +135,18 @@ export async function placeVerified(bot, refBlock, faceVector, opts = {}) {
     const verifyMs = opts.verifyMs ?? 400;
     const dest = refBlock.position.plus(faceVector);
     const before = bot.blockAt(dest);
+    // "Did it land?" has two forms, and using the wrong one is how a working placement reads as
+    // a failure. The default - "something solid that was not there before" - is right for the
+    // pillar/bridge callers, which only care that the cell became standable. It is WRONG for a
+    // blueprint, half of which is signs, trapdoors, fences and carpets whose boundingBox is
+    // never 'block'. `expectName` is the precise form: place a spruce_trapdoor, get a
+    // spruce_trapdoor.
+    const expect = opts.expectName ?? null;
     const landed = () => {
         const now = bot.blockAt(dest);
-        return !!now && now.boundingBox === 'block' && now.type !== before?.type;
+        if (!now) return false;
+        if (expect) return now.name === expect;
+        return now.boundingBox === 'block' && now.type !== before?.type;
     };
     if (landed()) return { ok: true, why: 'already solid' };
 
@@ -130,6 +155,62 @@ export async function placeVerified(bot, refBlock, faceVector, opts = {}) {
         if (wait) await new Promise((r) => setTimeout(r, wait));
     }
 
+    const fields = placeFieldsFor(bot);
+    const direction = faceToDirection(faceVector);
+
+    if (hasSequence(fields) && direction !== null && bot._client?.write) {
+        // ---- our path: real sequence, real acknowledgement ----
+        // The click point on the clicked face, in face-local 0..1. `half` nudges it into the
+        // upper or lower half of a side face, which is how a top-half slab or stair is asked
+        // for - the same cursor trick _genericPlace uses.
+        const half = opts.placeOpts?.half;
+        const cursor = {
+            x: 0.5 + faceVector.x * 0.5,
+            y: 0.5 + faceVector.y * 0.5 + (faceVector.y === 0 && half === 'top' ? 0.25
+                                         : faceVector.y === 0 && half === 'bottom' ? -0.25 : 0),
+            z: 0.5 + faceVector.z * 0.5,
+        };
+        // Snap, never turn. A smooth `lookAt` outlasts a jump's apex, and the server validates
+        // that the click is plausible from our eye - so the look has to land BEFORE the packet.
+        await snapLook(bot, refBlock.position.offset(cursor.x, cursor.y, cursor.z));
+        const seq = nextSequence();
+        let packet;
+        try {
+            packet = buildPlacePacket(fields, { location: refBlock.position, direction, cursor, sequence: seq });
+        } catch (err) {
+            // A schema we cannot express is a reason to use mineflayer's path, not to fail.
+            return placeViaMineflayer(bot, refBlock, faceVector, opts, dest, landed, verifyMs);
+        }
+        lastPlaceAt = Date.now();
+        try { bot.swingArm('right'); } catch (e) { /* cosmetic */ }
+        bot._client.write('block_place', packet);
+
+        // The ack says the server has DECIDED, not that it agreed - a refusal is acknowledged
+        // just the same (measured: an acked placement into the cell the bot was standing in
+        // never appeared). So it is a timing signal; the world below is the truth.
+        const ack = await awaitPlaceAck(bot, seq, opts.ackMs ?? 1000);
+        if (landed()) return { ok: true, why: ack.acked ? `placed, ack ${ack.ms}ms` : 'placed, no ack' };
+        // Acked and still not there means refused, and no amount of further waiting changes it.
+        if (ack.acked) return { ok: false, why: `refused by server (ack ${ack.ms}ms)` };
+        // No ack: the packet or its reply was lost. Fall back to watching the world, which is
+        // what we had before this path existed.
+        const deadline = Date.now() + verifyMs;
+        while (Date.now() < deadline) {
+            if (landed()) return { ok: true, why: 'placed, ack lost' };
+            await new Promise((r) => setTimeout(r, 20));
+        }
+        return { ok: false, why: `no ack and never appeared at ${dest}` };
+    }
+
+    return placeViaMineflayer(bot, refBlock, faceVector, opts, dest, landed, verifyMs);
+}
+
+/**
+ * mineflayer's placement path, kept for protocols with no `sequence` to acknowledge and for
+ * stubbed bots in tests. Everything it reports is still verified against the world, because its
+ * throw describes the missing confirmation and not the placement.
+ */
+async function placeViaMineflayer(bot, refBlock, faceVector, opts, dest, landed, verifyMs) {
     try {
         lastPlaceAt = Date.now();
         if (typeof bot._genericPlace === 'function') {

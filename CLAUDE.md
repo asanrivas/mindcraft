@@ -220,11 +220,36 @@ changing the connect version.** That theory is dead. `src/mc/` (the BotClient se
 useful as a clean construction seam, but its original justification is void - see
 `docs/CLIENT_REPLACEMENT.md` for what was actually established and what to investigate instead.
 
-**`onGround` cannot be trusted here.** Traced directly: it reads false for seconds at a time
-while the bot is provably standing (constant y, zero velocity), so prismarine-physics applies
-no ground acceleration and the bot sits at `vel=(0,0)` with forward held. **Anything that
-waits for `onGround` waits forever.** `followPath` pulses jump when progress stalls, because
-airborne acceleration still works - that is what actually moves the bot.
+**CORRECTION (2026-08-30): `onGround` is NOT broken here. Read this before acting on anything
+below that says it is.** The claim this section used to make - that the flag reads false for
+seconds while the bot is provably standing, so nothing may ever wait on it - is false as a
+general statement, and a great deal of the movement stack was built on it.
+
+Measured with a CLEAN mineflayer bot (no agent, no assists, `tools/place_probe.mjs`-style rig)
+against this very server:
+
+```
+=== localhost:25565 v1.21.11 ===
+  solid below        : 60/60 (100%)
+  onGround true      : 60/60 (100%)
+  isCollidedVertically: 60/60 (100%)
+  PLAIN JUMP APEX    : 1.252   (vanilla 1.252)
+```
+
+A flying-squid control server (1.21.4, no Purpur, no ViaVersion, no anti-cheat) gives the same
+1.252. `!groundProbe` inside the agent reports the same 60/60 on flat ground, and `GroundTruth`
+- which corrects the flag from the world - fires on **0 of 60** ticks there.
+
+**What IS true:** prismarine-physics derives the flag as
+`onGround = isCollidedVertically && oldVelY < 0` (`index.js:301`), so it needs a downward
+velocity going into the move. When something zeroes `vel.y` - a server position correction, the
+`negligeableVelocity` clamp - the test fails and a standing bot reads airborne for that tick.
+That is a real but SITUATIONAL fault, not a permanent one, and `library/ground_truth.js` exists
+to correct exactly it.
+
+**The stuck bots were real; the explanation was not.** Do not delete the workarounds on the
+strength of this - but do not add another one without first measuring whether the flag is
+actually wrong in your case. `followPath` still pulses jump, and that has not been re-measured.
 
 **Correction (2026-08-26): pathfinder PLANS fine. It is the EXECUTOR that is broken.** This doc
 previously said "mineflayer-pathfinder will not even *plan* a route over a 1-block step". That
@@ -424,15 +449,57 @@ reporting.
 Tried BEFORE bridging: a jump costs nothing, leaves the terrain untouched, and is what a player
 does. Bridging remains the fallback for anything out of reach.
 
-**This bot could not jump at all.** Every jump in prismarine-physics is gated on
-`entity.onGround` (`index.js:725`), and so is ground acceleration (`:545`). Measured in the
-sandbox: vanilla apex **1.252**, this server's apex **0.000**.
+**This bot could not jump at all** - *and that turned out to be wrong; see the correction under
+"onGround cannot be trusted", above.* Every jump in prismarine-physics is gated on
+`entity.onGround` (`index.js:725`), and so is ground acceleration (`:545`), both of which are
+true. The figure that used to sit here - "vanilla apex 1.252, this server's apex **0.000**" -
+was measured in `scratchpad/sim/`, which **forces `onGround` false in order to reproduce the
+pathology** and then measures no jump. That is circular: it establishes what happens IF the flag
+is false, never that it is. A clean bot on this server jumps **1.252**, the vanilla figure.
+
+JumpAssist still earns its place - a jump ARRIVES at a lip slower here than a player's, and the
+axial top-up is what fixes that - but its stated justification was a measurement of its own
+premise.
+
+#### Which assists are actually load-bearing (measured 2026-08-30)
+
+With the `onGround` premise overturned, the obvious question is how much of this stack is still
+earning its place. `settings.assists` turns each one off individually; the climb gym, four stone
+cases per arm:
+
+| arm | result | note |
+|---|---|---|
+| baseline, all on | **4/4** | 34.2 / 57.2 / 66.3 / 34.2s |
+| `auto_jump` off | 3/4 | loses `stone 12`; faster on the ones it clears |
+| **`jump_assist` off** | **1/4** | 3 cases end at exactly +4.0 and stop |
+| `ground_truth` off | **4/4** | and FASTER in 3 of 4 (22.1 / 48.2 / 58.2 / 36.2s) |
+
+Two conclusions, and the second is the uncomfortable one:
+
+- **`jump_assist` is load-bearing and stays.** 1/4 without it, with three cases dying at
+  identical +4.0. Even though a clean bot jumps a vanilla 1.252 here, inside the agent the
+  asserted take-off is what makes a pillar step reliable. The `apex 0.000` justification was
+  wrong; the component is not.
+- **`ground_truth` is NOT.** It was added the same day on the strength of a mechanism (a server
+  correction zeroing `vel.y` defeats `oldVelY < 0`) that is real but rare - it fires on 0 of 60
+  ticks on flat ground - and the gym is no worse without it. Now **off by default**. The
+  measurement that justifies an assist has to be of the assist, not of its premise; that is the
+  exact mistake `apex 0.000` represents, and it was repeated within hours of finding it.
+
+`swim_assist` was not in the sweep: water is not in question here and it owns the jump key while
+wet for reasons the Swimming section documents separately.
 
 #### Simulate first - with prismarine-physics, NOT three.js
 
 `scratchpad/sim/` runs the *same engine the bot runs*, headless, with `onGround` forced false to
 reproduce the pathology. A whole sweep is milliseconds against 45s per live lane, so the constants
 are **measured, not chosen**. Full working in `scratchpad/sim/RESULTS.md`.
+
+**But know what it can and cannot settle.** Forcing the flag false is an assumption the sim
+cannot test, and treating its output as a fact about the server is how "apex 0.000" entered this
+document and stayed for days. The sim answers *"given a broken flag, what constants work?"* -
+never *"is the flag broken?"*. For that, and for whether the SERVER accepts a movement, use a
+clean bot against the live server and a flying-squid control server.
 
 A general physics engine under three.js would have been the wrong tool: it would model *different*
 physics from the one the bot actually experiences, so every constant calibrated there would be
@@ -1027,6 +1094,38 @@ Scan the column **downward**; do not bisect. Columns are not monotonic here - ca
 put air under stone - and a bisection over [-64, 250] converges on a cave roof 50 blocks below
 the real surface. Use ONE persistent RCON connection: reconnecting per command stalls the
 server after ~13 rapid cycles, and `socket.setTimeout` does not fire on it.
+
+## Block placement - we own it
+
+Full engine: **`src/agent/library/block_io.js`** (and `place_packet.js`). Same decision as
+`container_io.js`, and the same underlying defect: mineflayer wraps a fire-and-forget packet in
+an await this server does not satisfy, then reports the missing confirmation as a failed action.
+
+**Never call `bot.placeBlock` for anything time-critical.** Three defects, and they only fail in
+combination - which is why none was visible alone:
+
+- **It burns the whole window on an ack.** It writes the packet, then blocks up to 500ms on a
+  `blockUpdate:` event (`place_block.js:13`) and throws if none arrives. A jump is ~900ms, so one
+  failed attempt consumed the flight and there was never a retry. The packet had already gone.
+- **`_genericPlace` awaits a SMOOTH `lookAt`** before writing the packet (`generic_place.js:36`,
+  `forceLook` undefined). That multi-tick turn alone outlasts a jump's apex.
+- **The body must clear the cell being filled.** Pillaring targets the feet cell and the bot is
+  1.8 tall, so at +0.5 the hitbox overlaps and the server refuses - as a missing confirmation,
+  the hardest failure to read.
+
+A clean bot placing at +0.5 nonetheless succeeds 4/4 here, **by accident**: the smooth look
+delayed the packet until the body had risen clear. Forcing the look broke placement, and that is
+how the real clearance requirement surfaced. Do not "optimise" one of these without the others.
+
+What we do instead: write the packet, snap the look, wait for the hitbox to clear, confirm by
+**reading the world**, and pace the packets - the server rate-limits interactions and silently
+drops the excess (`blueprint_builder.js` found the same independently: *"the API can throw after
+a successful placement - re-read before believing it"*).
+
+Measured: `PILLAR TEST: +5.00 of 5` where the old path managed +0.00.
+
+Pure parts are unit-tested in `tests/block_io.test.mjs` (`bodyClearsCell`, `placeGapRemaining`)
+and `tests/place_packet.test.mjs`.
 
 ## Chests and containers
 

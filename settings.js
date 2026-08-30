@@ -182,6 +182,29 @@ const settings = {
     // Independent of log_all_prompts: that flag governs the rotated debug dump in
     // bots/<name>/logs/, which cleanupOldLogs prunes to the newest 20 files once a minute -
     // useless as a dataset. The corpus is never rotated. See src/utils/corpus.js.
+    // TEARDOWN SWITCHES (2026-08-30). The movement assists were built on the belief that
+    // `onGround` is permanently false here. A clean bot measures 60/60 true and a vanilla 1.252
+    // apex on this very server, so some of them are now routing around a bug that is not there -
+    // and two subsystems both writing the jump key is a plausible cause of the run-to-run
+    // flakiness in the climb gyms.
+    //
+    // They are NOT deleted, because the stuck bots were real even though the explanation was
+    // not. Turn one OFF, run the gyms, and see what actually regresses. Naming them here rather
+    // than commenting out the construction keeps the experiment reproducible and reversible.
+    assists: {
+        auto_jump: true,     // clears a 1-block step; does not gate on onGround
+        jump_assist: true,   // deliberate gap jumps; asserts the flag for the take-off tick
+        // OFF by default, on its own evidence. Added 2026-08-30 to correct `onGround` from the
+        // world - then the teardown measured the climb gym at 4/4 WITHOUT it, and faster in 3
+        // of 4 cases (22.1s vs 34.2, 48.2 vs 57.2, 58.2 vs 66.3). It fires on 0 of 60 ticks on
+        // flat ground, so there is nothing for it to fix in the common case. The fault it
+        // targets is real but rare (a server correction zeroing vel.y defeats the engine's
+        // `oldVelY < 0` test), so the code and `!groundProbe` stay - shipping an assist that
+        // cannot show a benefit is how the last set of unexamined workarounds accumulated.
+        ground_truth: false,
+        swim_assist: true,   // owns the jump key while wet - water is NOT in question here
+    },
+
     collect_corpus: true,
 
     // Auto-login settings

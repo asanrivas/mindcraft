@@ -195,7 +195,7 @@ export class Agent {
                 // auto_jump.js), leaving the bot unable to climb 1-block steps. This presses
                 // jump early enough that the bot is still moving when it leaves the ground.
                 this.auto_jump = new AutoJump(this.bot);
-                this.auto_jump.enable();
+                if (settings.assists?.auto_jump !== false) this.auto_jump.enable();
                 // Exposed so JumpAssist and the navigator can coordinate with it - AutoJump has
                 // to stand down while a deliberate jump is in flight, or it fights for the key.
                 this.bot.autoJump = this.auto_jump;
@@ -204,7 +204,7 @@ export class Agent {
                 // propulsion) and restores the sprint-swim speed the physics library omits.
                 // Exposed on the bot so swim.js can reach it without an import cycle.
                 this.swim_assist = new SwimAssist(this.bot);
-                this.swim_assist.enable();
+                if (settings.assists?.swim_assist !== false) this.swim_assist.enable();
                 this.bot.swimAssist = this.swim_assist;
 
                 // Deliberate jumps - gaps and standstill steps. `onGround` reads false here, so
@@ -213,7 +213,7 @@ export class Agent {
                 // run-up. Carries its own forcedMove valve, so a server that objects degrades
                 // the bot to bridging rather than getting it kicked.
                 this.jump_assist = new JumpAssist(this.bot);
-                this.jump_assist.enable();
+                if (settings.assists?.jump_assist !== false) this.jump_assist.enable();
                 this.bot.jumpAssist = this.jump_assist;
 
                 // THE ROOT CAUSE, not another workaround. prismarine-physics derives `onGround`
@@ -224,7 +224,7 @@ export class Agent {
                 // JumpAssist so that when both fire on one tick the cheaper, always-on answer
                 // is already in place.
                 this.ground_truth = new GroundTruth(this.bot);
-                this.ground_truth.enable();
+                if (settings.assists?.ground_truth !== false) this.ground_truth.enable();
                 this.bot.groundTruth = this.ground_truth;
 
                 console.log('Initializing vision intepreter...');

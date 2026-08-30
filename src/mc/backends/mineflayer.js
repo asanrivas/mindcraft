@@ -42,11 +42,26 @@ export function createMineflayerBot(options, hooks = {}) {
     // `apex 1.00 ... place failed: Event blockUpdate did not fire within timeout of 500ms`, i.e.
     // the JUMP WORKED and the block never appeared - while a clean mineflayer bot on this same
     // server, with no throttle, pillared 4/4 with apex 1.25. The stale position is the difference.
+    // RE-MEASURED 2026-08-30, and the premise did not survive. A clean bot with NO throttle,
+    // moving and turning continuously against this server: 914 position packets over 45s, no
+    // kick, connection intact. Driving `bot.look` at a target of 100/s and 250/s changed
+    // nothing - the observed rate stayed 19.9/s, because mineflayer only writes a position
+    // packet on its own physics tick. It CANNOT exceed 20/s through the normal APIs.
+    //
+    // 20/s is one packet every 50ms, which was exactly the old threshold - so the throttle was
+    // firing on tick jitter alone, deferring packets it could never actually reduce the rate of.
+    // That is not a safety valve, it is a coin flip on the packet the server uses to decide
+    // where we are, and therefore what it will let us place and reach.
+    //
+    // Kept as a genuine burst guard rather than deleted: the original ECONNRESET was reported
+    // by someone, and this now sits far enough above the natural rate that ordinary movement
+    // never touches it, while a real runaway (some future code writing packets directly) is
+    // still bounded. If a kick ever recurs, RAISE the evidence, not the threshold.
     let lastPositionUpdate = 0;
     let pendingTimer = null;
     let pendingName = null;
     let pendingData = null;
-    const POSITION_THROTTLE_MS = 50;
+    const POSITION_THROTTLE_MS = 20;   // 50/s ceiling; mineflayer itself tops out at 20/s
     const originalWrite = bot._client.write.bind(bot._client);
     const flushPending = () => {
         pendingTimer = null;

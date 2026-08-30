@@ -65,10 +65,10 @@ check('submersion timing resets when the head comes up',
 
 // --- night_safety must not tax a Peaceful world -------------------------------------------------
 const night = SRC.slice(SRC.indexOf('name: "night_safety"'), SRC.indexOf('name: "hunting"'));
-check('night_safety skips Peaceful worlds', /peaceful/.test(night), true);
+check('night_safety skips Peaceful worlds', /isPeaceful\(/.test(night), true);
 // ...but only AFTER the dawn dig-out, or a bot sealed in on Normal never gets let out.
 check('the Peaceful check comes after the dig-out',
-    night.indexOf('digOut') < night.indexOf('peaceful'), true);
+    night.indexOf('digOut') < night.indexOf('isPeaceful'), true);
 
 // --- mode logs name the agent -------------------------------------------------------------------
 check('mode completion logs are attributed to an agent',
@@ -95,9 +95,58 @@ check('mode completion logs are attributed to an agent',
     const agentSrc = fs.readFileSync(new URL('../src/agent/agent.js', import.meta.url), 'utf8');
     check('agent.js repairs difficulty reporting', /_client\.on\('login', setDifficulty\)/.test(agentSrc), true);
     check('...and on later difficulty changes', /_client\.on\('difficulty', setDifficulty\)/.test(agentSrc), true);
-    // The whole point is that 0 must pass, so the guard has to be a null check, not truthiness.
-    check('uses a null check so peaceful (0) is accepted',
-        /packet\?\.difficulty == null/.test(agentSrc), true);
+    // The rules themselves - 0 is a valid difficulty, the wire form may be a string, and a later
+    // `undefined` write must not erase a good value - live in difficulty.js and are covered
+    // directly by tests/difficulty.test.mjs. What matters here is that agent.js uses them
+    // rather than re-deriving its own version, which is how the bug survived two fixes.
+    check('agent.js parses through difficultyName', /difficultyName\(packet\?\.difficulty\)/.test(agentSrc), true);
+    check('...and installs the field guard', /installDifficultyField\(this\.bot\.game\)/.test(agentSrc), true);
+}
+
+// --- a failed shelter must not become a metronome ----------------------------------------------
+// The mode interrupts EVERY action in the agent. A flat 20s cooldown on failure therefore
+// cancelled whatever the bot was doing three times a minute, all night, on ground it could never
+// shelter on (bare stone, no pickaxe, nothing to place). Nothing about the ground or the
+// inventory changes while the bot stands still, so repeated identical failures are evidence.
+{
+    check('failures are counted', /failures:\s*0/.test(night) && /this\.failures\+\+/.test(night), true);
+    check('...and it gives up for the night', /this\.gaveUp = true/.test(night), true);
+    check('...and an early return means no further interruptions',
+        /if \(this\.gaveUp\) return;/.test(night), true);
+    check('the backoff escalates rather than repeating one interval',
+        /\[20000, 60000\]/.test(night), true);
+    // Both must clear at dawn, or one bad night disables the mode permanently.
+    check('dawn resets the failure count', /this\.failures = 0;[\s\S]{0,60}this\.gaveUp = false;/.test(night), true);
+    // ...but only in FULL DAYLIGHT. `isNight` starts at 13000 and `isDuskApproaching` 600 ticks
+    // earlier, so the dusk window is both "not night" and "time to shelter" - resetting on
+    // `!isNight` alone cleared the counter on every tick of the window the mode fails in.
+    check('the reset requires daylight, not merely "not night"',
+        /const daylight = !night\.isNight\(t\) && !night\.isDuskApproaching\(t\)/.test(night), true);
+    // A success has to clear it too, or three bad nights in a row would latch.
+    check('a successful shelter resets the count', /else \{\s*this\.failures = 0;/.test(night), true);
+}
+
+// --- emergencyShelter must not break ground it cannot finish -----------------------------------
+// It used to call digDown and IGNORE ITS RETURN VALUE, then try to seal at y+2 - which, when the
+// dig had failed, is the open air above the bot's own head. An open pit is worse than flat
+// ground: the bot is cornered in it and the terrain is spent.
+{
+    const skillsSrc = fs.readFileSync(new URL('../src/agent/library/skills.js', import.meta.url), 'utf8');
+    const shelter = skillsSrc.slice(skillsSrc.indexOf('async function shelterFeasibility'),
+                                   skillsSrc.indexOf('/** Break out of the overnight shelter at dawn. */'));
+    check('feasibility is checked before any digging',
+        shelter.indexOf('shelterFeasibility(bot)') < shelter.indexOf('digDown(bot, 3)'), true);
+    check('digDown\'s return value is used', /const dug = await digDown/.test(shelter), true);
+    check('...and the descent is MEASURED, not assumed', /descended < 2\.5/.test(shelter), true);
+    // Two blocks puts the seal at the old surface level, whose neighbours are open sky on flat
+    // ground - `nothing to place on`. Three puts it one block UNDER the surface, always walled.
+    check('digs three so the seal has something to attach to',
+        /digDown\(bot, 3\)/.test(shelter), true);
+    check('...and the descent is measured after the fall settles',
+        /startY - await settleY\(bot\)/.test(shelter), true);
+    check('a failed seal climbs back out', /pillarUp\(bot, Math\.round\(descended\)\)/.test(shelter), true);
+    check('the tool check asks whether the drop is KEPT, not just whether it is diggable',
+        /tools\.canBreak/.test(shelter), true);
 }
 
 // --- night_safety stands down when sheltering cannot pay for itself ---------------------------
@@ -119,6 +168,40 @@ check('mode completion logs are attributed to an agent',
     // All of these must sit AFTER the dawn dig-out, or a sheltered bot never gets let out.
     check('the new guards come after the dig-out',
         night.indexOf('digOut') < night.indexOf('humanAwakeOnline'), true);
+}
+
+// A mode whose remedy COMPETES with the navigator's own stall ladder must not be able to
+// interrupt a follow. `elbow_room` shuffles half a block away from a nearby player; during a
+// follow, being near the person is the goal state, and on 2026-08-30 three interrupts in 16s
+// aborted the dig that was freeing a stuck bot and then killed the follow outright. Its own
+// description says "when idle" - an empty interrupt set is what makes that true.
+{
+    // Strip comment lines first: the block carries a write-up of the incident that QUOTES the
+    // old `interrupts: ["action:followPlayer"]`, and a naive scan matches its own explanation.
+    const elbow = SRC.slice(SRC.indexOf('name: "elbow_room"'), SRC.indexOf('name: "idle_staring"'))
+        .split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+    check('elbow_room does not interrupt anything', /interrupts: \[\]/.test(elbow), true);
+    check('elbow_room specifically does not interrupt followPlayer',
+        /interrupts: \[[^\]]*followPlayer/.test(elbow), false);
+    // The modes that DO interrupt a follow are deliberate: followPlayer pauses them by distance
+    // ("these modes slow down the bot, and we want to catch up"). That pairing must survive.
+    for (const m of ['hunting', 'torch_placing'])
+        check(`${m} still interrupts followPlayer`,
+            new RegExp(`name: "${m}"[\\s\\S]*?interrupts: \\[[^\\]]*followPlayer`).test(SRC), true);
+
+    // item_collecting is deliberately NOT in that list any more. It used to interrupt a follow,
+    // and its own gate read `agent.isIdle() || is_very_close` - so any item within 3 blocks
+    // preempted whatever Andy had been asked to do. Mining drops items constantly, which made
+    // the bot interrupt itself on its own output. Both halves have to stay fixed: dropping the
+    // interrupt while leaving the proximity bypass would change nothing.
+    const collecting = SRC.slice(SRC.indexOf('name: "item_collecting"'))
+        .split('\n').filter(l => !l.trim().startsWith('//')).join('\n');
+    check('item_collecting does not interrupt followPlayer',
+        /interrupts: \[[^\]]*followPlayer/.test(collecting.slice(0, 400)), false);
+    check('item_collecting still picks up while standing still',
+        /interrupts: \[[^\]]*!stayHere/.test(collecting.slice(0, 400)), true);
+    check('item_collecting no longer treats proximity as permission',
+        /can_interrupt = agent\.isIdle\(\) \|\| is_very_close/.test(collecting), false);
 }
 
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }

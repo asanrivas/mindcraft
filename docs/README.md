@@ -26,7 +26,8 @@ it lives in SWIMMING, and the journeys that spend it live in MARATHON.
 
 | Doc | What it covers |
 |---|---|
-| [LLM_FAILOVER.md](LLM_FAILOVER.md) | The DeepSeek backup brain, the circuit breaker, and why providers must throw rather than return a placeholder |
+| [OBEDIENCE.md](OBEDIENCE.md) | Making the model pick the right command: the compact-docs renderer that deleted disambiguation, hidden_actions, alias contract, the `depth`→`y` rename, before/after measurements (flash + local 9B), the max_tokens "auto" bug, memory paraphrase-folding — and the open gaps at the bottom |
+| [LLM_FAILOVER.md](LLM_FAILOVER.md) | The backup brain, the circuit breaker, and why providers must throw rather than return a placeholder. Current chain (2026-08-29): llamacpp qwen3.5-9B on amyasan:8000 (direct, tunnel disabled) → gemini-2.5-flash; DigitalOcean removed (402 account-wide) |
 | [LETTA.md](LETTA.md) · [LETTA_CLIENT.md](LETTA_CLIENT.md) | Letta integration |
 | [MEM0_INTEGRATION.md](MEM0_INTEGRATION.md) · [MEM0_FINAL_STATUS.md](MEM0_FINAL_STATUS.md) · [MEM0_SUCCESS.md](MEM0_SUCCESS.md) | Mem0 cloud memory |
 

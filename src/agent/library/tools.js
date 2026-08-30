@@ -47,6 +47,25 @@ export async function equipBestTool(bot, block) {
     return false;
 }
 
+/**
+ * Could we actually break this block, and keep what it drops?
+ *
+ * `bot.canDigBlock` is NOT this question - it only checks `diggable` and reach, and stone is
+ * diggable bare-handed. It just drops nothing. That distinction is what made `emergencyShelter`
+ * dig a pit it could not roof: it "mined a wall for a block", got no item, and then had nothing
+ * to seal with.
+ *
+ * Equips the best tool we have first, because the answer depends on what ends up in hand.
+ */
+export async function canBreak(bot, block) {
+    if (!block || block.boundingBox !== 'block') return false;
+    if (block.name === 'bedrock' || isLavaName(block.name)) return false;
+    if (bot.game?.gameMode === 'creative') return true;
+    await equipBestTool(bot, block);
+    const id = bot.heldItem ? bot.heldItem.type : null;
+    return typeof block.canHarvest === 'function' ? !!block.canHarvest(id) : true;
+}
+
 /** Equip the right tool, then break the block. */
 export async function digWithTool(bot, block) {
     if (!block || block.boundingBox !== 'block') return false;
@@ -56,6 +75,10 @@ export async function digWithTool(bot, block) {
         await bot.dig(block);
         return true;
     } catch (err) {
+        // Say why. A silent `false` here reads as "there was nothing to mine", which is the
+        // opposite of the truth and sent a walled-in bot round the recovery ladder forever with
+        // no indication that the dig itself was the thing failing.
+        console.log(`[${bot.username ?? '?'}] dig ${block.name} at ${block.position}: ${err.message}`);
         return false;
     }
 }
@@ -125,3 +148,9 @@ export function isSwimmable(name) {
 export function isBubbleColumn(name) {
     return name === 'bubble_column';
 }
+
+
+// Block placement lived here briefly as `placeBlockVerified`. It moved to `block_io.js`, which
+// owns the whole problem rather than wrapping one symptom of it - the ack wait, the smooth look,
+// the hitbox clearance and the interaction rate limit are four separate defects and a wrapper
+// could only ever address the first.

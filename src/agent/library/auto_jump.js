@@ -85,6 +85,17 @@ export class AutoJump {
             return;
         }
 
+        // A DELIBERATE JUMP IS IN FLIGHT: hands off. JumpAssist asserts the ground flag and drives
+        // the arc, and our own timing logic would fight it for the key mid-flight.
+        //
+        // Clear `holding` WITHOUT releasing, exactly as the water bail above does. Releasing here
+        // would press `jump` false on the very tick JumpAssist set it true, which is the take-off
+        // tick - the one tick in the whole flight that matters.
+        if (bot.jumpAssist?.active) {
+            if (this.holding > 0) { this.holding = 0; this.cooldown = 0; }
+            return;
+        }
+
         // Release the key once the hold window is over, then start the cooldown.
         if (this.holding > 0) {
             if (--this.holding === 0) {

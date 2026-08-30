@@ -2,9 +2,11 @@ import * as mc from "../../utils/mcdata.js";
 import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
 import { digWithTool, equipBestTool, isFallingBlockName, isTreeTrunk, isWaterName } from './tools.js';
+import * as tools from './tools.js';
 import * as swim from './swim.js';
 import * as chest from './chest.js';
 import * as nav from './nav.js';
+import * as blockIO from './block_io.js';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { existsSync, readFileSync } from 'fs';
@@ -822,8 +824,6 @@ export async function pickupNearbyItems(bot) {
     let nearestItem = getNearestItem(bot);
     let pickedUp = 0;
     while (nearestItem) {
-        let movements = createSafeMovements(bot, { canDig: false });
-        bot.pathfinder.setMovements(movements);
         await goToGoal(bot, new pf.goals.GoalFollow(nearestItem, 1));
         await new Promise(resolve => setTimeout(resolve, 200));
         let prev = nearestItem;
@@ -863,8 +863,6 @@ export async function breakBlockAt(bot, x, y, z) {
 
         if (bot.entity.position.distanceTo(block.position) > 4.5) {
             let pos = block.position;
-            let movements = createSafeMovements(bot, { canPlaceOn: false, allow1by1towers: false });
-            bot.pathfinder.setMovements(movements);
             await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
         }
         if (bot.game.gameMode !== 'creative') {
@@ -886,36 +884,6 @@ export async function breakBlockAt(bot, x, y, z) {
 }
 
 
-async function gotoWithTimeout(bot, goal, label, timeoutMs = 15000) {
-    /**
-     * Run a pathfinder goto bounded by a timeout. mineflayer-pathfinder's goto() never
-     * resolves when no route exists (e.g. the bot would need to step/jump up terrain it
-     * won't path over), which would otherwise hang block placement indefinitely.
-     * @returns {Promise<boolean>} true if the goal was reached, false on timeout/failure.
-     */
-    let timer;
-    const timeout = new Promise((resolve) => {
-        timer = setTimeout(() => resolve('timeout'), timeoutMs);
-    });
-    try {
-        const result = await Promise.race([
-            bot.pathfinder.goto(goal).then(() => 'ok', (e) => e),
-            timeout
-        ]);
-        if (result === 'timeout') {
-            bot.pathfinder.stop();
-            console.warn(`[placeBlock] pathfinder goto timed out after ${timeoutMs}ms (${label})`);
-            return false;
-        }
-        if (result !== 'ok') {
-            console.warn(`[placeBlock] pathfinder goto failed (${label}): ${result?.message || result}`);
-            return false;
-        }
-        return true;
-    } finally {
-        clearTimeout(timer);
-    }
-}
 
 export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dontCheat=false) {
     /**
@@ -1065,9 +1033,11 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         'powered_rail', 'activator_rail', 'tripwire_hook', 'tripwire', 'water_bucket', 'string'];
     if (!dont_move_for.includes(item_name) && (pos.distanceTo(targetBlock.position) < 1.1 || pos_above.distanceTo(targetBlock.position) < 1.1)) {
         // too close - try to move away, but don't fail if pathfinding has issues
-        // "Step away from the cell I am about to fill" - a 2-block retreat, which is what
-        // GoalInvert(GoalNear) meant. fleeFrom supplies the heading the inverted goal lacks.
-        if (!await fleeFrom(bot, targetBlock.position.clone(), 2, { timeoutMs: 3000 })) {
+        // "Step away from the cell I am about to fill" - ONE block, not a retreat. stepClear
+        // is bounded to an adjacent cell; fleeFrom is the fallback for when no neighbour is
+        // standable, and must not be the default (see stepClear's note on the 30-block drift).
+        if (!await stepClear(bot, targetBlock.position)
+            && !await fleeFrom(bot, targetBlock.position.clone(), 2, { timeoutMs: 3000 })) {
             log(bot, `Couldn't move away from target, trying to place anyway.`);
         }
     }
@@ -1075,8 +1045,6 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         // too far - try to get closer, but handle pathfinding failures gracefully
         try {
             let pos = targetBlock.position;
-            let movements = createSafeMovements(bot);
-            bot.pathfinder.setMovements(movements);
             // Generous but bounded: goToGoal spends up to ~2s on path planning before it
             // starts walking, so a tight budget starves the actual movement.
             await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4), 15000);
@@ -1097,7 +1065,8 @@ export async function placeBlock(bot, blockType, x, y, z, placeOn='bottom', dont
         const now = bot.entity.position;
         const now_above = now.plus(Vec3(0, 1, 0));
         if (now.distanceTo(targetBlock.position) < 1.1 || now_above.distanceTo(targetBlock.position) < 1.1) {
-            if (!await fleeFrom(bot, targetBlock.position.clone(), 2, { timeoutMs: 3000 })) {
+            if (!await stepClear(bot, targetBlock.position)
+                && !await fleeFrom(bot, targetBlock.position.clone(), 2, { timeoutMs: 3000 })) {
                 log(bot, `Standing on ${target_dest} and could not step clear.`);
             }
         }
@@ -1640,7 +1609,13 @@ export async function putInChest(bot, itemName, num=-1, x=null, y=null, z=null) 
 
     const { moved, asked, reason, type, used, total } = res.value;
     if (moved === 0) {
-        log(bot, `Could not deposit any ${itemName}. The ${type} is ${reason === 'timeout' ? 'not responding' : 'full'}.`);
+        // Name the actual reason. "The chest is full" was printed for every zero, including
+        // `none_held` - so asking the bot to store an item it was not carrying reported a
+        // problem with the CHEST, and every later diagnosis started from the wrong end.
+        const why = reason === 'none_held' ? `I am not carrying any ${itemName}`
+            : reason === 'timeout'         ? `the ${type} is not responding`
+            :                                `the ${type} is full`;
+        log(bot, `Could not deposit any ${itemName}: ${why}.`);
         return false;
     }
     const left = bot.inventory.items().filter(i => i.name === itemName).reduce((s, i) => s + i.count, 0);
@@ -1682,6 +1657,8 @@ export async function takeFromChest(bot, itemName, num=-1, x=null, y=null, z=nul
     if (v.moved === 0) {
         log(bot, v.reason === 'inventory_full'
             ? `Could not take ${itemName}: my inventory is full.`
+            : v.reason === 'timeout'
+            ? `Could not take ${itemName}: the ${v.type} is not responding.`
             : `Could not take any ${itemName} from the ${v.type} (${v.reason}).`);
         return false;
     }
@@ -2040,57 +2017,121 @@ export async function findItemInChests(bot, itemName, range = CONSTANTS.DEFAULT_
     return results;
 }
 
+/**
+ * Move items from one container to another.
+ *
+ * **The source is never emptied on spec.** The first version withdrew everything it could and
+ * only then walked to the destination - so a transfer into a FULL chest left the source at 0/27,
+ * 1728 items stranded in the bot's bag, and a cheerful "Transferred 0 items". Measured exactly
+ * like that. Three things make that impossible now:
+ *
+ * - the destination's free space is measured FIRST, and the withdraw is bounded by it;
+ * - whatever the destination would not take is PUT BACK in the source before returning;
+ * - the round trip repeats while progress is being made, so `("all", -1)` really does move
+ *   everything even when the bag can only carry part of it at a time.
+ *
+ * The cost is more container opens, which are bounded and cheap; the alternative is a bot that
+ * strips a chest and wanders off holding the contents.
+ */
 export async function transferBetweenChests(bot, itemName, num, fromX, fromY, fromZ, toX, toY, toZ) {
-    /**
-     * Move items from one container to another. Carries only what it actually withdrew - the
-     * old version deposited the amounts it had asked for, which invented items when the bag
-     * was full at the source.
-     */
     const src = resolveContainer(bot, fromX, fromY, fromZ, 'take items from');
     if (src.error) { log(bot, `Source: ${src.error}`); return false; }
     const dst = resolveContainer(bot, toX, toY, toZ, 'put items in');
     if (dst.error) { log(bot, `Destination: ${dst.error}`); return false; }
 
     const takeAll = String(itemName).toLowerCase() === 'all';
-    const pickup = await chest.withContainer(bot, src.block, async (ctx) => {
-        const names = [...new Set(ctx.contents()
-            .filter(i => takeAll || i.name === itemName || i.name.includes(itemName))
-            .map(i => i.name))];
-        if (names.length === 0) return { taken: [], empty: true };
+    const wants = (name) => takeAll || name === itemName || name.includes(itemName);
+    const at = (p) => `(${p[0]}, ${p[1]}, ${p[2]})`;
 
-        let budget = num === -1 || num == null ? Infinity : num;
-        const taken = [];
-        for (const name of names) {
-            if (budget <= 0 || bot.interrupt_code) break;
-            const r = await ctx.withdraw(name, budget === Infinity ? -1 : budget);
-            if (r.moved > 0) { taken.push({ name, count: r.moved }); budget -= r.moved; }
-            if (r.reason === 'inventory_full') break;
+    let budget = num === -1 || num == null ? Infinity : num;
+    let movedTotal = 0, rounds = 0, stranded = [];
+    let stopReason = null;
+
+    // Bounded: each round must move something or we stop, so this is a progress guard rather
+    // than a real iteration count. 8 rounds is 8 bagfuls, far more than any chest holds.
+    while (rounds < 8 && budget > 0 && !bot.interrupt_code) {
+        rounds++;
+
+        // 1. How much will the destination actually take, and of what? Measured before anything
+        //    leaves the source, because that is the whole point.
+        const survey = await chest.withContainer(bot, dst.block, async (ctx) => ({
+            room: (name, stackSize = 64) => chest.capacityFor({
+                contents: ctx.contents(), totalSlots: ctx.totalSlots, itemName: name, stackSize,
+            }).freeUnits,
+            free: ctx.totalSlots - ctx.usedSlots(),
+            type: ctx.type,
+        }), { fallback: goToPosition });
+        if (!survey.ok) { log(bot, `Destination: ${chest.explainFailure(survey, at([toX, toY, toZ]))}`); return false; }
+
+        // 2. Take only what will fit, one item type at a time.
+        const pickup = await chest.withContainer(bot, src.block, async (ctx) => {
+            const names = [...new Set(ctx.contents().filter(i => wants(i.name)).map(i => i.name))];
+            if (names.length === 0) return { taken: [], empty: true };
+            const taken = [];
+            for (const name of names) {
+                if (budget <= 0 || bot.interrupt_code) break;
+                const room = survey.value.room(name);
+                if (room <= 0) continue;
+                const want = Math.min(budget === Infinity ? room : budget, room);
+                const r = await ctx.withdraw(name, want);
+                if (r.moved > 0) { taken.push({ name, count: r.moved }); budget -= r.moved; }
+                if (r.reason === 'inventory_full') break;
+            }
+            return { taken, empty: false };
+        }, { fallback: goToPosition });
+        if (!pickup.ok) { log(bot, `Source: ${chest.explainFailure(pickup, at([fromX, fromY, fromZ]))}`); return false; }
+
+        if (pickup.value.empty) { stopReason = movedTotal ? null : 'source_empty'; break; }
+        const taken = pickup.value.taken;
+        if (taken.length === 0) { stopReason = movedTotal ? null : 'destination_full'; break; }
+
+        // 3. Deposit, and find out what would not go in.
+        const drop = await chest.withContainer(bot, dst.block, async (ctx) => {
+            const left = [];
+            let moved = 0;
+            for (const t of taken) {
+                if (bot.interrupt_code) break;
+                const r = await ctx.deposit(t.name, t.count);
+                moved += r.moved;
+                if (r.moved < t.count) left.push({ name: t.name, count: t.count - r.moved });
+            }
+            return { moved, left };
+        }, { fallback: goToPosition });
+        if (!drop.ok) {
+            // Carrying items with nowhere to put them: hand them back rather than wandering off
+            // with a stripped chest behind us.
+            stranded = taken;
+            log(bot, `${chest.explainFailure(drop, at([toX, toY, toZ]))}`);
+            break;
         }
-        return { taken, empty: false };
-    }, { fallback: goToPosition });
+        movedTotal += drop.value.moved;
+        if (drop.value.left.length) { stranded = drop.value.left; stopReason = 'destination_full'; break; }
+        if (drop.value.moved === 0) { stopReason = 'destination_full'; break; }
+    }
 
-    if (!pickup.ok) { log(bot, `Source: ${chest.explainFailure(pickup, `(${fromX}, ${fromY}, ${fromZ})`)}`); return false; }
-    if (pickup.value.empty) { log(bot, `No ${takeAll ? 'items' : itemName} in the source container.`); return false; }
-    const taken = pickup.value.taken;
-    if (taken.length === 0) { log(bot, `Could not take any items from the source container - my inventory is full.`); return false; }
+    // 4. PUT BACK anything the destination refused. This is the invariant that makes every
+    //    failure above harmless: items are either in a chest or in transit, never abandoned.
+    let returned = 0;
+    if (stranded.length) {
+        const back = await chest.withContainer(bot, src.block, async (ctx) => {
+            let n = 0;
+            for (const t of stranded) n += (await ctx.deposit(t.name, t.count)).moved;
+            return n;
+        }, { fallback: goToPosition });
+        returned = back.ok ? back.value : 0;
+    }
 
-    const drop = await chest.withContainer(bot, dst.block, async (ctx) => {
-        let moved = 0;
-        for (const t of taken) {
-            if (bot.interrupt_code) break;
-            const r = await ctx.deposit(t.name, t.count);
-            moved += r.moved;
-            if (r.moved < t.count) { log(bot, `Destination container is full. ${t.count - r.moved} ${t.name} left in my inventory.`); break; }
-        }
-        return moved;
-    }, { fallback: goToPosition });
-
-    if (!drop.ok) {
-        log(bot, `Took ${taken.reduce((s, t) => s + t.count, 0)} items but ${chest.explainFailure(drop, `(${toX}, ${toY}, ${toZ})`)} They are in my inventory.`);
+    const tail = returned ? ` Put ${returned} back in the source.` : '';
+    if (movedTotal === 0) {
+        const why = stopReason === 'source_empty' ? `no ${takeAll ? 'items' : itemName} in the source container`
+            : stopReason === 'destination_full' ? `the destination is full`
+            : `nothing could be moved`;
+        log(bot, `Transferred nothing from ${at([fromX, fromY, fromZ])} to ${at([toX, toY, toZ])}: ${why}.${tail}`);
         return false;
     }
-    log(bot, `Transferred ${drop.value} items from (${fromX}, ${fromY}, ${fromZ}) to (${toX}, ${toY}, ${toZ}).`);
-    return drop.value > 0;
+    const short = stopReason === 'destination_full' ? ' The destination is now full.' : '';
+    log(bot, `Transferred ${movedTotal} items from ${at([fromX, fromY, fromZ])} to ${at([toX, toY, toZ])}.${short}${tail}`);
+    return true;
 }
 
 export async function putInNamedChest(bot, chestName, itemName, num = -1) {
@@ -2344,95 +2385,30 @@ export async function goToGoal(bot, goal, timeoutMs = 0) {
         clearInterval(doorCheckForNav);
     }
 
-    const nonDestructiveMovements = new pf.Movements(bot);
-    const dontBreakBlocks = [
-        'glass', 'glass_pane', 'door', 'oak_door', 'spruce_door', 'birch_door', 'jungle_door',
-        'acacia_door', 'dark_oak_door', 'mangrove_door', 'cherry_door', 'bamboo_door',
-        'crimson_door', 'warped_door', 'iron_door',
-        // Fence gates - can be opened/closed
-        'fence_gate', 'oak_fence_gate', 'spruce_fence_gate', 'birch_fence_gate',
-        'jungle_fence_gate', 'acacia_fence_gate', 'dark_oak_fence_gate',
-        'mangrove_fence_gate', 'cherry_fence_gate', 'bamboo_fence_gate',
-        'crimson_fence_gate', 'warped_fence_gate',
-        // Fence blocks - don't break
-        'oak_fence', 'spruce_fence', 'birch_fence', 'jungle_fence',
-        'acacia_fence', 'dark_oak_fence', 'mangrove_fence', 'cherry_fence',
-        'bamboo_fence', 'crimson_fence', 'warped_fence', 'nether_brick_fence'
-    ];
-    for (let block of dontBreakBlocks) {
-        const blockId = mc.getBlockId(block);
-        if (blockId) nonDestructiveMovements.blocksCantBreak.add(blockId);
-    }
-    nonDestructiveMovements.placeCost = 50;
-    nonDestructiveMovements.digCost = 100;
-
-    const destructiveMovements = new pf.Movements(bot);
-    destructiveMovements.placeCost = 50;
-
-    let final_movements = destructiveMovements;
-
-    const pathfind_timeout = 1000;
-    if (await bot.pathfinder.getPathTo(nonDestructiveMovements, goal, pathfind_timeout).status === 'success') {
-        final_movements = nonDestructiveMovements;
-        log(bot, `Found non-destructive path.`);
-    }
-    else if (await bot.pathfinder.getPathTo(destructiveMovements, goal, pathfind_timeout).status === 'success') {
-        log(bot, `Found destructive path.`);
-    }
-    else {
-        log(bot, `Path not found, but attempting to navigate anyway using destructive movements.`);
-    }
-
-    const doorCheckInterval = startDoorInterval(bot);
-
-
-    bot.pathfinder.setMovements(final_movements);
-    try {
-        if (timeoutMs > 0) {
-            return await gotoWithTimeout(bot, goal, 'goToGoal', timeoutMs);
-        }
-        await bot.pathfinder.goto(goal);
-        clearInterval(doorCheckInterval);
-        return true;
-    } catch (err) {
-        clearInterval(doorCheckInterval);
-        // we need to catch so we can clean up the door check interval, then rethrow the error
-        throw err;
-    } finally {
-        clearInterval(doorCheckInterval);
-    }
+    // NOTHING FALLS THROUGH HERE ANY MORE, so there is no pathfinder branch left to fall into.
+    // What used to sit here built two `pf.Movements`, probed them with `getPathTo`, and then
+    // executed with `bot.pathfinder.goto` - and that EXECUTOR cannot move this bot at all
+    // (`onGround` reads false while the bot is provably standing, so it waits for a flag that
+    // never arrives; measured: plan success in 6ms, goto timeout after 30s having moved 3.1
+    // blocks). Every caller now constructs a `GoalFollow` or a `GoalNear`, both of which
+    // `navTargetFor` translates, so the branch was dead weight that only made it look as though
+    // there were still a working fallback.
+    //
+    // `GoalInvert` is the one shape the seam cannot express - it means "get AWAY from", so
+    // there is no target to steer at - and `fleeFrom` supplies the missing heading instead.
+    // Refuse in words rather than silently returning false: a bot that declines to move and
+    // says nothing is indistinguishable from a bot that is stuck.
+    log(bot, `I cannot walk to a ${goal?.constructor?.name ?? 'goal'} of that shape.`
+        + ` "Get away from" is fleeFrom's job, not a walk target.`);
+    return false;
 }
 
 let _doorInterval = null;
 
-/**
- * Create surface-only movements for long distance travel to avoid caves
- * @param {MinecraftBot} bot - reference to the minecraft bot
- * @returns {pf.Movements} configured movements that prefer surface travel
- */
-function createSurfaceMovements(bot) {
-    const movements = new pf.Movements(bot);
-
-    // Disable digging to stay on surface
-    movements.canDig = false;
-
-    // Limit vertical drops to avoid falling into caves
-    movements.maxDropDown = 3;
-
-    // Don't build towers (stay on natural terrain)
-    movements.allow1by1towers = false;
-
-    // High cost for going down to discourage cave entry
-    movements.digCost = 1000;
-
-    // High place cost to discourage building bridges over water
-    movements.placeCost = 100;
-
-    // Avoid water/lava
-    movements.canOpenDoors = true;
-
-    return movements;
-}
+// `createSurfaceMovements` lived here: a pf.Movements tuned to keep long journeys out of caves
+// (canDig off, maxDropDown 3, digCost 1000). Deleted with the executor it configured - the cost
+// model that actually decides this now lives in nav.js DEFAULTS (digCost, dropCost, preferY /
+// yBias), which is the one the A* planner reads.
 
 function createSafeMovements(bot, options = {}) {
     /**
@@ -2738,7 +2714,6 @@ export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
         const numWaypoints = Math.floor(horizontalDistance / WAYPOINT_INTERVAL);
 
         // Use surface movements for long distance
-        const surfaceMovements = createSurfaceMovements(bot);
 
         for (let i = 1; i <= numWaypoints; i++) {
             if (bot.interrupt_code) {
@@ -2767,7 +2742,6 @@ export async function goToPosition(bot, x, y, z, min_distance=2, sprint=false) {
             }
 
             try {
-                bot.pathfinder.setMovements(surfaceMovements);
                 await goToGoal(bot, new pf.goals.GoalNear(waypointX, bot.entity.position.y, waypointZ, 5));
                 log(bot, `Waypoint ${i}/${numWaypoints} reached, ${Math.round(remainingDist)} blocks remaining...`);
             } catch (err) {
@@ -2923,7 +2897,32 @@ export async function goToPlayer(bot, username, distance=3) {
 
     await goToGoal(bot, goal, true);
 
-    log(bot, `You have reached ${username}.`);
+    // REPORT WHAT HAPPENED, not what was attempted. This used to log "You have reached
+    // <player>" unconditionally, discarding goToGoal's result - so a bot still sealed in a box
+    // twelve blocks away announced that it had arrived. Measured: boxed in with no pickaxe, it
+    // moved 0.0 blocks and said it had reached the player.
+    // Re-read the entity before measuring. A long walk can outlast the object mineflayer handed
+    // us at the top: it destroys and rebuilds a player's entity across render distance, and
+    // judging arrival against a frozen position is how "You have reached <player>" gets said to
+    // an empty field. Falls back to the original reference when they are out of sight, which is
+    // still the best estimate we have.
+    const livePlayer = bot.players[username]?.entity ?? player;
+    const gap = bot.entity.position.distanceTo(livePlayer.position);
+    if (gap <= Math.max(distance, 1) + 1.5) {
+        log(bot, `You have reached ${username}.`);
+        return true;
+    }
+    if (nav.enclosed(bot)) {
+        // Name the real obstacle. The recovery ladder digs out of most enclosures, but bare
+        // handed stone runs about 35 seconds a block, so "walled in with no pickaxe" looks
+        // exactly like "ignoring you" for minutes at a time.
+        const pick = bot.inventory.items().some(i => i.name.endsWith('_pickaxe'));
+        log(bot, `I am walled in ${gap.toFixed(0)} blocks from ${username}`
+            + `${pick ? ' and still digging out' : ' with no pickaxe, so digging out is very slow'}.`);
+        return false;
+    }
+    log(bot, `Could not reach ${username} - stopped ${gap.toFixed(1)} blocks away.`);
+    return false;
 }
 
 
@@ -2962,6 +2961,62 @@ const FOLLOW_AIR_FLOOR = 10;
  */
 const SWIM_POLL_MS = 100;
 
+/**
+ * How long to keep walking toward the last place we saw someone before admitting we lost them.
+ * A teleport well beyond render distance is recoverable by WALKING - get close enough and the
+ * server starts sending the entity again - so the bot must not give up the moment it blinks
+ * out. But it must give up eventually, or it converges on an empty patch of ground and stands
+ * there polling a position it has already reached.
+ */
+const FOLLOW_LOST_MS = 8000;
+const FOLLOW_REACQUIRE_DIST = 6;
+
+/**
+ * Where each player was last actually SEEN, kept ACROSS calls to `followPlayer`.
+ *
+ * A follow does not run once - it is torn down and restarted from the top every time a mode
+ * interrupts it, which is constantly (`hunting`, `item_collecting`, `torch_placing` and
+ * `elbow_room` all list `action:followPlayer` as interruptible). The target can easily walk out
+ * of entity range during the interruption, and a restarted call that only looks at
+ * `bot.players[x].entity` then has no idea where they went - so it refuses, throwing away a
+ * position it knew perfectly well a second earlier.
+ *
+ * That is exactly what happened on 2026-08-30: three `elbow_room` interrupts in 16 seconds, the
+ * third resume found no entity, refused outright, and the follow was over - the bot stood on the
+ * same block until it was restarted, while the player it was following walked away and logged off.
+ */
+const lastSeenPos = new Map();
+
+/**
+ * What should a follow loop do this iteration? Pure, so every branch is testable
+ * (`tests/follow.test.mjs`) - a live run only ever exercises whichever one the world happens
+ * to be in, and three of these four states need a player to teleport to produce at all.
+ *
+ * The distinction that matters is between "cannot see them" and "cannot reach them". They look
+ * identical from chat and need opposite handling: one is fixed by WALKING, the other cannot be
+ * fixed at all.
+ *
+ * @param {object} s
+ * @param {boolean} s.hasEntity        - the entity object exists RIGHT NOW (re-read, never cached)
+ * @param {boolean} s.online           - still in `bot.players`, i.e. on the server at all
+ * @param {number}  s.lostMs           - how long we have been unable to see them
+ * @param {number}  s.distToLastSeen   - how far we are from where we last saw them
+ * @returns {{action: 'follow'|'seek'|'lost'|'gone', reason: string}}
+ */
+export function followVerdict({ hasEntity, online, lostMs = 0, distToLastSeen = Infinity,
+                                lostMsLimit = FOLLOW_LOST_MS, reacquireDist = FOLLOW_REACQUIRE_DIST }) {
+    // Checked FIRST: a player who quit is not out of render distance, and walking to their last
+    // position would be a pointless journey ending in a timeout rather than an explanation.
+    if (!online) return { action: 'gone', reason: 'left the game' };
+    if (hasEntity) return { action: 'follow', reason: 'in sight' };
+    // Out of render distance is RECOVERABLE BY WALKING - get close enough and the server starts
+    // sending the entity again. Giving up the moment they blink out is what makes a long
+    // teleport end the follow instead of starting a chase.
+    if (lostMs > lostMsLimit && distToLastSeen < reacquireDist)
+        return { action: 'lost', reason: 'arrived where they were, still not in sight' };
+    return { action: 'seek', reason: 'walking to where I last saw them' };
+}
+
 export async function followPlayer(bot, username, distance=4) {
     /**
      * Follow the given player endlessly. Will not return until the code is manually stopped.
@@ -2979,15 +3034,25 @@ export async function followPlayer(bot, username, distance=4) {
     }
     username = resolvedName;
     
-    let playerObj = bot.players[username];
-    if (!playerObj || !playerObj.entity) {
-        console.log(`Player ${username} not found or has no entity`);
+    // THE ENTITY OBJECT IS NOT STABLE, so it must never be captured for the life of the loop.
+    // mineflayer DESTROYS a player's entity when they leave render distance and builds a NEW
+    // one when they come back, so a reference taken once here points at an orphan whose
+    // `position` is frozen wherever it was last seen. The bot then chases a ghost -
+    // confidently, forever, with nothing in chat to say so. Exactly the shape of the
+    // `GoalFollow` bug `navToGoal` already had to fix: it cached x/y/z at construction while
+    // the target moved.
+    const liveEntity = () => bot.players[username]?.entity ?? null;
+    let player = liveEntity();
+    /** Where we last actually SAW them - the only position worth walking toward once they blink out. */
+    let lastSeen = player ? player.position.clone() : (lastSeenPos.get(username) ?? null);
+    let lostSince = player ? null : Date.now();
+    // Only refuse when we have BOTH no entity and no memory of one. "I cannot see you" and "I
+    // have no idea where you went" are different problems, and only the second is hopeless.
+    if (!player && !lastSeen) {
+        log(bot, `I cannot see ${username} from here and I do not know where they went - come closer and ask again.`);
         return false;
     }
-    let player = playerObj.entity;
 
-    const move = createSafeMovements(bot);
-    bot.pathfinder.setMovements(move);
     let doorCheckInterval = startDoorInterval(bot);
 
     // LAND DRIVING IS OURS NOW. This used to be `bot.pathfinder.setGoal(GoalFollow, true)`,
@@ -3018,6 +3083,39 @@ export async function followPlayer(bot, username, distance=4) {
     let exitFails = 0;
 
     while (!bot.interrupt_code) {
+        // RE-ACQUIRE EVERY ITERATION - see the note on `liveEntity` above.
+        const live = liveEntity();
+        if (live) {
+            player = live;
+            lastSeen = live.position.clone();
+            lastSeenPos.set(username, lastSeen);   // survives the next mode interrupt
+            lostSince = null;
+        } else if (lostSince === null) lostSince = Date.now();
+
+        const verdict = followVerdict({
+            hasEntity: !!live,
+            online: !!bot.players[username],
+            lostMs: lostSince === null ? 0 : Date.now() - lostSince,
+            distToLastSeen: bot.entity.position.distanceTo(lastSeen),
+        });
+        if (verdict.action === 'gone') {
+            lastSeenPos.delete(username);   // a position from a past session is not a lead
+            log(bot, `${username} left the game, so I stopped following.`);
+            break;
+        }
+        if (verdict.action === 'lost') {
+            // We arrived where they were and they are still invisible. Continuing to walk at a
+            // position we have already reached IS the ghost behaviour.
+            log(bot, `I got to where I last saw ${username}, but they are not in sight.`);
+            break;
+        }
+        if (verdict.action === 'seek') {
+            await nav.navigateTo(bot, { x: lastSeen.x, y: lastSeen.y, z: lastSeen.z },
+                { arriveDist: Math.max(1.5, distance), maxReplans: 2, waypointMs: 1500 });
+            await new Promise(resolve => setTimeout(resolve, 500));
+            continue;
+        }
+
         const distance_from_player = bot.entity.position.distanceTo(player.position);
         const botWet = swim.inWater(bot);
         if (!botWet) exitFails = 0;
@@ -3180,6 +3278,50 @@ export async function followPlayer(bot, username, distance=4) {
  * @param {object} opts - {timeoutMs}
  * @returns {Promise<boolean>} whether we ended up at least `distance` from `from`
  */
+/**
+ * Step just far enough clear of a cell to place into it - one block sideways, never a journey.
+ *
+ * placeBlock needs 1.1 blocks of separation from the cell it is about to fill, and nothing
+ * more. It used to buy that with fleeFrom(target, 2), which is a NAVIGATOR call: it steers at
+ * a point `distance + 2` away, fans through five bearings, and is allowed two replans. That is
+ * the right shape for running from a creeper and the wrong shape for stepping off a floor tile.
+ *
+ * It matters because laying a floor puts the bot ON the next cell almost every time, so the
+ * retreat fires once PER CELL, and each one pushes it away from wherever it happens to be
+ * standing. Measured 2026-08-30, bob filling a 13x13 floor at (4710..4722, 4608..4620): he
+ * drifted 4724 -> 4731 -> 4746 -> 4752, thirty blocks east of a region he had already left,
+ * logging `pinned: nothing worked - recentring` the whole way, and came back with 60 ragged
+ * blocks placed out of 169.
+ *
+ * So: pick an adjacent standable cell that is already far enough away, and take one short
+ * step to it. Bounded by construction - the target is one block from where we stand, so a
+ * failure costs a step, not a walkabout. fleeFrom remains the fallback for the case where no
+ * neighbour is standable.
+ *
+ * @param {MinecraftBot} bot
+ * @param {Vec3} target the cell we want to place into
+ * @returns {Promise<boolean>} true if the bot is now >= 1.1 blocks clear of the cell
+ */
+export async function stepClear(bot, target) {
+    const clearOf = (p) => p.distanceTo(target) >= 1.1 && p.offset(0, 1, 0).distanceTo(target) >= 1.1;
+    if (clearOf(bot.entity.position)) return true;
+
+    const feet = bot.entity.position.floored();
+    // Straights before diagonals: a diagonal sweeps the bot's 0.6-block width past two block
+    // corners, which is the same clipping that `bodyClear` exists for in the planner.
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+        const t = feet.offset(dx, 0, dz);
+        const centre = t.offset(0.5, 0, 0.5);
+        if (!clearOf(centre)) continue;                  // still too close - no point going there
+        const at = bot.blockAt(t), head = bot.blockAt(t.offset(0, 1, 0)), below = bot.blockAt(t.offset(0, -1, 0));
+        if (at?.boundingBox !== 'empty' || head?.boundingBox !== 'empty' || below?.boundingBox !== 'block') continue;
+        await nav.navigateTo(bot, { x: t.x, y: t.y, z: t.z },
+            { arriveDist: 0.6, maxReplans: 1, planRange: 8 });
+        if (clearOf(bot.entity.position)) return true;
+    }
+    return clearOf(bot.entity.position);
+}
+
 export async function fleeFrom(bot, from, distance = 16, opts = {}) {
     const timeoutMs = opts.timeoutMs ?? 6000;
     const deadline = Date.now() + timeoutMs;
@@ -3223,7 +3365,6 @@ export async function moveAway(bot, distance) {
     const pos = bot.entity.position;
     let goal = new pf.goals.GoalNear(pos.x, pos.y, pos.z, distance);
     let inverted_goal = new pf.goals.GoalInvert(goal);
-    bot.pathfinder.setMovements(new pf.Movements(bot));
 
     if (bot.modes.isOn('cheat')) {
         const move = new pf.Movements(bot);
@@ -3477,6 +3618,71 @@ async function sleepUntilMorning(bot, timeoutMs = 90000) {
  *
  * @returns {Promise<{sheltered:boolean, reason:string, seal?:object}>}
  */
+/**
+ * Wait for the bot to stop falling, then report its y.
+ *
+ * Two consecutive equal readings a tick apart; capped, so a bot wedged in a wall still returns.
+ * `onGround` is unusable on this server (see CLAUDE.md), so stability of the measurement is the
+ * only signal available.
+ */
+async function settleY(bot, maxMs = 1500) {
+    const deadline = Date.now() + maxMs;
+    let last = bot.entity.position.y;
+    while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 100));
+        const now = bot.entity.position.y;
+        if (Math.abs(now - last) < 0.01) return now;
+        last = now;
+    }
+    return bot.entity.position.y;
+}
+
+/**
+ * Can we actually finish a shelter here, BEFORE we break any ground?
+ *
+ * This check is the whole fix. The old routine dug first and asked later: it called
+ * `digDown(bot, 2)`, **ignored its return value**, and went on to place a roof - so on bare
+ * stone with no pickaxe it reported `Don't have right tools to break stone`, failed to descend,
+ * and then tried to seal at `y+2`, which is the open air above the bot's own head with nothing
+ * adjacent to place against. The result was the line `Dug in at y=111 but could not seal the
+ * roof` every twenty seconds all night, each one interrupting whatever the bot was doing.
+ *
+ * A half-built shelter is worse than none: an open pit is somewhere to fall into and be cornered,
+ * and it has cost the terrain as well.
+ *
+ * @returns {Promise<{ok:boolean, reason:string, material:string|null, harvest:Vec3|null}>}
+ */
+async function shelterFeasibility(bot) {
+    const p = bot.entity.position.floored();
+
+    // Can we get down at all? Not "is it diggable" - can we break it AND keep the drop.
+    const below = bot.blockAt(p.offset(0, -1, 0));
+    if (!below || below.name === 'air' || below.name === 'cave_air')
+        return { ok: false, reason: 'nothing_to_dig', material: null, harvest: null };
+    if (!await tools.canBreak(bot, below))
+        return { ok: false, reason: `no tool for ${below.name}`, material: null, harvest: null };
+
+    // Something to roof it with: carried, or a wall we could mine one out of.
+    if (hasBuildingBlocks(bot))
+        return { ok: true, reason: 'carried', material: pickBuildMaterial(bot), harvest: null };
+
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const wall = bot.blockAt(p.offset(dx, -1, dz));
+        if (!wall || wall.boundingBox !== 'block') continue;
+        if (!STACKABLE.includes(wall.name)) continue;   // a drop we can actually place back
+        if (!await tools.canBreak(bot, wall)) continue;
+        return { ok: true, reason: 'harvest', material: null, harvest: wall.position };
+    }
+    return { ok: false, reason: 'nothing to seal with', material: null, harvest: null };
+}
+
+/**
+ * Dig in for the night, or refuse - never anything in between.
+ *
+ * Sequence matters: prove it can be finished, dig, verify the dig HAPPENED, seal, verify the
+ * seal. Any failure after ground has been broken climbs back out, so the bot is never left
+ * standing in an open hole it dug for its own safety.
+ */
 export async function emergencyShelter(bot, modeState = null) {
     const night = await import('./night.js');
     const getName = (x, y, z) => {
@@ -3495,34 +3701,80 @@ export async function emergencyShelter(bot, modeState = null) {
         await nav.navigateTo(bot, new Vec3(spot.x, spot.y, spot.z), { arriveDist: 1.5 });
     }
 
+    const plan = await shelterFeasibility(bot);
+    if (!plan.ok) {
+        // Refusing BEFORE breaking ground is the point. Say why, so the log is diagnosable -
+        // "could not seal the roof" was true of every distinct failure and told us nothing.
+        log(bot, `Cannot dig in here: ${plan.reason}.`);
+        return { sheltered: false, reason: plan.reason };
+    }
+
+    const startY = bot.entity.position.y;
+    // THREE BLOCKS, NOT TWO - the old depth put the roof in mid-air on flat ground.
+    //
+    // With the top solid block at Y-1 and the bot's feet at Y, digging 2 breaks Y-1 and Y-2 and
+    // leaves the bot at feet Y-2 / head Y-1. The seal then goes at Y - which is the open sky
+    // above the surface, with four air neighbours and nothing to place against:
+    // `Cannot place dirt at (4566, 111, 4706): nothing to place on`. Digging 3 puts the bot at
+    // feet Y-3 / head Y-2 and the seal at Y-1, which is the old surface layer and therefore
+    // surrounded by earth on every side. Works on a flat plain and in a hillside alike.
+    //
+    // It looked correct for a long time because in natural terrain the bot usually dug into a
+    // slope, where the cell above the shaft happened to have solid neighbours anyway.
     // digDown already refuses to break into lava, water, or over a big drop - keep that.
-    await digDown(bot, 2);
+    const dug = await digDown(bot, 3);
+    // LET THE BOT LAND BEFORE MEASURING. `digDown` returns when the blocks are broken, not when
+    // the body has fallen through them, so reading y straight away catches it mid-air: measured
+    // `Dug down 2 blocks.` followed by `only got down 1.0 blocks` on a dig that worked perfectly.
+    // Same class of mistake as counting a chest transfer the instant the deadline fires.
+    const descended = startY - await settleY(bot);
+    if (!dug || descended < 2.5) {
+        // Did not actually get down. Sealing from here would place a block in mid-air above the
+        // bot's head; that is the `nothing to place on` failure, and it is not worth retrying.
+        if (descended > 0.5) await pillarUp(bot, Math.round(descended));
+        log(bot, `Could not dig in: only got down ${descended.toFixed(1)} blocks.`);
+        return { sheltered: false, reason: 'could_not_dig' };
+    }
+
+    let material = plan.material;
+    if (!material) {
+        await breakBlockAt(bot, plan.harvest.x, plan.harvest.y, plan.harvest.z);
+        await pickupNearbyItems(bot);
+        material = hasBuildingBlocks(bot) ? pickBuildMaterial(bot) : null;
+    }
+    if (!material) {
+        await pillarUp(bot, Math.round(descended));
+        log(bot, `Could not dig in: the wall block did not drop anything I can place.`);
+        return { sheltered: false, reason: 'no_material' };
+    }
 
     const p = bot.entity.position.floored();
     const sealPos = new Vec3(p.x, p.y + 2, p.z);
-    let material = pickBuildMaterial(bot);
-    if (!hasBuildingBlocks(bot)) {
-        // Nothing to seal with: mine one wall of the hole for a block.
-        await breakBlockAt(bot, p.x + 1, p.y, p.z);
-        await pickupNearbyItems(bot);
-        material = pickBuildMaterial(bot);
-    }
-
     await placeBlock(bot, material, sealPos.x, sealPos.y, sealPos.z, 'bottom');
     const sealed = bot.blockAt(sealPos);
     const ok = !!sealed && sealed.boundingBox === 'block';
-    if (ok && modeState) modeState.sheltered = sealPos;
-    log(bot, ok
-        ? `VERIFIED SHELTER: sealed at (${sealPos.x}, ${sealPos.y}, ${sealPos.z}) with ${sealed.name}.`
-        : `Dug in at y=${p.y} but could not seal the roof.`);
-    return { sheltered: ok, reason: ok ? 'sealed' : 'unsealed', seal: sealPos };
+    if (ok) {
+        if (modeState) modeState.sheltered = sealPos;
+        log(bot, `VERIFIED SHELTER: sealed at (${sealPos.x}, ${sealPos.y}, ${sealPos.z}) with ${sealed.name}.`);
+        return { sheltered: true, reason: 'sealed', seal: sealPos };
+    }
+    // NEVER LEAVE AN OPEN PIT. A hole with no roof is strictly worse than the flat ground we
+    // started on - the bot is cornered in it and the terrain is spent.
+    await pillarUp(bot, Math.round(descended));
+    log(bot, `Could not seal the roof at (${sealPos.x}, ${sealPos.y}, ${sealPos.z}); climbed back out.`);
+    return { sheltered: false, reason: 'unsealed' };
 }
 
-/** Break out of the overnight shelter at dawn. */
+/**
+ * Break out of the overnight shelter at dawn.
+ *
+ * Climbs THREE, matching the shelter's depth: the bot sits at feet Y-3 with the seal at Y-1, so
+ * one pillar leaves it still a block under the surface in a hole it cannot walk out of.
+ */
 export async function digOut(bot, sealPos) {
     if (!sealPos) return false;
     await breakBlockAt(bot, sealPos.x, sealPos.y, sealPos.z);
-    await pillarUp(bot, 1);
+    await pillarUp(bot, 3);
     log(bot, `Dug out of the shelter at dawn.`);
     return true;
 }
@@ -3618,7 +3870,6 @@ export async function tillAndSow(bot, x, y, z, seedType=null) {
     // if distance is too far, move to the block
     if (bot.entity.position.distanceTo(block.position) > 4.5) {
         let pos = block.position;
-        bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
     }
     if (block.name !== 'farmland') {
@@ -3710,7 +3961,6 @@ export async function fillBucket(bot, liquidType = 'water') {
     
     // Move closer if needed
     if (bot.entity.position.distanceTo(liquidBlock.position) > 4.5) {
-        bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(liquidBlock.position.x, liquidBlock.position.y, liquidBlock.position.z, 3));
     }
     
@@ -3744,7 +3994,6 @@ export async function activateNearestBlock(bot, type) {
     }
     if (bot.entity.position.distanceTo(block.position) > 4.5) {
         let pos = block.position;
-        bot.pathfinder.setMovements(new pf.Movements(bot));
         await goToGoal(bot, new pf.goals.GoalNear(pos.x, pos.y, pos.z, 4));
     }
     await bot.activateBlock(block);
@@ -4234,42 +4483,109 @@ export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
         : base;
     let dir = 0;
 
+    // Stairing that buys no height, four headings running, is not going to start working on the
+    // fifth. Count it, and hand over to the tower - which needs no horizontal room at all.
+    let stalls = 0;
+    // WHY THE CLIMB ENDED. This routine has six exits and reported none of them: a bot that
+    // stopped one block under the surface, a bot that ran out of blocks, and a bot that decided
+    // it had already arrived all printed the identical "Climbed N blocks" line. The null-surface
+    // bug above sat behind that for as long as it did because of this.
+    let stopped = 'step budget spent';
+
     for (let i = 0; i < maxSteps; i++) {
-        if (bot.interrupt_code) break;
+        if (bot.interrupt_code) { stopped = 'interrupted'; break; }
         const p = bot.entity.position.floored();
-        if (targetY !== null) {
-            if (p.y >= targetY - 1) break;
-        } else {
-            const surf = nav.surfaceY(bot, p.x, p.z, 140, p.y + 1);
-            if (surf === null || p.y >= surf - 1) break;
+        let goalY = targetY;
+        if (goalY === null) {
+            // READ THE NEIGHBOURS TOO. `surfaceY` wants a cell that is standable WITH SOMETHING
+            // SOLID UNDER IT, searching only above the bot - and after the bot has mined its own
+            // column there is no such cell, because it removed every block a cell up there could
+            // stand on. The scan then returns null, which the routine read as "no surface, stop"
+            // and returned reporting success. Measured exiting at y=65, in a one-wide hole it
+            // had just dug, with open sky two blocks overhead.
+            goalY = nav.surfaceY(bot, p.x, p.z, 140, p.y + 1)
+                ?? nav.surfaceY(bot, p.x + 1, p.z, 140, p.y + 1)
+                ?? nav.surfaceY(bot, p.x - 1, p.z, 140, p.y + 1)
+                ?? nav.surfaceY(bot, p.x, p.z + 1, 140, p.y + 1)
+                ?? nav.surfaceY(bot, p.x, p.z - 1, 140, p.y + 1);
         }
+        if (goalY === null) {
+            // Every column around us is mined out too, so there is no surface to aim at - but
+            // that is not a reason to stand still at the bottom of the hole. Rise a bounded
+            // amount and let the next iteration re-read the world from higher up.
+            stopped = 'no surface in any neighbouring column';
+            const lifted = await climbShaftUp(bot, null, 4);
+            if (lifted < 0.5) break;
+            continue;
+        }
+        // `surfaceY` already returns the STANDABLE cell - the one whose feet are on top of the
+        // ground - so stopping a block below it was stopping a block short. On a slope that is
+        // close enough to be invisible; at the top of a one-wide shaft it is the difference
+        // between out and trapped, since the bot is then standing in a hole it cannot walk out
+        // of. The tower rung is what makes demanding the last block safe: before it, the last
+        // block was often unreachable and the tolerance was hiding that.
+        if (p.y >= goalY) { stopped = `reached y=${p.y} (surface ${goalY})`; break; }
 
         const [dx, dz] = dirs[dir % dirs.length];
         const ahead = new Vec3(p.x + dx, p.y, p.z + dz);
 
         // The block we will step onto has to exist. After mining its way along, the bot is often
         // standing in an open chamber of its own making with no wall in any direction - stairs
-        // are impossible there, so pillar straight up instead of spinning on the spot.
+        // are impossible there, so tower straight up instead of spinning on the spot.
+        // ONE PLACE THAT GIVES UP ON STAIRS. Turning away used to be written three times with
+        // three different bookkeeping rules, and only one of them counted a stall - so two of
+        // the three ways this loop fails could never reach the tower.
+        //
+        // A staircase needs BOTH a solid neighbour to step onto and somewhere to travel through.
+        // Sealed in a pocket it has the first and not the second, so it grinds sideways for the
+        // whole budget: measured at 90s for +2 blocks against a plug only 3 thick. Towering has
+        // no horizontal requirement, which is exactly why it is the right answer here.
+        const turn = async (reason) => {
+            dir++;
+            if (++stalls < dirs.length) return false;
+            stalls = 0;
+            const lifted = await climbShaftUp(bot, goalY, 8);
+            if (lifted < 0.5) { stopped = `${reason} and cannot tower`; return true; }
+            return false;
+        };
+
+        // The block we will step onto has to exist. After mining its way along, the bot is often
+        // standing in an open chamber of its own making with no wall in any direction - stairs
+        // are impossible there, so tower straight up instead of spinning on the spot.
         const stepBlock = bot.blockAt(ahead);
         if (!stepBlock || stepBlock.boundingBox !== 'block') {
-            if (++dir % dirs.length === 0) {
-                const lifted = await pillarUp(bot, 4);
-                if (lifted < 0.5) break;   // out of blocks or boxed in; nothing more to try
-            }
+            if (await turn('no wall to stair against')) break;
             continue;
         }
 
-        let mined = 0;
         for (const target of [ahead.offset(0, 1, 0), ahead.offset(0, 2, 0), new Vec3(p.x, p.y + 2, p.z)]) {
-            if (await digWithTool(bot, bot.blockAt(target))) mined++;
+            await digWithTool(bot, bot.blockAt(target));
         }
-        if (mined === 0 && stepBlock.boundingBox === 'block') { dir++; continue; }
+
+        // ASK THE WORLD WHETHER THE STEP IS CLEAR, do not infer it from how many blocks we
+        // mined. The old test turned away whenever `mined === 0` - which is also the GOOD case,
+        // where the way was already open and nothing needed breaking. The bot then span through
+        // all four headings without ever hopping, counted no stall, never reached the tower, and
+        // burned its entire 150-step budget in milliseconds: `climbOut: +4.0 to y=66.0 - step
+        // budget spent`, standing one block under the surface the whole time.
+        const clear = (b) => !b || b.boundingBox !== 'block';
+        const canStep = clear(bot.blockAt(ahead.offset(0, 1, 0)))
+            && clear(bot.blockAt(ahead.offset(0, 2, 0)))
+            && clear(bot.blockAt(new Vec3(p.x, p.y + 2, p.z)));
+        if (!canStep) {
+            if (await turn('cannot clear the way ahead')) break;
+            continue;
+        }
 
         const gained = await hopForward(bot, dx, dz, 1600);
-        if (gained < 0.5) dir++;   // no height gained: stairing into a wall, so turn
+        if (gained < 0.5) {
+            if (await turn('stairs stalled')) break;
+        } else stalls = 0;
     }
 
     const climbed = bot.entity.position.y - startY;
+    console.log(`[${bot.username ?? '?'}] climbOut: +${climbed.toFixed(1)} to `
+        + `y=${bot.entity.position.y.toFixed(1)} - ${stopped}`);
     log(bot, `Climbed ${climbed.toFixed(0)} blocks toward the surface (now y=${bot.entity.position.y.toFixed(0)}).`);
     return climbed;
 }
@@ -4791,7 +5107,7 @@ async function bridgeWayAhead(bot, dx, dz) {
 }
 
 /** Pick something sensible to bridge with from inventory, else a common block. */
-function pickBuildMaterial(bot) {
+export function pickBuildMaterial(bot) {
     const preferred = ['dirt', 'cobblestone', 'sandstone', 'sand', 'stone', 'netherrack', 'andesite'];
     const counts = world.getInventoryCounts(bot);
     for (const name of preferred) {
@@ -5055,15 +5371,13 @@ export async function buildFootingBelow(bot, maxPlaces = 3) {
         if (!mat) { why('nothing stackable in inventory'); break; }
         try { await bot.equip(mat, 'hand'); } catch (err) { why(`equip failed: ${err.message}`); break; }
 
-        try {
-            await bot.look(bot.entity.yaw, Math.PI / 2, true);   // face straight down
-            await bot.placeBlock(ref, new Vec3(0, 1, 0));
-            placed++;
-            why(`placed ${mat.name} on ${ref.position} (feet ${feet})`);
-        } catch (err) {
-            why(`placeBlock failed on ${ref.position}: ${err.message}`);
-            break;
-        }
+        // Through block_io for the same reason pillarUp is: `bot.placeBlock` reports a late
+        // confirmation as a failed placement, and this ran in water where the round trip is no
+        // faster. The block either appears or it does not, and the world says which.
+        const r = await blockIO.placeVerified(bot, ref, new Vec3(0, 1, 0));
+        if (!r.ok) { why(`place failed on ${ref.position}: ${r.why}`); break; }
+        placed++;
+        why(`placed ${mat.name} on ${ref.position} (feet ${feet})`);
         await new Promise((r) => setTimeout(r, 250));
     }
 
@@ -5075,15 +5389,29 @@ export async function pillarUp(bot, blocks = 1) {
     const { Vec3 } = await import('vec3');
     const stackable = STACKABLE;
     const startY = bot.entity.position.y;
+    // NAME THE RUNG THAT FAILED. This loop has five ways to give up and reported none of them,
+    // so every one of them surfaced to the caller as the single number 0 - indistinguishable
+    // from "there was a ceiling". Chasing `pillar did not lift me` against open sky cost a whole
+    // round of live testing that a one-line reason would have ended immediately.
+    let why = 'done';
 
     for (let i = 0; i < blocks; i++) {
-        if (bot.interrupt_code) break;
+        if (bot.interrupt_code) { why = 'interrupted'; break; }
         const mat = stackable.map(n => bot.inventory.items().find(it => it.name === n)).find(Boolean);
-        if (!mat) break;
-        try { await bot.equip(mat, 'hand'); } catch (err) { break; }
+        if (!mat) { why = 'nothing stackable in inventory'; break; }
+        try { await bot.equip(mat, 'hand'); } catch (err) { why = `equip failed: ${err.message}`; break; }
 
+        // SETTLE BEFORE MEASURING THE FLOOR. `onGround` is unusable here, so the only honest
+        // test of "am I standing" is that y has stopped changing - and a pillar step is nearly
+        // always entered straight out of a hop or a dig, with the body still falling. Measured
+        // at y=65.17: seventeen hundredths above the block face, which reads as NOT standing on
+        // it, so the floor check below failed and the jump was never even attempted.
+        await settleY(bot, 600);
         const below = bot.blockAt(bot.entity.position.offset(0, -1, 0));
-        if (!below || below.boundingBox !== 'block') break;
+        if (!below || below.boundingBox !== 'block') {
+            why = `nothing solid under my feet (${below?.name ?? 'void'} at y=${bot.entity.position.y.toFixed(2)})`;
+            break;
+        }
 
         // Wait for actual clearance instead of guessing a delay. A fixed sleep placed the block
         // while the bot was still inside the target cell, which silently fails - measured as
@@ -5091,25 +5419,181 @@ export async function pillarUp(bot, blocks = 1) {
         // here because the physics is running on stale collision data.
         const baseY = bot.entity.position.y;
         bot.setControlState('forward', false);   // drifting off the pillar loses the gain
+        // ASSERTED TAKE-OFF, not a key press. Every jump in prismarine-physics is gated on
+        // `entity.onGround`, which reads false for seconds at a time while the bot is provably
+        // standing - so `setControlState('jump')` alone fires nothing, and this loop measured
+        // `0 broken, 0 placed - pillar did not lift me` against OPEN SKY. JumpAssist asserts the
+        // flag for the take-off tick and lets the engine apply its own 0.42 impulse. Heading
+        // (0,0) because this is a vertical hop: the axial top-up then contributes exactly
+        // nothing, where any other heading would shove the bot off its own pillar.
+        //
+        // `noteOutcome` is deliberately NOT called here. It latches jumping dead for the session
+        // after three riseless flights, and a pillar can fail for reasons that say nothing about
+        // the jump mechanism - a ceiling, a full inventory, a placement the server refused.
+        // Only `jumpAcross`, which probes the terrain first, has earned the right to that verdict.
+        const assisted = bot.jumpAssist?.begin(0, 0) === true;
+        let apex = 0, placeErr = null;
         try {
             await bot.look(bot.entity.yaw, Math.PI / 2, true);   // face straight down
-            bot.setControlState('jump', true);
-            const deadline = Date.now() + 900;
-            while (Date.now() < deadline) {
-                await new Promise(r => setTimeout(r, 40));
-                if (bot.entity.position.y - baseY < 0.5) continue;
-                try { await bot.placeBlock(below, new Vec3(0, 1, 0)); } catch (err) { /* retry next block */ }
-                break;
+            if (!assisted) bot.setControlState('jump', true);
+            // PLACE ON THE WAY UP, not at the apex. Waiting for a full block of clearance was
+            // tried and is worse: the apex lasts about two ticks, and by the time the placement
+            // packet is written the body is back in the cell. A clean mineflayer bot placing at
+            // +0.5 on the way up succeeds 4/4 on this server, so 0.5 is the measured threshold,
+            // not a guess. Retry within the flight rather than spending the whole jump on one
+            // attempt - the window is several ticks wide and a single miss should not cost the
+            // block.
+            // `placeUnderfoot` owns the whole pillar placement: it waits for the body to leave
+            // the cell it is filling, snaps the look instead of turning smoothly, never awaits
+            // mineflayer's unsatisfiable ack, and retries inside the flight. See block_io.js -
+            // all three of those are separate mineflayer defects that only fail in combination.
+            const apexWatch = setInterval(() => {
+                apex = Math.max(apex, bot.entity.position.y - baseY);
+            }, 10);
+            let res;
+            try {
+                res = await blockIO.placeUnderfoot(bot, below, { windowMs: 900 });
+            } finally {
+                clearInterval(apexWatch);
             }
+            if (!res.ok) placeErr = `${res.why} after ${res.attempts} attempt(s)`;
         } catch (err) {
             // look/jump failed; the next iteration retries
         } finally {
+            // A leaked `active` flag mutes AutoJump permanently, which destroys the one-block
+            // step the whole navigator is built on.
+            if (assisted) bot.jumpAssist.end();
             bot.setControlState('jump', false);
         }
         await new Promise(r => setTimeout(r, 400));
-        if (bot.entity.position.y - baseY < 0.5) break;   // not rising: out of room or blocked
+        if (bot.entity.position.y - baseY < 0.5) {
+            // APEX SEPARATES THE TWO FAILURES, and they need opposite fixes. An apex near zero
+            // means the bot never left the ground - a take-off problem. An apex near 1.25 (the
+            // engine's own jump) means it flew fine and the PLACEMENT is what failed, so the bot
+            // simply fell back down the shaft it was trying to climb.
+            why = `did not rise from y=${baseY.toFixed(2)} (apex ${apex.toFixed(2)}, `
+                + `assisted=${assisted}, jumpAssist.disabled=${!!bot.jumpAssist?.disabled}`
+                + (placeErr ? `, place failed: ${placeErr}` : '') + ')';
+            break;
+        }
     }
-    return bot.entity.position.y - startY;
+    const gained = bot.entity.position.y - startY;
+    if (gained < 0.5) console.log(`[${bot.username ?? '?'}] pillarUp: +${gained.toFixed(2)} - ${why}`);
+    return gained;
+}
+
+/**
+ * Is ONE tower-up step - break the ceiling, place under the feet - safe and possible here?
+ *
+ * Pure, so every refusal is unit-testable (`tests/shaft.test.mjs`). The refusals matter more
+ * than the approvals: this routine mines the block directly over the bot's head, and the two
+ * ways that goes wrong are irreversible. Breaking into lava kills the bot AND its inventory,
+ * and breaking into water floods a sealed pocket the bot is standing at the bottom of.
+ *
+ * @param {object} ctx
+ * @param {string} ctx.above      block name at feet+2 - the ceiling. 'air' when already open.
+ * @param {boolean} ctx.hasBlocks something stackable is in the inventory
+ * @param {boolean} ctx.afloat    the bot is floating, not standing on something solid
+ * @returns {{ok: boolean, dig: boolean, falling: boolean, reason: string}}
+ */
+export function shaftUpVerdict(ctx) {
+    const above = ctx?.above ?? 'air';
+    const no = (reason) => ({ ok: false, dig: false, falling: false, reason });
+
+    // Placing does not work while floating, for the same reason pillaring does not - there is
+    // nothing under the feet to place against. Same invariant as the swim code.
+    if (ctx?.afloat) return no('afloat - cannot place a block under myself');
+    // Digging up without anything to stand on just makes a shaft the bot is still at the
+    // bottom of. That is strictly worse than not starting: it spends the ceiling for nothing.
+    if (!ctx?.hasBlocks) return no('nothing stackable to pillar with');
+    if (tools.isLavaName(above)) return no('lava overhead');
+    if (isWaterName(above)) return no('water overhead - breaking it would flood the shaft');
+    if (above === 'bedrock') return no('bedrock overhead');
+
+    const open = above === 'air' || above === 'cave_air' || above === 'void_air';
+    return {
+        ok: true,
+        dig: !open,
+        // Sand and gravel do not stay mined: the column above drops into the cell just cleared,
+        // so the caller has to keep breaking the SAME cell instead of moving up into it.
+        falling: !open && isFallingBlockName(above),
+        reason: open ? 'already open' : `break ${above}`,
+    };
+}
+
+/**
+ * Tower straight up out of a sealed pocket: break the block above the head, place one under the
+ * feet, repeat. What a player does when buried.
+ *
+ * `climbToSurface` cuts a diagonal STAIRCASE, which needs a solid neighbour to step onto and
+ * horizontal room to travel through; `pillarUp` places under the feet but requires headroom it
+ * cannot make for itself, so sealed under a ceiling it measures "not rising" on its first
+ * iteration and returns 0. Neither one breaks upward, so between them the bot could not leave a
+ * pocket whose only cheap exit was above it - the case that produced "Andy is stuck underground".
+ *
+ * Kept separate from `pillarUp` deliberately. `pillarUp`'s other callers are the night-shelter
+ * paths (`emergencyShelter`, `digOut`), where a ceiling is the POINT - teaching it to break
+ * through one would have the bot demolish the roof it just sealed itself under.
+ *
+ * @param {number|null} targetY stop once the feet reach this Y. Defaults to the surface.
+ * @returns {Promise<number>} height gained.
+ */
+export async function climbShaftUp(bot, targetY = null, maxSteps = 64) {
+    const startY = bot.entity.position.y;
+    const why = (m) => console.log(`[${bot.username ?? '?'}] shaftUp: ${m}`);
+
+    let target = targetY;
+    if (target === null) {
+        const p0 = bot.entity.position.floored();
+        target = nav.surfaceY(bot, p0.x, p0.z, 160, p0.y + 1);
+    }
+
+    let dug = 0, placed = 0, stop = 'reached target';
+    for (let i = 0; i < maxSteps; i++) {
+        if (bot.interrupt_code) { stop = 'interrupted'; break; }
+        const p = bot.entity.position.floored();
+        if (target !== null && p.y >= target) break;
+
+        const ceilPos = p.offset(0, 2, 0);
+        const below = bot.blockAt(p.offset(0, -1, 0));
+        const v = shaftUpVerdict({
+            above: bot.blockAt(ceilPos)?.name ?? 'air',
+            hasBlocks: hasBuildingBlocks(bot),
+            afloat: swim.inWater(bot) && !(below && below.boundingBox === 'block'),
+        });
+        if (!v.ok) { stop = v.reason; break; }
+
+        if (v.dig) {
+            // A falling column has to be cleared until it STAYS clear. Reading the cell once
+            // catches it in the moment between the block being broken and the sand above
+            // landing in its place, and the bot then pillars into a cell that refills onto its
+            // head. Two consecutive clear reads is the same "trust measured state" rule the
+            // shelter descent and the chest counts already use.
+            let cleared = false;
+            for (let t = 0; t < (v.falling ? 24 : 3); t++) {
+                const b = bot.blockAt(ceilPos);
+                if (!b || b.boundingBox !== 'block') {
+                    if (!v.falling) { cleared = true; break; }
+                    await new Promise(r => setTimeout(r, 300));
+                    const again = bot.blockAt(ceilPos);
+                    if (!again || again.boundingBox !== 'block') { cleared = true; break; }
+                    continue;
+                }
+                if (!(await digWithTool(bot, b))) break;
+                dug++;
+            }
+            if (!cleared) { stop = `could not clear ${bot.blockAt(ceilPos)?.name} at ${ceilPos}`; break; }
+        }
+
+        const gained = await pillarUp(bot, 1);
+        if (gained < 0.5) { stop = `pillar did not lift me (y=${bot.entity.position.y.toFixed(2)})`; break; }
+        placed++;
+    }
+
+    const climbed = bot.entity.position.y - startY;
+    why(`${climbed.toFixed(1)} blocks: ${dug} broken, ${placed} placed - ${stop}`);
+    if (placed) log(bot, `Towered up ${climbed.toFixed(0)} blocks (broke ${dug}, placed ${placed}).`);
+    return climbed;
 }
 
 /**

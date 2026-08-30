@@ -21,7 +21,21 @@ export class SelfPrompter {
         }
         this.state = ACTIVE;
         this.prompt = prompt;
+        this.persist();
         this.startLoop();
+    }
+
+    /**
+     * Write the loop's state to memory.json the moment it changes.
+     *
+     * `history.save()` records `self_prompt: isStopped() ? null : prompt`, so whether a restart
+     * finds a task at all depended on WHEN the last save happened to be taken. A save while the
+     * loop was momentarily down - `!endGoal` forces one - persisted null even though the goal
+     * record lived on, and the bot came back with nothing to resume. Saving on the transitions
+     * themselves makes the file track reality instead of sampling it.
+     */
+    persist() {
+        try { this.agent.history?.save?.(); } catch { /* a failed save must not kill the loop */ }
     }
 
     isActive() {
@@ -131,6 +145,7 @@ export class SelfPrompter {
             await this.agent.actions.stop();
         this.stopLoop();
         this.state = STOPPED;
+        this.persist();
     }
 
     async pause() {

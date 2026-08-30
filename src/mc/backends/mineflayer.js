@@ -25,32 +25,55 @@ import armorManagerPlugin from 'mineflayer-armor-manager';
 export function createMineflayerBot(options, hooks = {}) {
     const bot = createBot(options);
 
-    // Throttle position packets to avoid kicks on Paper/Spigot servers
-    // Paper enforces stricter packet rate limits than vanilla, causing ECONNRESET
-    // when mineflayer sends position updates faster than 50ms apart
+    // Throttle position packets to avoid kicks on Paper/Spigot servers.
+    // Paper enforces stricter packet rate limits than vanilla, causing ECONNRESET when
+    // mineflayer sends position updates faster than 50ms apart.
+    //
+    // COALESCE TO THE LATEST PACKET, NOT THE FIRST. The original captured `name`/`data` in the
+    // timer closure the moment the FIRST packet of a window was deferred, and every later packet
+    // in that window hit `if (!pendingPositionPacket)` and was dropped on the floor - so the
+    // comment "the last position update is never lost" described the opposite of the behaviour.
+    // What the server received 50ms later was a STALE position, which is worse than a dropped
+    // one: the server places blocks, and validates reach, against where it believes we are.
+    //
+    // That is not theoretical. `bot.placeBlock` sends its packet and then waits 500ms for a
+    // `blockUpdate` to confirm it (mineflayer/lib/plugins/place_block.js:13), throwing when none
+    // arrives. Inside the agent that throw was routine - `pillarUp` measured
+    // `apex 1.00 ... place failed: Event blockUpdate did not fire within timeout of 500ms`, i.e.
+    // the JUMP WORKED and the block never appeared - while a clean mineflayer bot on this same
+    // server, with no throttle, pillared 4/4 with apex 1.25. The stale position is the difference.
     let lastPositionUpdate = 0;
-    let pendingPositionPacket = null;
+    let pendingTimer = null;
+    let pendingName = null;
+    let pendingData = null;
     const POSITION_THROTTLE_MS = 50;
     const originalWrite = bot._client.write.bind(bot._client);
+    const flushPending = () => {
+        pendingTimer = null;
+        if (!pendingName) return;
+        lastPositionUpdate = Date.now();
+        const [n, d] = [pendingName, pendingData];
+        pendingName = pendingData = null;
+        originalWrite(n, d);
+    };
     bot._client.write = function (name, data) {
         if (name === 'position' || name === 'position_look' || name === 'look') {
             const now = Date.now();
             if (now - lastPositionUpdate < POSITION_THROTTLE_MS) {
-                // Queue this packet so the last position update is never lost
-                if (!pendingPositionPacket) {
-                    pendingPositionPacket = setTimeout(() => {
-                        pendingPositionPacket = null;
-                        lastPositionUpdate = Date.now();
-                        originalWrite(name, data);
-                    }, POSITION_THROTTLE_MS - (now - lastPositionUpdate));
+                // Always overwrite: the newest position is the only one worth sending.
+                pendingName = name;
+                pendingData = data;
+                if (!pendingTimer) {
+                    pendingTimer = setTimeout(flushPending,
+                        POSITION_THROTTLE_MS - (now - lastPositionUpdate));
                 }
                 return;
             }
             lastPositionUpdate = now;
-            if (pendingPositionPacket) {
-                clearTimeout(pendingPositionPacket);
-                pendingPositionPacket = null;
-            }
+            // A fresh packet supersedes anything queued; sending the stale one after it would
+            // teleport the server's view of us backwards.
+            if (pendingTimer) { clearTimeout(pendingTimer); pendingTimer = null; }
+            pendingName = pendingData = null;
         }
         return originalWrite(name, data);
     };

@@ -302,6 +302,9 @@ export class History {
                 self_prompt: this.agent.self_prompter.isStopped() ? null : this.agent.self_prompter.prompt,
                 taskStart: this.agent.task.taskStartTime,
                 last_sender: this.agent.last_sender,
+                // Survives the restart on purpose: it is the whole point of the reconnect
+                // policy that a person's last instruction outlives the process.
+                last_directive: this.agent.last_directive ?? null,
                 saved_places: this.agent.memory_bank.getJson(),
                 named_chests: getNamedChestsJson()
             };
@@ -327,6 +330,9 @@ export class History {
             this.loadStore(data.memory || '');
             this.memory = this.store.records.size ? this.store.render(getBudget().memory_chars)
                                                   : (data.memory || '');
+            // The last human instruction, restored BEFORE the reconnect message is built - it is
+            // what decides whether the bot resumes anything at all.
+            if (data.last_directive) this.agent.last_directive = data.last_directive;
             // Load saved places if available
             if (data.saved_places && this.agent.memory_bank) {
                 this.agent.memory_bank.loadJson(data.saved_places);

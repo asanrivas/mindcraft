@@ -3,6 +3,7 @@ import { Examples } from '../utils/examples.js';
 import { getCommandDocs } from '../agent/commands/index.js';
 import { SkillLibrary } from "../agent/library/skill_library.js";
 import { stringifyTurns } from '../utils/text.js';
+import { recordTurn } from '../utils/corpus.js';
 import { getCommand } from '../agent/commands/index.js';
 import settings from '../agent/settings.js';
 import { promises as fs } from 'fs';
@@ -338,8 +339,14 @@ export class Prompter {
         if (prompt.includes('$ACTION')) {
             prompt = prompt.replaceAll('$ACTION', this.agent.actions.currentActionLabel);
         }
-        if (prompt.includes('$COMMAND_DOCS'))
-            prompt = prompt.replaceAll('$COMMAND_DOCS', getCommandDocs(this.agent));
+        if (prompt.includes('$COMMAND_DOCS')) {
+            // Kept for the corpus writer so it can lift this block out of the stored prompt by
+            // exact match. Re-deriving it at log time would usually work, but `hidden_actions`
+            // makes getCommandDocs agent-state dependent, and a near-miss would silently store
+            // the docs inline on every record.
+            this._last_command_docs = getCommandDocs(this.agent);
+            prompt = prompt.replaceAll('$COMMAND_DOCS', this._last_command_docs);
+        }
         if (prompt.includes('$CODE_DOCS')) {
             const code_task_content = messages.slice().reverse().find(msg =>
                 msg.role !== 'system' && msg.content.includes('!newAction(')
@@ -534,6 +541,22 @@ export class Prompter {
     }
 
     async _saveLog(prompt, messages, generation, tag) {
+        // The corpus is independent of log_all_prompts: that flag governs the rotated debug
+        // dump, and the dataset must not disappear when someone turns down log verbosity.
+        if (settings.collect_corpus) {
+            recordTurn({
+                botName: this.agent.name,
+                tag,
+                prompt,
+                messages,
+                response: generation,
+                docs: this._last_command_docs,
+                docsMode: settings.command_docs_mode,
+                model: this.chat_model?.model_name,
+                onBackup: Boolean(this.chat_model?.on_backup),
+            });
+        }
+
         if (!settings.log_all_prompts)
             return;
         const timestamp = new Date().toISOString().replace(/[:.]/g, '-');

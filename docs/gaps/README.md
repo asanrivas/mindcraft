@@ -5,8 +5,11 @@ value each unlocks. Compiled 2026-08-22, after the swimming work made Andy morta
 ([SWIMMING.md](../SWIMMING.md), [WORLD_TOOLS.md](../WORLD_TOOLS.md)).
 
 **Ground rules for all plans** (the constraints that shaped everything else in this repo):
-- Protocol 775 vs mineflayer's 774: `onGround` lies, mineflayer-pathfinder cannot move the bot.
-  Build on primitives that work: walking, raw jumping, block reads, mining, **water physics**.
+- `onGround` lies and mineflayer-pathfinder's executor cannot move the bot. Build on
+  primitives that work: walking, raw jumping, block reads, mining, **water physics**.
+  (Corrected 2026-08-23: the original "protocol 775 vs 774" explanation was WRONG — the
+  server is natively 1.21.11 and there is no version skew; see CLAUDE.md "Movement". The
+  constraint stands, the stated cause was stale. Older plan headers below may still cite it.)
 - No cheat-code shortcuts: capabilities must work in survival without operator crutches.
 - Measure before tuning — every "the bot can't X" claim in this codebase that got measured
   turned out wrong or differently-shaped than assumed.
@@ -23,6 +26,18 @@ value each unlocks. Compiled 2026-08-22, after the swimming work made Andy morta
 | 5 | **Resource progression** | wood -> stone -> iron -> diamond autonomously | the pieces exist (`collectBlocks`, `craftRecipe`, `smeltItem`, `digDown`) but nothing sequences them; no ore-finding strategy; `getCraftingPlan` is informational only | [resource-progression.md](resource-progression.md) |
 | 7 | **Safe autonomy for `!newAction`** | doesn't need one — a human knows the recipe | free-form codegen: crashed the bot process live while trying to walk through a door the navigator handles | [playbooks.md](playbooks.md) |
 | 6 | **The Nether** | builds a portal, lights it, navigates hell terrain | zero portal/dimension logic; the navigator has never seen lava oceans or ceiling bedrock | [nether.md](nether.md) |
+
+## Gaps found 2026-08-29 (see [../OBEDIENCE.md](../OBEDIENCE.md) "Not done" for detail)
+
+| Gap | Andy today | Cost when it bites |
+|---|---|---|
+| **Descent executor stalls, model freelances** | `staircaseDown` returned `no descent progress` at Y=−45 (1 block dug in 4s, cause uninvestigated); the model then improvised `digDown`/`navTo` down INTO the bedrock layer and oscillated ~2h | a whole session burned; memory polluted with loop narration |
+| **No "below target Y" awareness** | nothing in `$STATS` or the mine report tells the model it is UNDER the layer it wants; it kept digging down toward a Y above its head | the freelancing above never self-corrects |
+| **`!buildStatus` blueprint paths unguessable** | model invents `"file.json"` — no query lists `blueprints/*.json` | command reliably called with a path that cannot exist |
+| **Transient junk in memory Locations** | `current@`, `nav_failures@` stored as places (cap 12) | stale episode state steers future navigation |
+| **Andy's memory store saturated** | 200/200 rows, 150 lessons, running on pre-fix code; evicting durable facts now | needs restart + `compact.mjs` pass (bob's is done) |
+| **Obedience harness unwired** | `scratchpad/obedience_ab.mjs` exists and runs, but nothing invokes it on description changes | description drift silently un-fixes command selection |
+| **llama-server has no wake/boot supervisor** | `run_llama.bat` restarts a crash, but a stopped task / sleeping box = silent failover to paid gemini | cloud spend, and nobody notices until `!stats` shows BACKUP |
 
 ## Gaps noted but NOT planned yet
 

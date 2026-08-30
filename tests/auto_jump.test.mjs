@@ -78,6 +78,31 @@ const tick = (bot) => { const aj = new AutoJump(bot); aj._tick(); return bot.con
     check('no headroom: no jump', tick(bot), false);
 }
 
+// --- AutoJump must stand down while a deliberate jump is in flight -----------------------------
+// JumpAssist asserts the ground flag and drives the arc; AutoJump's own timing logic would fight
+// it for the key mid-flight.
+{
+    const bot = fakeBot(new Vec3(10.5, 64, 10.5), [[11, 64, 10]]);   // a real step, would normally fire
+    check('a step normally fires', tick(bot), true);
+
+    const held = fakeBot(new Vec3(10.5, 64, 10.5), [[11, 64, 10]]);
+    held.jumpAssist = { active: true };
+    check('...but not while a jump is in flight', tick(held), false);
+}
+{
+    // AND IT MUST NOT RELEASE. Pressing `jump` false here would land on the take-off tick - the
+    // one tick in the whole flight that matters - and silently cancel every jump. The water bail
+    // has the same shape for the same reason: clear `holding`, touch nothing else.
+    const bot = fakeBot(new Vec3(10.5, 64, 10.5), [[11, 64, 10]]);
+    bot.jumpAssist = { active: true };
+    bot.controlState.jump = true;                 // JumpAssist is holding it
+    const aj = new AutoJump(bot);
+    aj.holding = 2;                               // ...and we believe we are mid-jump
+    aj._tick();
+    check('stands down without releasing the key', bot.controlState.jump, true);
+    check('...and forgets its own hold', aj.holding, 0);
+}
+
 // --- the sweep must match nav.js's body radius, or the two disagree about what fits ------------
 {
     const src = (await import('fs')).readFileSync(

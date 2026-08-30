@@ -1,4 +1,5 @@
 import { Vec3 } from 'vec3';
+import * as io from './container_io.js';
 import * as nav from './nav.js';
 
 /**
@@ -179,13 +180,61 @@ export function withTimeout(promise, ms, label) {
     ]);
 }
 
-const countItem = (bot, name) =>
-    bot.inventory.items().filter(i => i.name === name).reduce((s, i) => s + i.count, 0);
+/**
+ * The bot's own items, read through the OPEN WINDOW - never through `bot.inventory`.
+ *
+ * `bot.inventory` is a separate Window object (id 0) and mineflayer only refreshes it from the
+ * container window in `closeWindow` -> `copyInventory`
+ * (mineflayer/lib/plugins/inventory.js:412-417). **While a chest is open it therefore cannot
+ * change.** Every count in this file used to read it, which meant every deposit and every
+ * withdraw measured a number that was frozen before the operation started: `moved` came out 0
+ * however much actually moved.
+ *
+ * That is not a cosmetic reporting bug. `transferBetweenChests` builds its carry list from
+ * `moved`, so a perfectly good withdraw produced an empty list, the transfer aborted with
+ * "my inventory is full" - and the items it had genuinely pulled were left in the bag while
+ * the source chest really was emptied. Measured: 4 of 5 stacks out of the chest, 0 into the
+ * destination, and a message blaming a full inventory that had 30 free slots.
+ *
+ * The window's own view IS live: `slots[inventoryStart..inventoryEnd]` is the player's
+ * inventory as the server currently sees it, and `items()` / `emptySlotCount()` read exactly
+ * that range. Falls back to `bot.inventory` only when no window is open, which is the one
+ * moment `bot.inventory` is trustworthy.
+ */
+const bagItems = (bot, win) => (win ? win.items() : bot.inventory.items());
+const bagEmptySlots = (bot, win) => (win ? win.emptySlotCount() : bot.inventory.emptySlotCount());
+const countItem = (bot, name, win = null) =>
+    bagItems(bot, win).filter(i => i.name === name).reduce((s, i) => s + i.count, 0);
+
+/**
+ * Wait for the bag to stop changing, then report the count.
+ *
+ * `withTimeout` abandons its loser rather than cancelling it - mineflayer has no cancellation -
+ * so on the timeout path the clicks are still in flight and the acks are still arriving. Reading
+ * the count the instant the deadline fires measures the middle of the operation and reports
+ * "nothing moved" for a transfer that is most of the way done. Two consecutive equal readings
+ * separated by a tick is enough; the cap keeps a genuinely dead server bounded.
+ */
+async function settledCount(bot, name, win, ms = 1000) {
+    const deadline = Date.now() + ms;
+    let last = countItem(bot, name, win);
+    while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 100));
+        const now = countItem(bot, name, win);
+        if (now === last) return now;
+        last = now;
+    }
+    return last;
+}
 
 /** Close whatever is open, tolerating every way that can fail. Never throws. */
 export async function safeClose(bot, window = null) {
     const win = window ?? bot.currentWindow;
     if (!win) return;
+    // NEVER CLOSE HOLDING SOMETHING. The server drops whatever is on the cursor when a window
+    // closes, so a transfer that died mid-click used to scatter its items on the floor - the
+    // source chest emptied, the destination untouched, and an item entity on the ground.
+    try { if (win.selectedItem) await io.clearCursor(bot, win); } catch { /* best effort */ }
     try {
         await withTimeout(Promise.resolve(win.close ? win.close() : bot.closeWindow(win)), CLOSE_TIMEOUT_MS, 'close');
     } catch {
@@ -261,18 +310,58 @@ export function findContainers(bot, range = 32, count = 50) {
         return [];
     }
     const out = [];
+    const claimed = new Set();
     for (const pos of positions) {
         const block = bot.blockAt(pos);
         if (!block || !isOpenableContainer(block.name)) continue;
+        if (claimed.has(key3(pos))) continue;
+
+        // A DOUBLE CHEST IS ONE CONTAINER, NOT TWO. It is two block entities, and findBlocks
+        // returns both - so a pad with one single and one double chest reported "Found 3
+        // storage containers", listing the same 54-slot window twice at neighbouring
+        // coordinates. The model then treats it as two places to put things, and a person
+        // reading the list cannot tell which of the three is real.
+        const partner = doublePartner(bot, block);
+        if (partner) claimed.add(key3(partner.position));
+
         out.push({
             block,
             position: { x: pos.x, y: pos.y, z: pos.z },
-            type: block.name,
+            type: partner ? 'double chest' : block.name,
+            isDouble: !!partner,
+            otherHalf: partner ? { x: partner.position.x, y: partner.position.y, z: partner.position.z } : null,
             distance: Math.round(bot.entity.position.distanceTo(pos) * 10) / 10,
         });
     }
     out.sort((a, b) => a.distance - b.distance);
     return out;
+}
+
+const key3 = (p) => `${p.x},${p.y},${p.z}`;
+
+/**
+ * The other half of a double chest, or null for a single.
+ *
+ * Read from the block state rather than guessed from geometry: `type` is `single`/`left`/`right`
+ * and only a matching `facing` makes a pair, so two unrelated chests set side by side are still
+ * two containers. Checks all four horizontal neighbours instead of deriving the axis from
+ * `facing` - the mapping from facing to left/right side is easy to get backwards and produces a
+ * listing that is wrong only for half the orientations, which is worse than one that is wrong
+ * always. Fails to "single" on any missing data, which merely restores the old behaviour.
+ */
+export function doublePartner(bot, block) {
+    let props;
+    try { props = block.getProperties?.(); } catch { return null; }
+    if (!props || !props.type || props.type === 'single') return null;
+    const wantType = props.type === 'left' ? 'right' : 'left';
+    for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) {
+        const n = bot.blockAt(block.position.offset(dx, 0, dz));
+        if (!n || n.name !== block.name) continue;
+        let np;
+        try { np = n.getProperties?.(); } catch { continue; }
+        if (np && np.type === wantType && np.facing === props.facing) return n;
+    }
+    return null;
 }
 
 export function containerAt(bot, x, y, z) {
@@ -413,66 +502,43 @@ export async function withContainer(bot, target, fn, opts = {}) {
 // Verified transfers - every number reported here was measured, not requested
 // ---------------------------------------------------------------------------
 
-/** Deposit, and report what actually moved. Returns {moved, asked, reason}. */
+/**
+ * Deposit, and report what actually moved.
+ *
+ * The clicking is `container_io`, not mineflayer: `win.deposit` waits on a slot update the
+ * server never sends for a correct click, and strands items on the cursor when it gives up.
+ * See the header of that file for the three separate defects and how each was measured.
+ */
 export async function depositVerified(bot, opened, itemName, want = -1) {
     const win = opened.window;
-    const mine = bot.inventory.items().filter(i => i.name === itemName);
+    const mine = io.slotsIn(win, io.bagRange(win)).filter(e => e.item && e.item.name === itemName);
     if (mine.length === 0) return { moved: 0, asked: 0, reason: 'none_held' };
 
-    const held = mine.reduce((s, i) => s + i.count, 0);
+    const stackSize = mine[0].item.stackSize ?? 64;
+    const held = mine.reduce((n, e) => n + e.item.count, 0);
     const asked = want === -1 || want == null ? held : Math.min(want, held);
-    const stackSize = mine[0].stackSize ?? 64;
 
     const cap = capacityFor({ contents: win.containerItems(), totalSlots: opened.totalSlots, itemName, stackSize });
     if (!cap.canAccept) return { moved: 0, asked, reason: 'full' };
 
-    const before = countItem(bot, itemName);
-    let reason = 'ok';
-    try {
-        await withTimeout(win.deposit(mine[0].type, null, Math.min(asked, cap.freeUnits)), CLICK_TIMEOUT_MS, 'deposit');
-    } catch (e) {
-        // 'destination full' mid-transfer, or our own deadline. Either way the truth is in the
-        // inventory count below - a partial deposit is a real deposit.
-        reason = e.name === 'Timeout' ? 'timeout' : 'partial';
-        console.log(`[chest] deposit ${itemName}: ${e.message}`);
-    }
-    const moved = before - countItem(bot, itemName);
-    if (moved === 0 && reason === 'ok') reason = 'full';
-    return { moved, asked, reason };
+    const r = await io.moveItems(bot, win, { name: itemName, want: asked, direction: 'in', stackSize });
+    if (r.droppedCursor) console.log(`[chest] deposit ${itemName}: had to drop a held stack on the ground`);
+    return { moved: r.moved, asked, reason: r.moved > 0 && r.reason !== 'ok' ? 'partial' : r.reason };
 }
 
-/** Withdraw, and report what actually moved. Returns {moved, asked, reason}. */
+/** Withdraw, and report what actually moved. Same engine, other direction. */
 export async function withdrawVerified(bot, opened, itemName, want = -1) {
     const win = opened.window;
-    const contents = win.containerItems();
-    const sample = contents.find(i => i.name === itemName);
+    const sample = win.containerItems().find(i => i.name === itemName);
     if (!sample) return { moved: 0, asked: 0, reason: 'not_present' };
-
     const stackSize = sample.stackSize ?? 64;
-    const invPartialRoom = bot.inventory.items()
-        .filter(i => i.name === itemName)
-        .reduce((s, i) => s + Math.max(0, (i.stackSize ?? stackSize) - i.count), 0);
 
-    const plan = planWithdraw({
-        contents, itemName, want,
-        freeInvSlots: bot.inventory.emptySlotCount(),
-        invPartialRoom, stackSize,
-    });
-    if (plan.invFull) return { moved: 0, asked: plan.asked, reason: 'inventory_full' };
-
-    const before = countItem(bot, itemName);
-    let reason = 'ok';
-    try {
-        // One call for the whole amount: mineflayer's transfer already walks the source slots,
-        // and re-deriving slot numbers between clicks reads stale - the window mutates as we go.
-        await withTimeout(win.withdraw(sample.type, null, plan.total), CLICK_TIMEOUT_MS, 'withdraw');
-    } catch (e) {
-        reason = e.name === 'Timeout' ? 'timeout' : 'partial';
-        console.log(`[chest] withdraw ${itemName}: ${e.message}`);
-    }
-    const moved = countItem(bot, itemName) - before;
-    if (moved === 0 && reason === 'ok') reason = 'inventory_full';
-    return { moved, asked: plan.asked, reason, shortfall: plan.shortfall };
+    const r = await io.moveItems(bot, win, { name: itemName, want, direction: 'out', stackSize });
+    if (r.droppedCursor) console.log(`[chest] withdraw ${itemName}: had to drop a held stack on the ground`);
+    return {
+        moved: r.moved, asked: r.asked, shortfall: r.shortfall,
+        reason: r.moved > 0 && r.reason !== 'ok' ? 'partial' : r.reason,
+    };
 }
 
 /** One-line human explanation for a failed open/approach, used by every command. */

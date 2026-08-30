@@ -119,7 +119,7 @@ export const actionsList = [
     },
     {
         name: '!navTo',
-        description: 'Walk to exact coordinates you already know. Use this for any trip to a specific x y z; !travel is for heading off in a compass direction with no fixed destination. Climbs, bridges and digs its way there.',
+        description: 'Walk to exact coordinates you already know. Use this for any trip to a specific x y z; !travel is for heading off in a compass direction with no fixed destination. Climbs, bridges, digs and towers up its way there.',
         params: {
             'x': { type: 'int', description: 'target x' },
             'y': { type: 'int', description: 'target y' },
@@ -288,7 +288,7 @@ export const actionsList = [
     },
     {
         name: '!climbOut',
-        description: 'Cut a staircase up to the surface. Use when stuck underground in a cave or tunnel.',
+        description: 'Climb up to the surface from underground. Use when buried, sealed in, or stuck in a cave or tunnel.',
         perform: runAsAction(async (agent) => {
             const before = agent.bot.entity.position.y;
             const gained = await skills.climbToSurface(agent.bot);
@@ -365,6 +365,33 @@ export const actionsList = [
         }, false, 1)
     },
     {
+        // Hidden measurement harness. The agent could not pillar where a CLEAN mineflayer bot on
+        // this same server pillars perfectly (+4.00 blocks, apex 1.25, 4/4 placed) - so this runs
+        // the identical test from inside the agent, on the same ground, to find the difference.
+        name: '!pillarTest',
+        description: 'Pillar straight up n blocks and report the apex of each jump. Diagnostic.',
+        params: { 'blocks': { type: 'int', description: 'how many blocks to climb' } },
+        perform: runAsAction(async (agent, blocks) => {
+            const before = agent.bot.entity.position.y;
+            const gained = await skills.pillarUp(agent.bot, blocks);
+            const msg = `PILLAR TEST: +${gained.toFixed(2)} of ${blocks} requested, `
+                + `y ${before.toFixed(2)} -> ${agent.bot.entity.position.y.toFixed(2)}`;
+            console.log(msg);
+            return msg;
+        }, false, 2)
+    },
+    {
+        // Diagnostic, and hidden for the same reason !swimProbe is. The ENTIRE movement stack is
+        // a workaround for `onGround` reading false while the bot is standing - a fact that was
+        // observed many times and never explained, so every fix could only route around it.
+        name: '!groundProbe',
+        description: 'Measure what onGround actually reports while standing still. Diagnostic.',
+        perform: runAsAction(async (agent) => {
+            const { measureGround, formatGround } = await import('../library/ground_probe.js');
+            return formatGround(await measureGround(agent.bot, 3000));
+        }, false, 2)
+    },
+    {
         // Diagnostic. The whole water cost model in nav.js rests on a claim that the bot "barely
         // moves while swimming"; this is what settles it with numbers instead of a comment.
         name: '!swimProbe',
@@ -423,7 +450,8 @@ export const actionsList = [
             agent.bot.emit('idle');
             let msg = 'Agent stopped.';
             if (agent.self_prompter.isActive())
-                msg += ' Self-prompting still active.';
+                msg += ' Self-prompting still active - but it will NOT come back after a restart;'
+                    + ' say !goal again to restart it, or !endGoal to drop it for good.';
             return msg;
         }
     },
@@ -667,7 +695,8 @@ export const actionsList = [
             }
             skills.log(agent.bot, `Found ${containers.length} storage containers within ${searchRange} blocks:`);
             for (const c of containers.slice(0, 10)) {
-                skills.log(agent.bot, `  ${c.type} at (${c.position.x}, ${c.position.y}, ${c.position.z}) - ${c.distance} blocks away`);
+                const half = c.otherHalf ? ` + (${c.otherHalf.x}, ${c.otherHalf.y}, ${c.otherHalf.z})` : '';
+                skills.log(agent.bot, `  ${c.type} at (${c.position.x}, ${c.position.y}, ${c.position.z})${half} - ${c.distance} blocks away`);
             }
             if (containers.length > 10) {
                 skills.log(agent.bot, `  ... and ${containers.length - 10} more`);
@@ -881,7 +910,7 @@ export const actionsList = [
     },
     {
         name: '!fill',
-        description: 'Manually walk and place blocks (slow, can fail on rough terrain - prefer !serverFill). Takes only X/Z corners then a SINGLE y and a height: (blockType, x1, z1, x2, z2, y, height). This is NOT the vanilla /fill order.',
+        description: 'Walk and place blocks by hand (slow, can fail on rough terrain). Takes only X/Z corners then a SINGLE y and a height: (blockType, x1, z1, x2, z2, y, height). This is NOT the vanilla /fill order.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "dirt", "cobblestone").' },
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
@@ -899,7 +928,7 @@ export const actionsList = [
     },
     {
         name: '!buildBlueprint',
-        description: 'Hand-build a blueprint JSON block by block, flying to each position and placing by hand. Takes longer than !serverFill but leaves a survival-legal build.',
+        description: 'Hand-build a blueprint JSON block by block, flying to each position and placing by hand. Slow, but leaves a survival-legal build.',
         params: {
             'file': { type: 'string', description: 'Path to the placements JSON, relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
             'x': { type: 'int', description: 'World X of the blueprint origin (its local 0,0,0 min-corner).' },

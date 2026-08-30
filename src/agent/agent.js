@@ -4,6 +4,9 @@ import { Coder } from './coder.js';
 import { VisionInterpreter } from './vision/vision_interpreter.js';
 import { Prompter } from '../models/prompter.js';
 import { initModes } from './modes.js';
+import { difficultyName, installDifficultyField } from './difficulty.js';
+import { reconnectDirective, standDownIsCurrent, isStandDown } from './resume_policy.js';
+import { deixisVerdict } from './deixis.js';
 import { initBot } from '../utils/mcdata.js';
 import { containsCommand, commandExists, executeCommand, truncCommandMessage, isAction, takesOverBot, blacklistCommands } from './commands/index.js';
 import { ActionManager } from './action_manager.js';
@@ -16,6 +19,8 @@ import { handleTranslation, handleEnglishTranslation } from '../utils/translator
 import { addBrowserViewer } from './vision/browser_viewer.js';
 import { AutoJump } from './library/auto_jump.js';
 import { SwimAssist } from './library/swim_assist.js';
+import { JumpAssist } from './library/jump_assist.js';
+import { GroundTruth } from './library/ground_truth.js';
 import * as swim from './library/swim.js';
 import { serverProxy, sendOutputToServer } from './mindserver_proxy.js';
 import settings from './settings.js';
@@ -61,6 +66,9 @@ export function teleportVerdict({ jumped, sinceSpawnMs, expected = false, cheatO
 export class Agent {
     async start(load_mem=false, init_message=null, count_id=0) {
         this.last_sender = null;
+        // The last thing a HUMAN said, restored from memory.json below. Outranks `$MEMORY` on
+        // reconnect: a stored task must never outlive a spoken "stop".
+        this.last_directive = null;
         this.count_id = count_id;
         // Set before any packet can arrive: an unset value would make the grace-window check
         // NaN, which compares false, and the login teleport would be reported as an operator
@@ -69,6 +77,16 @@ export class Agent {
 
         // Initialize components with more detailed error handling
         this.actions = new ActionManager(this);
+
+        // MUST run before `new Prompter`, which constructs the model providers. LlamaCpp copies
+        // its params at construction (`this.params = { ...params }`), so a max_tokens still set
+        // to "auto" at that moment is frozen into the provider and reaches llama-server as the
+        // STRING "auto" - every request then 400s with `Field 'max_tokens': type must be number,
+        // but is string`, and the agent silently runs on its backup model forever. This used to
+        // sit after the Prompter (and after the name check), which is why the local model could
+        // not serve as the primary at all.
+        await applyContextBudget(settings, settings.profile);
+
         this.prompter = new Prompter(this, settings.profile);
         this.name = (this.prompter.getName() || '').trim();
         console.log(`Initializing agent ${this.name}...`);
@@ -82,11 +100,6 @@ export class Agent {
             return;
         }
         
-        // Probe the model's real context window and derive every context-sensitive limit from
-        // it before anything reads those limits. History in particular caches max_messages at
-        // construction, so this has to happen first.
-        await applyContextBudget(settings, settings.profile);
-
         this.history = new History(this);
         this.coder = new Coder(this);
         this.npc = new NPCContoller(this);
@@ -127,6 +140,8 @@ export class Agent {
 
         console.log(this.name, 'logging into minecraft...');
         this.bot = initBot(this.name);
+        // IMMEDIATELY, in the same synchronous block as the bot's construction - see the method.
+        this._wireDifficulty();
 
         initModes(this);
 
@@ -181,6 +196,9 @@ export class Agent {
                 // jump early enough that the bot is still moving when it leaves the ground.
                 this.auto_jump = new AutoJump(this.bot);
                 this.auto_jump.enable();
+                // Exposed so JumpAssist and the navigator can coordinate with it - AutoJump has
+                // to stand down while a deliberate jump is in flight, or it fights for the key.
+                this.bot.autoJump = this.auto_jump;
 
                 // Owns the jump key while the bot is wet (jump is buoyancy in water, not
                 // propulsion) and restores the sprint-swim speed the physics library omits.
@@ -188,6 +206,26 @@ export class Agent {
                 this.swim_assist = new SwimAssist(this.bot);
                 this.swim_assist.enable();
                 this.bot.swimAssist = this.swim_assist;
+
+                // Deliberate jumps - gaps and standstill steps. `onGround` reads false here, so
+                // the engine never fires a jump at all (measured: apex 0.00 against vanilla's
+                // 1.25); JumpAssist asserts the flag for the take-off tick and sustains the
+                // run-up. Carries its own forcedMove valve, so a server that objects degrades
+                // the bot to bridging rather than getting it kicked.
+                this.jump_assist = new JumpAssist(this.bot);
+                this.jump_assist.enable();
+                this.bot.jumpAssist = this.jump_assist;
+
+                // THE ROOT CAUSE, not another workaround. prismarine-physics derives `onGround`
+                // from whether a downward velocity survived into the move, and this server's
+                // position corrections zero that velocity - so a bot standing flush on stone is
+                // reported airborne, and the engine then withholds BOTH jumping and ground
+                // acceleration. GroundTruth recomputes the flag from the world. Installed AFTER
+                // JumpAssist so that when both fire on one tick the cheaper, always-on answer
+                // is already in place.
+                this.ground_truth = new GroundTruth(this.bot);
+                this.ground_truth.enable();
+                this.bot.groundTruth = this.ground_truth;
 
                 console.log('Initializing vision intepreter...');
                 this.vision_interpreter = new VisionInterpreter(this, settings.allow_vision);
@@ -327,11 +365,65 @@ export class Agent {
             bannedFood: ["rotten_flesh", "spider_eye", "poisonous_potato", "pufferfish", "chicken"]
         };
 
-        if (save_data?.self_prompt) {
+        // Decide what "reconnected" means from STATE, not by asking the model to work it out
+        // from `$MEMORY`. `settings.init_message` used to say "check your MEMORY for an
+        // unfinished task and resume it", which is an invitation to invent one out of location
+        // notes - and no amount of a person saying "stop" beforehand could outvote it.
+        const goalRecord = this.history.store?.get?.('goal') ?? null;
+        const standDown = standDownIsCurrent({
+            lastDirective: this.last_directive,
+            goalUpdated: goalRecord?.updated ?? null,
+        });
+        if (init_message) {
+            init_message = reconnectDirective({
+                goal: this.history.store?.goal?.() ?? null,
+                selfPrompt: save_data?.self_prompt ?? null,
+                lastDirective: this.last_directive,
+                goalUpdated: goalRecord?.updated ?? null,
+            });
+            console.log(`[${this.name}] reconnect: ${init_message}`);
+        }
+
+        // THE AGENT RESTARTS ITS OWN LOOP. It must not delegate that to the model.
+        //
+        // The reconnect message used to end "resume exactly that with !goal(...)", and for a
+        // USER-AUTHORED goal that instruction cannot succeed: `!goal` from the model is refused
+        // outright - `Kept the existing goal: ... (user goal)` - and the refusal path never
+        // reaches `self_prompter.start`. Caught by the control half of the reconnect test: the
+        // model obeyed, emitted `!goal("count to ten out loud")`, and the loop never started.
+        // The one case where resuming matters most is exactly the case where asking the model
+        // to do it cannot work.
+        //
+        // `save_data.self_prompt` is not a reliable signal on its own either. It is written as
+        // `isStopped() ? null : prompt`, so any save taken while the loop happens to be down -
+        // and `!endGoal` forces one - persists null while the goal RECORD lives on. So fall
+        // back to the goal record, which is the durable statement of what a person asked for.
+        const resumeTask = (!standDown)
+            ? (save_data?.self_prompt || this.history.store?.goal?.() || null)
+            : null;
+
+        if (resumeTask) {
             if (init_message) {
                 this.history.add('system', init_message);
             }
-            await this.self_prompter.handleLoad(save_data.self_prompt, save_data.self_prompting_state);
+            if (save_data?.self_prompt) {
+                await this.self_prompter.handleLoad(save_data.self_prompt, save_data.self_prompting_state);
+            } else {
+                console.log(`[${this.name}] reconnect: restarting the self-prompt loop from the `
+                    + `goal record ("${resumeTask}") - no live loop was persisted.`);
+                this.self_prompter.start(resumeTask);
+            }
+        }
+        else if (save_data?.self_prompt && standDown) {
+            // THE LOOP IS THE TEETH. Telling the model not to resume is not enough: `!stop`
+            // leaves self-prompting running by design ("Agent stopped. Self-prompting still
+            // active."), the loop is persisted, and `handleLoad` restarts it on the next boot -
+            // which is the bot carrying on with the old task no matter what the prompt says.
+            // The goal RECORD is left alone: deleting a user-authored goal is `!endGoal`'s
+            // authority, not something a fuzzy text match should do behind the user's back.
+            console.log(`[${this.name}] reconnect: not restarting the self-prompt loop `
+                + `("${this.last_directive?.text}" from ${this.last_directive?.from} stands). `
+                + `Goal record left intact; say !goal to start again.`);
         }
         if (save_data?.last_sender) {
             this.last_sender = save_data.last_sender;
@@ -402,6 +494,19 @@ export class Agent {
         const self_prompt = source === 'system' || source === this.name;
         const from_other_bot = convoManager.isOtherAgent(source);
 
+        // REMEMBER THE LAST THING A PERSON SAID, and persist it. On reconnect it outranks
+        // anything in memory - see resume_policy.js for the bug that made this necessary.
+        // Only humans: a system prompt is our own words coming back, and another bot's chatter
+        // is not an instruction.
+        if (!self_prompt && !from_other_bot) {
+            this.last_directive = { from: source, text: String(message).trim(), at: Date.now() };
+            // Persist a stand-down IMMEDIATELY. The ordinary save at the bottom of this method
+            // is never reached for a message that is a command - `!stop` returns from the
+            // forced-command branch above it - and "!stop, then restart" is precisely the case
+            // this whole mechanism exists for. Rare enough that the extra write costs nothing.
+            if (isStandDown(this.last_directive.text)) this.history.save();
+        }
+
         if (!self_prompt && !from_other_bot) { // from user, check for forced commands
             const user_command_name = containsCommand(message);
             if (user_command_name) {
@@ -450,6 +555,18 @@ export class Agent {
 
         // Handle other user messages
         await this.history.add(source, message);
+
+        // Resolve "here". A player message carries no coordinates, and the model only sees
+        // the bot's OWN position - so "build hut here" from 100 blocks away got coordinates
+        // invented near the bot (and then a 2.3M-block garbled !fill, 2026-08-29). When the
+        // message points at the speaker, hand the model their real position; when their
+        // entity is not visible, say so explicitly rather than let it guess. Humans only:
+        // system text is our own words, and another bot's "here" is its own problem.
+        if (!self_prompt && !from_other_bot) {
+            const speakerPos = this.bot?.players?.[source]?.entity?.position ?? null;
+            const note = deixisVerdict(source, message, speakerPos);
+            if (note) await this.history.add('system', note);
+        }
         this.history.save();
 
         if (!self_prompt && this.self_prompter.isActive()) // message is from user during self-prompting
@@ -616,6 +733,36 @@ export class Agent {
      * correction nudges the bot; a teleport moves it far in a single packet. Only distance
      * separates them.
      */
+    /**
+     * Repair mineflayer's difficulty reporting, before anything can read it.
+     *
+     * `lib/plugins/game.js` assigns the field with `if (packet.difficulty)` - and PEACEFUL IS
+     * ZERO, which is falsy. So on a Peaceful world the login packet never sets it and
+     * `bot.game.difficulty` reads `undefined` forever. Every guard written against it then fails
+     * OPEN: `mode:night_safety`'s Peaceful check saw `undefined`, concluded the world was
+     * dangerous, and dug the bot in for the night - cancelling a user's marathon 12 seconds
+     * after it started.
+     *
+     * **This must be wired at CONSTRUCTION, not in `startEvents()`.** It was, and that is why
+     * the first fix did not work: `startEvents()` runs from the `spawn` handler, by which time
+     * the `login` and `difficulty` packets have long since been dispatched, so the listener
+     * could never fire. The mode kept digging in on a Peaceful world, and the only thing that
+     * ever set the field was a human running `/difficulty` afterwards. Registered here, in the
+     * same synchronous block as `initBot`, no packet can have been handled yet.
+     */
+    _wireDifficulty() {
+        // Both rules live in `difficulty.js`, with the measurements behind them, and are unit
+        // tested there - a live check can only ever exercise whichever world you happen to be on.
+        const setDifficulty = (packet) => {
+            const name = difficultyName(packet?.difficulty);
+            if (!name || !this.bot.game) return;
+            installDifficultyField(this.bot.game);
+            this.bot.game.difficulty = name;
+        };
+        this.bot._client.on('login', setDifficulty);
+        this.bot._client.on('difficulty', setDifficulty);
+    }
+
     _wireTeleportDetection() {
         // Sampled every physics tick, so at forcedMove time it holds the position from at most
         // ~50ms ago - under a block of ordinary movement, and far below the threshold.
@@ -787,25 +934,6 @@ export class Agent {
                 }
             }
         });
-        // Repair mineflayer's difficulty reporting before anything reads it.
-        //
-        // `lib/plugins/game.js` sets the field with `if (packet.difficulty)` - and PEACEFUL IS
-        // ZERO, which is falsy. So on a Peaceful server the login packet never assigns it and
-        // `bot.game.difficulty` stays `undefined` forever. Every check written against it
-        // silently fails open: `mode:night_safety`'s Peaceful guard read `undefined`, decided
-        // the world was dangerous, and dug the bot in for the night - cancelling a user's
-        // marathon 12 seconds after it started.
-        //
-        // The later `difficulty` packet handler has no such guard, so this only bites when the
-        // world was already Peaceful when the bot logged in - which is the common case.
-        const DIFFICULTIES = ['peaceful', 'easy', 'normal', 'hard'];
-        const setDifficulty = (packet) => {
-            if (packet?.difficulty == null) return;      // == null: absent, but 0 is valid
-            this.bot.game.difficulty = DIFFICULTIES[packet.difficulty] ?? this.bot.game.difficulty;
-        };
-        this.bot._client.on('login', setDifficulty);
-        this.bot._client.on('difficulty', setDifficulty);
-
         this.bot.on('idle', () => {
             // Not while wet. SwimAssist owns the jump key whenever the bot is in water - that
             // key is its buoyancy, not a movement input - and clearing it here drops the bot

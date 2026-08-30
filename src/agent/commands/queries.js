@@ -42,6 +42,15 @@ export const queryList = [
                 // ground acceleration, and the bot sits at vel=0 with the keys held.
                 res += ` [physics.isInWater=${bot.entity.isInWater} vel.y=${bot.entity.velocity.y.toFixed(3)}]`;
             }
+            // Jumping, but ONLY once it has been disabled or is mid-flight - the same rule the
+            // water line follows, so the ordinary prompt costs nothing. "The bot will not jump"
+            // is otherwise undiagnosable from outside: a tripped anti-cheat valve and a bot that
+            // simply never met a gap look identical.
+            const ja = bot.jumpAssist;
+            if (ja && (ja.disabled || ja.active)) {
+                res += `\n- Jump: ${ja.disabled ? 'DISABLED (server corrections)' : 'in flight'}`
+                     + ` [jumps=${ja.stats.jumps} failures=${ja.stats.failures}]`;
+            }
             let weather = "Clear";
             if (bot.rainState > 0)
                 weather = "Rain";

@@ -68,6 +68,73 @@ export function recordId(kind, key) {
 /** Kinds whose lines are prose, not name/value pairs - rendered without a key. */
 const PROSE_KINDS = new Set([KIND.LESSON, KIND.NOTE]);
 
+/** Words that carry no identity in a lesson; dropped before comparing two of them. */
+const PROSE_STOPWORDS = new Set(('a an the and or but if then than that this these those is are was were be been being '
+    + 'do does did doing get gets got getting can could should would will just also very more most any all some '
+    + 'to of in on at by for with from into onto up down out off over under again once here there when while '
+    + 'it its your you i we they them he she him her my our their as so not no nor only own same too s t don now')
+    .split(' '));
+
+/**
+ * Identity for a PROSE record (a lesson or a note).
+ *
+ * `normalizeKey` folds punctuation and plurals, which is enough for a name like "Coal ore" but
+ * not for a sentence: every re-summarisation rewords it, so the key differs and a new row is
+ * minted. Measured on a live bot, 90 of 101 stored rows were lessons and they were paraphrases
+ * of four facts - six spellings of "on reconnect read memory first, then resume unfinished
+ * task", six of "non-terminating code is killed at 10s", four of "hold position when the target
+ * is offline". Only 10 ever render, so the other 80 were dead weight waiting to evict the
+ * locations.
+ *
+ * So identity is the SET of content words, order and wording ignored:
+ *   - a leading label is dropped ("**Drop Loops**: navTo fails..." and "**Nav Failures**:
+ *     navTo fails..." were two rows with identical bodies);
+ *   - stopwords and punctuation go;
+ *   - what remains is sorted, so a reordered clause is the same lesson.
+ *
+ * @param {string} text
+ * @returns {string[]} sorted content words
+ */
+export function proseTokens(text) {
+    const withoutLabel = String(text ?? '').replace(/^\s*\*{0,2}[^:*\n]{1,40}\*{0,2}:\s+/, '');
+    return [...new Set(withoutLabel
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]+/g, ' ')
+        .split(/\s+/)
+        .map(w => w.replace(/s$/, ''))
+        // A bare digit is kept: numbers are usually the IDENTITY of a lesson ("killed at 10s",
+        // "Y=-58", "240-min"), and dropping them made "fact number 0" and "fact number 5" the
+        // same sentence.
+        .filter(w => w && (w.length > 1 || /[0-9]/.test(w)) && !PROSE_STOPWORDS.has(w)))].sort();
+}
+
+/**
+ * Jaccard overlap of two prose token sets. 1 = the same sentence reworded, 0 = unrelated.
+ * @returns {number}
+ */
+export function proseSimilarity(a, b) {
+    if (!a.length || !b.length) return 0;
+    const B = new Set(b);
+    let shared = 0;
+    for (const w of a) if (B.has(w)) shared++;
+    return shared / (a.length + b.length - shared);
+}
+
+/**
+ * Two lessons this similar are the same lesson. Tuned against the 90 real rows above: 0.6
+ * collapses the paraphrase families without merging distinct lessons - the nearest unrelated
+ * pair in that set scores well below it. Raising it lets duplicates back in; lowering it starts
+ * merging lessons that only share vocabulary.
+ */
+const PROSE_DUPLICATE_AT = 0.6;
+
+/**
+ * Below this many content words a sentence carries too little signal to fold safely - two short
+ * lessons that share a word or two would score as identical. Short rows are cheap; a duplicate
+ * of one costs far less than silently merging two distinct lessons.
+ */
+const PROSE_MIN_TOKENS = 5;
+
 /**
  * Collapse a key to its identity, so re-summarising updates a fact instead of duplicating it.
  *
@@ -142,9 +209,27 @@ export class MemoryStore {
         // on the normalised value - two different keys can carry one fact ("Coal" / "Coal ore").
         if (kind !== KIND.GOAL) {
             const nk = normalizeKey(k), nv = normalizeValue(value);
+            let folded = false;
             for (const r of this.records.values()) {
                 if (r.kind !== kind) continue;
-                if (normalizeKey(r.key) === nk || (nv && normalizeValue(r.value) === nv)) { k = r.key; break; }
+                if (normalizeKey(r.key) === nk || (nv && normalizeValue(r.value) === nv)) { k = r.key; folded = true; break; }
+            }
+            // A lesson survives rewording, so exact-match folding never catches it. Compare
+            // content-word SETS and treat a close enough match as the same lesson - otherwise
+            // every summarisation mints one more spelling of a fact already recorded.
+            if (!folded && PROSE_KINDS.has(kind)) {
+                const tokens = proseTokens(value);
+                if (tokens.length >= PROSE_MIN_TOKENS) {
+                    let best = null, bestScore = 0;
+                    for (const r of this.records.values()) {
+                        if (r.kind !== kind) continue;
+                        const other = proseTokens(r.value);
+                        if (other.length < PROSE_MIN_TOKENS) continue;
+                        const score = proseSimilarity(tokens, other);
+                        if (score > bestScore) { best = r; bestScore = score; }
+                    }
+                    if (best && bestScore >= PROSE_DUPLICATE_AT) k = best.key;
+                }
             }
         }
 
@@ -351,8 +436,30 @@ export class MemoryStore {
         this.pending.push(entry);
     }
 
-    /** Cap total rows. User rows are never evicted; oldest agent rows go first. */
+    /**
+     * Cap rows. User rows are never evicted; oldest agent rows go first.
+     *
+     * PER-KIND caps are enforced here and not only at render. They used to bound the render
+     * alone, so a bot in a stuck loop kept minting lessons that were stored forever and never
+     * shown: 90 of 101 live rows were lessons, 10 of which rendered. The global cap then evicts
+     * the OLDEST agent rows - the durable, hard-won facts - to make room for the newest noise.
+     * Bounding each kind at its own cap means a runaway section can only ever crowd out itself.
+     */
     _evict() {
+        for (const [kind, cap] of Object.entries(KIND_CAPS)) {
+            const rows = [...this.records.values()]
+                .filter(r => r.kind === kind && r.origin === ORIGIN.AGENT)
+                // Least-REINFORCED first, then oldest. Recency alone hands the section to
+                // whatever the bot is currently looping on: a stuck bot narrates its loop every
+                // summarisation, so the newest rows are all one bad episode - including things
+                // that are simply false ("Successfully broke bedrock at Y:-62"). A lesson the
+                // summariser has restated across separate episodes has been folded onto that
+                // many times, so `revision` counts how often it was independently re-learned.
+                .sort((a, b) => (a.revision - b.revision) || (a.updated - b.updated));
+            const userRows = [...this.records.values()].filter(r => r.kind === kind && r.origin !== ORIGIN.AGENT).length;
+            let over = rows.length + userRows - cap;
+            while (over-- > 0 && rows.length) this.records.delete(rows.shift().id);
+        }
         if (this.records.size <= this.maxRecords) return;
         const agentRows = [...this.records.values()]
             .filter(r => r.origin === ORIGIN.AGENT)

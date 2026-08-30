@@ -2,6 +2,7 @@ import * as skills from "./library/skills.js";
 import { isFallingBlockName } from "./library/tools.js";
 import * as swim from "./library/swim.js";
 import * as night from "./library/night.js";
+import { isPeaceful } from "./difficulty.js";
 import * as nav from "./library/nav.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
@@ -422,6 +423,10 @@ const modes_list = [
         active: false,
         cooldownUntil: 0,
         sheltered: null,
+        // Consecutive failed shelter attempts, and whether we have given up for tonight.
+        // Both reset at dawn - see the dig-out branch.
+        failures: 0,
+        gaveUp: false,
         update: async function (agent) {
             const bot = agent.bot;
             if (Date.now() < this.cooldownUntil) return;
@@ -429,7 +434,19 @@ const modes_list = [
 
             const t = bot.time.timeOfDay;
 
-            // Dawn: break out of last night's hole.
+            // Dawn: break out of last night's hole, and forget last night's failures.
+            //
+            // The reset is gated on FULL DAYLIGHT, not merely `!isNight`. The two predicates do
+            // not partition the day: `isNight` starts at 13000 while `isDuskApproaching` starts
+            // 600 ticks earlier, so the dusk window is "not night" AND "time to shelter". A
+            // reset on `!isNight` alone therefore cleared the counter on every tick of exactly
+            // the window in which the mode is trying and failing - measured as 35 attempts in
+            // 110 seconds, with the give-up never latching.
+            const daylight = !night.isNight(t) && !night.isDuskApproaching(t);
+            if (daylight) {
+                this.failures = 0;
+                this.gaveUp = false;
+            }
             if (!night.isNight(t) && this.sheltered) {
                 const seal = this.sheltered;
                 this.sheltered = null;
@@ -446,7 +463,7 @@ const modes_list = [
             //
             // Deliberately AFTER the dawn dig-out above: a bot that sealed itself in while the
             // world was on Normal must still be let out if the difficulty is lowered overnight.
-            if (String(bot.game?.difficulty ?? '').toLowerCase() === 'peaceful') return;
+            if (isPeaceful(bot.game)) return;
 
             // A HUMAN IS ONLINE AND AWAKE: do not dig in.
             //
@@ -485,18 +502,45 @@ const modes_list = [
                 .find(e => e && mc.isHostile(e));
             if (hostile) { this.cooldownUntil = Date.now() + 8000; return; }
 
+            // GIVE UP FOR THE NIGHT rather than retrying until dawn.
+            //
+            // A flat 20s cooldown on failure is not a backoff, it is a metronome: the mode
+            // interrupts every action in the agent, so on ground it cannot shelter on - bare
+            // stone, no pickaxe, nothing to place - it cancelled whatever the bot was doing
+            // three times a minute, all night. Observed exactly that during the chest work.
+            // Nothing about the ground or the inventory changes while the bot stands still, so
+            // the third identical failure is evidence, not bad luck.
+            if (this.gaveUp) return;
+
             execute(this, agent, async () => {
                 const outcome = await skills.nightRoutine(bot, this);
                 say(agent, outcome);
-                if (/could not|cannot/i.test(outcome)) {
-                    // Hopeless right now (no bed, nothing to dig, bare stone): back off rather
-                    // than re-firing every tick and pinning currentActionLabel.
-                    this.cooldownUntil = Date.now() + 20000;
+                if (/could not|cannot|nowhere/i.test(outcome)) {
+                    this.failures++;
+                    if (this.failures >= 3) {
+                        this.gaveUp = true;
+                        // Console as well as chat, and named: this is the line that explains why
+                        // the bot spent a night in the open, and `say` only reaches Minecraft
+                        // chat - which is not where anyone debugs a mode from.
+                        console.log(`[${agent.name}] night_safety: giving up for tonight after `
+                            + `3 failed attempts (${outcome.trim()})`);
+                        say(agent, `I cannot shelter here tonight; carrying on in the open.`);
+                        return;
+                    }
+                    // Escalating, so a transient failure (a mob wandered past the spot) still
+                    // gets a prompt second try while a permanent one stops costing actions.
+                    this.cooldownUntil = Date.now() + [20000, 60000][this.failures - 1];
+                } else {
+                    this.failures = 0;
                 }
             }, 3);   // 3 minutes, never -1
         },
         unpause: function () {
             this.cooldownUntil = 0;
+            // An explicit unpause is a person putting the mode back in charge; that is new
+            // information, so last night's "I cannot shelter here" no longer stands.
+            this.failures = 0;
+            this.gaveUp = false;
         },
     },
     {
@@ -522,8 +566,13 @@ const modes_list = [
     {
         name: "item_collecting",
         description:
-            "Collect nearby items when idle or when items are dropped.",
-        interrupts: ["action:followPlayer", "action:!stop", "action:!stayHere"],
+            "Collect nearby items when idle.",
+        // ONLY WHEN NOT BUSY. `action:followPlayer` used to be in this list, so a single dropped
+        // item within 3 blocks ended a follow outright - and mining drops items constantly, so
+        // the bot interrupted itself on its own output. What is left are the two actions whose
+        // whole purpose is to stand still: those are idleness with a name, and picking things up
+        // during them is the point of them.
+        interrupts: ["action:!stop", "action:!stayHere"],
         on: true,
         active: false,
 
@@ -539,12 +588,21 @@ const modes_list = [
             );
             let empty_inv_slots = agent.bot.inventory.emptySlotCount();
 
-            // More aggressive item collection - interrupt more actions when items are very close
             const distance = item
                 ? agent.bot.entity.position.distanceTo(item.position)
                 : 999;
-            const is_very_close = distance < 3; // items within 3 blocks are considered "given" items
-            const can_interrupt = agent.isIdle() || is_very_close;
+            // Still used to shorten the wait and to speak up: an item dropped at the bot's feet
+            // is almost always a person handing it something, and should not sit for 1.5s.
+            const is_very_close = distance < 3;
+            // PROXIMITY IS NOT PERMISSION. This was `agent.isIdle() || is_very_close`, which let
+            // any item within 3 blocks preempt a running action - the "more aggressive" comment
+            // that used to sit here was describing the bug. The mode framework already gates
+            // `update()` on `isIdle() || interruptible` (see runAll), and `interrupts` above is
+            // now only the stand-still actions, so this states the same rule rather than widening
+            // it: pick up when there is nothing else to do.
+            const standingStill = agent.actions.currentActionLabel === 'action:!stop'
+                || agent.actions.currentActionLabel === 'action:!stayHere';
+            const can_interrupt = agent.isIdle() || standingStill;
 
             if (
                 item &&
@@ -639,7 +697,29 @@ const modes_list = [
     {
         name: "elbow_room",
         description: "Move away from nearby players when idle.",
-        interrupts: ["action:followPlayer"],
+        // IDLE MEANS IDLE. This used to carry `interrupts: ["action:followPlayer"]`, and on
+        // 2026-08-30 that stopped a follow dead. Log times below are UTC (the service log is
+        // UTC while this host is +0800 - worth remembering before concluding an event is old):
+        //
+        //   16:32:51  pinned: pos=(4744.5, 65.50, 4810.7)        <- stuck in sand
+        //   16:32:52  mode:elbow_room interrupts action:followPlayer
+        //   16:32:52  dig sand at (4744, 65, 4811): Digging aborted   <- the recovery, cancelled
+        //   16:32:52  pinned: nothing worked - recentring
+        //   16:32:55  mode:elbow_room interrupts action:followPlayer  (third time in 16s)
+        //   16:32:57  follow resumes, target now out of entity range, refuses
+        //   ...and the bot then stood on that block, motionless, until it was restarted.
+        //
+        // Three faults compounded. Being 0.5 blocks from the person you are FOLLOWING is the
+        // goal state, not a problem to fix. The remedy - shuffle half a block - competes with
+        // the navigator's own stall ladder and aborted the dig that was getting the bot out.
+        // And each interrupt tears the follow down and restarts it from the top, so a target
+        // who keeps walking eventually gets out of range during one of the gaps.
+        //
+        // `followPlayer` already pauses this mode when it is within `distance + 2`, but that
+        // line sits at the BOTTOM of a loop iteration which blocks for seconds inside
+        // navigateTo - so a player walking up to a stuck bot beats the pause every time. The
+        // pause stays as belt-and-braces; not interrupting is what actually fixes it.
+        interrupts: [],
         on: true,
         active: false,
         distance: 0.5,

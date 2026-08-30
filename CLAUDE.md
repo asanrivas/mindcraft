@@ -74,6 +74,31 @@ export const myCommand = {
 // Register in index.js: actionsList = [..., myCommand]
 ```
 
+### Writing a description the model will obey (2026-08-29, measured — docs/OBEDIENCE.md)
+
+`command_docs_mode: "compact"` keeps the first sentence (120ch) plus any follow-up sentence
+that starts imperatively (Use/Do NOT/Takes/Refused/Disabled/Pauses...). Prose sentences are
+dropped. Rules that came out of A/B-measuring gemini-flash and the local 9B:
+
+- **The param NAME is the only param documentation compact mode shows** (`name:type`; the
+  per-param descriptions are never rendered). `!branchMine(depth,...)` made the 9B pass a
+  distance where an absolute Y was wanted - out-of-domain calls, 5/5. Renamed to `y`; name
+  every new param so it is self-explanatory bare.
+- **Prohibitions go on the TEMPTING command, not the right one.** "Use !branchMine for ores"
+  written on !branchMine changed nothing; "Do NOT use for ores - use !branchMine" on
+  !collectBlocks flipped the 9B 5/5.
+- **Overlapping commands must cross-reference each other** (!scanArea<->!gridView,
+  !nearbyBlocks<->!surroundings, the chest list/find/named family). This is what made
+  selection *stable* across runs, not just more often right.
+- **Doc text does not deter a capable model** - flash took the !serverTp bait through every
+  wording. Real guards (the ALLOW_RESCUE_TP marker) protect; descriptions only inform.
+- `settings.hidden_actions` hides a command from the model while keeping it chat-callable
+  (measurement harnesses, and !goToSurface, which rides pathfinder with timeout -1).
+  `blocked_actions` deletes it for everyone.
+- Aliases must resolve to real, unblocked commands, and no destructive command may sit one
+  letter from a read-only one ('cf' used to be chestForget beside 'cfi' chestFind).
+  `tests/command_docs.test.mjs` enforces all of this.
+
 ## Configuration
 
 **settings.js**: `host`, `port`, `max_messages`, `command_docs_mode` (full/compact/minimal)
@@ -138,6 +163,16 @@ costs nothing. Without it the only symptom of an outage is that Andy suddenly wr
 Tests: `bun tests/fallback.test.mjs` (fakes, no network). Verified live against a genuinely
 dead local server, and recovery verified with real sockets: down -> backup, back up but inside
 cooldown -> still backup, after cooldown -> primary.
+
+**Current chain (2026-08-29, both bots):** primary `llamacpp/qwen3.5-9b-uncensored` direct at
+`http://amyasan:8000/v1` (tunnel disabled - `llama-tunnel.service` stopped; the server is a
+`LlamaServer` scheduled task on the Windows box, `Start-ScheduledTask` over ssh restarts it),
+backup `google/gemini-2.5-flash`. DigitalOcean is REMOVED: 402 on every model account-wide
+while /models still answers - billing, not tier-lock (tier locks are 403). Two bugs fixed so
+the local model can be primary at all: `applyContextBudget` must run BEFORE `new Prompter`
+(providers copy params at construction, so a later `"auto"`->number mutation never reaches
+them and llama-server 400s on the string), and it must resolve `max_tokens:"auto"` for the
+whole backup chain, not just `profile.model`.
 
 ## Movement (the "version mismatch" was a myth - see below)
 
@@ -325,6 +360,203 @@ Each of these cost real debugging time and each produced a *totally stuck* bot, 
 - **Progress must be measured along the travel axis**, not as total distance moved. Otherwise
   wandering sideways around an obstacle counts as progress and the dig-through fallback never
   fires (observed: 15 minutes for 1 block).
+
+### "Andy can't reach me with blocks around him"
+
+Two independent faults, one of which made following a person **completely** unable to dig.
+
+#### The recovery ladder must fit inside the leg the caller asked for
+
+`followPlayer` passes `waypointMs: 1500`, because the target moves and it wants to re-evaluate
+often. But digging, climbing and bridging are gated on `pinnedMs` (2500) **plus two hops 700ms
+apart** - so the leg always broke first and the follow silently had **no recovery whatsoever**.
+Not slow: absent. The bot walked into the wall, the leg timed out, `navigateTo` spent its 2
+replans, `followPlayer` polled, and nothing ever reached for the pickaxe.
+
+Measured, boxed in behind a one-block wall, with the same rig either side of the change:
+
+| | `!followPlayer` |
+|---|---|
+| before | **STUCK, moved 0.0 blocks in 45s** |
+| after | out in **9.0s** |
+
+The trigger now scales to the budget the caller actually gave (`shortLeg` -> `pinnedAt` at 45% of
+`waypointMs`, and one hop instead of two, because on a short leg requiring two is the same as
+requiring none). On a default 6000ms leg nothing changes.
+
+**The general rule: a timing constant that gates a recovery must never exceed the window the
+recovery has to run in.** Nothing enforced that, and nothing complained - the ladder just never
+ran. `tests/bridge.test.mjs` now asserts the relationship.
+
+#### `goToPlayer` claimed to have arrived when it had not
+
+It logged `You have reached <player>` unconditionally, discarding `goToGoal`'s return value. A bot
+sealed in a box twelve blocks away announced that it had arrived. It measures the distance now,
+and when it has genuinely failed it names the obstacle:
+
+```
+digAhead: 0:stone dig-failed, 1:stone dig-failed
+I am walled in 10 blocks from bob with no pickaxe, so digging out is very slow.
+```
+
+`nav.enclosed(bot)` exists only for that sentence - the ladder digs out fine and the planner
+routes through a wall in 1ms, so nothing *decides* anything on it.
+
+#### What the boxed gym measures
+
+`scratchpad/boxed_gym.mjs` seals the bot six ways and asks it to walk 12 blocks east;
+`scratchpad/sim/boxed.mjs` asks the planner the same question offline, in 1ms per case.
+**7/8 escape**: walls 2 high (10s), walls + roof (10s), walls 3 high (12s), walls 2 thick (23s),
+fully buried in solid stone (17s), and both follow cases (~9s).
+
+The one failure is **no pickaxe**, and it is not a logic bug: bare-handed stone runs about **35
+seconds a block** on this server, so a two-block wall exceeds any sane timeout. The bot does get
+out eventually; what was wrong was that it said nothing for minutes, which is why the message
+above matters more than the digging does.
+
+**The planner was never the problem.** It routes a dig through the wall in every configuration -
+walls, roof, two-thick, fully buried - in 1ms. Every failure here was in the executor or the
+reporting.
+
+### Jumping - and the headless sandbox that calibrated it
+
+`nav.jumpVerdict` / `probeJump` / `jumpAcross`, driven by `src/agent/library/jump_assist.js`.
+Tried BEFORE bridging: a jump costs nothing, leaves the terrain untouched, and is what a player
+does. Bridging remains the fallback for anything out of reach.
+
+**This bot could not jump at all.** Every jump in prismarine-physics is gated on
+`entity.onGround` (`index.js:725`), and so is ground acceleration (`:545`). Measured in the
+sandbox: vanilla apex **1.252**, this server's apex **0.000**.
+
+#### Simulate first - with prismarine-physics, NOT three.js
+
+`scratchpad/sim/` runs the *same engine the bot runs*, headless, with `onGround` forced false to
+reproduce the pathology. A whole sweep is milliseconds against 45s per live lane, so the constants
+are **measured, not chosen**. Full working in `scratchpad/sim/RESULTS.md`.
+
+A general physics engine under three.js would have been the wrong tool: it would model *different*
+physics from the one the bot actually experiences, so every constant calibrated there would be
+wrong on arrival. **What the sim cannot tell you is whether the SERVER accepts the movement** -
+that is the live gym's job, and the `forcedMove` valve's.
+
+#### The mechanism is a hybrid, and neither half is sufficient
+
+| | apex | clears | without sprint |
+|---|---|---|---|
+| assert `onGround` for the take-off tick | 1.25 | ≤3 | **fails at 3** |
+| hand-injected impulse + axial top-up | 1.25 | ≤3 | ok |
+| **both** | **1.25** | **≤4** | **ok** |
+
+Asserting the flag buys the engine's real impulse *and* its `+0.2` sprint-jump boost; the axial
+top-up supplies the run-up the broken flag denies (the same thing `STEP_IN_SPEED` does over a bank
+lip). "Works without sprint" is not optional - `followPath` only sprints when aiming far ahead.
+
+**A first sweep measured apex 0.87, not 1.25**, because the injection used `vel.y += 0.42` from a
+velocity the engine had already made negative. The engine *assigns*. `+=` costs a third of the jump.
+
+#### What the take-off window says about what is safe to ship
+
+Reporting the *best* take-off lead flatters everything; what matters is how many leads work, since
+the tick a decision lands on is not ours to choose. Level gaps, 11 leads sampled: widths 0-2 at
+11/11, width 3 at 11/11 (10/11 without sprint), width 4 at **7/11**, width 5 never. Rise 1: 0-2 at
+11/11. **Rise 2: never, at any width or lead** - the honesty refusal, confirmed rather than argued.
+
+So `JUMP_REACH = 3`, one below the measured maximum: width 4 is a coin flip once server lag is
+involved, and **a jump is the only recovery in this navigator that cannot be undone**.
+
+#### Three constants the live gym corrected
+
+- **`span` meant the wrong thing.** It counted cells-to-traverse, which is gap width + 1, so a
+  2-wide gap reported `span=3` and was refused. It is the gap width now, matching the sweep.
+- **`JUMP_FALL_SAFE` must EXCEED `maxDrop`.** At 4 against a `maxDrop` of 3 the rule contradicted
+  itself: the planner walks down into any drop of 3 or less, so every gap it refuses to enter is
+  deeper than 3 - and every one of those was a gap we refused to jump. There was no gap geometry in
+  between. It is 8 now: vanilla fall damage is `distance - 3`, so an 8-block miss costs 2.5 hearts.
+- **Lava is not a long drop.** They shared a threshold, and the gym duly jumped a 2-wide gap over
+  lava. A missed jump into a ravine costs health, which the bot recovers; into lava it costs the
+  bot *and* its inventory. Any gap over a hazard floor is refused now, however narrow. Water is
+  the opposite case - a benign floor the swim stack recovers from.
+
+#### Verified live
+
+**9/9 crossings** at widths 1-3 over three repeats, one jump each, 2-3s, **zero blocks laid**,
+full health - and `apex=1.25` in every log line, the exact vanilla figure on a server where the
+bot previously could not leave the ground. Rise 1 crosses 3/3 at widths 0-2 (the standstill step
+included). Refused, with zero attempts and zero damage: rise 2 (*"too tall to jump"*), lava at any
+width, a 3-wide gap over a lethal drop, and no far side at all.
+
+**Jump and bridge cooperate.** Width 5, with dirt in the bag: jump refused (no landing within 3),
+plank laid, refused again, plank laid - and now the gap is 3, so the jump takes it. The bridging
+gym still crosses 6/6 and now spends **two fewer blocks per span**; widths 1-2 spend none.
+
+#### Traps
+
+- **AutoJump must stand down without RELEASING the key.** Clearing `holding` is right; pressing
+  `jump` false would land on the take-off tick - the one tick in the flight that matters.
+- **A leaked `active` flag mutes AutoJump permanently**, destroying the one-block step the whole
+  navigator is built on. Three guards: the caller's `finally`, `JumpAssist` self-expiring `active`
+  on its own tick, and `!stats` showing it.
+- **Refusals must be logged.** The first live run attempted zero jumps and the refusal path was
+  silent, which is indistinguishable from the branch never running. Bounded by `maxJumps`, so it
+  cannot flood the way a per-tick line would.
+- **Overshooting a landing is success**, not a timeout. Demanding the bot finish within 0.6 of the
+  landing cell's centre reported `TIMEOUT axial=14.21` for a jump that had crossed fourteen blocks
+  earlier.
+- Sneak *prevents walking off a block edge* (`prismarine-physics/index.js:175`), so a latched sneak
+  cancels every take-off and looks exactly like broken physics. `jumpAcross` clears it explicitly.
+
+### Bridging a gap - the one thing pathfinder did that we lost
+
+mineflayer-pathfinder could span a gap because **scaffolding lived in its MOVEMENT GENERATOR**:
+the plan already contained the placements, so every `goto` had it for free. We replaced that
+executor (its own cannot move this bot at all) and the capability went with it. `travelToward`
+kept a `bridgeWayAhead` step in its recovery ladder; `navigateTo` - which is `!navTo`,
+`followPlayer`, `moveAway`, the chest approach and every mode-driven move - had **none**, so a
+one-block gap stopped the bot dead.
+
+`nav.bridgeVerdict` / `bridgeAhead`, and it is deliberately the **last** resort: placing costs
+materials and permanently alters ground the bot is only passing over, so climbing, digging and
+walking round are all preferable when they work.
+
+**The planner cannot express a gap at all, and that is why the executor-level fix was not
+enough.** Every move it has is cell-to-adjacent-cell, so with the neighbouring cell unstandable
+there is simply no move and the search fails - or worse, returns a stub. Measured:
+`[navTo] plan took 4ms length=2 first=last=(4614.5, 111, 4701.5)` against a goal ten blocks
+further on. So `followPath`'s bridge step never fires, because followPath is only ever reached by
+way of a plan. `navigateTo` therefore bridges on **a leg that went nowhere with the goal still
+ahead** - by which point the hop, climb and dig ladders have all had their turn. Teaching the
+PLANNER to place blocks was rejected on purpose: it would change which nodes win the whole A\*
+frontier, not just the ones over gaps - the same trap `waterCost` carries.
+
+Three things each cost a run of the gym:
+
+- **Find the EDGE; do not assume the bot is standing on it.** A leg ends when the bot is within
+  `arriveDist` of its last waypoint, so it habitually stops a block short of the drop - measured
+  halting at x=4613.5 with the gap starting at 4615. Probing only the adjacent cell reads "solid
+  ground ahead" and refuses to bridge a gap it is looking straight into. `EDGE_REACH = 3`.
+- **Refund the replan.** Laying a plank is progress, not a wasted attempt, and the leg that
+  discovers the gap always costs one - so a 3-block span burned four of the six replans and the
+  loop exited with the bridge FINISHED and the bot standing on it.
+- **Refund the step ONTO the plank too.** Otherwise the replan budget, not `maxBridge`, is what
+  decides how wide a gap can be: widths 1-5 crossed while 6 and 8 stopped with five planks laid,
+  the bot on the end of its own unfinished bridge. Laying a block and walking onto it is one unit
+  of progress, not two.
+
+**Never bridge into the unknown.** We only build toward a standable cell we can SEE, at our own
+level - `BRIDGE_REACH` (8) is kept equal to `maxBridge` so the look-ahead and the build budget
+agree; promising a span we would refuse to finish leaves a half-built ledge to walk off, which
+is worse than refusing. The other refusals are the tested surface (`tests/bridge.test.mjs`):
+nothing to build with, afloat (placing does not work while floating, same as pillaring), lava, a
+wall (that is `digAhead`'s job), a step (that is `climbAhead`'s), and a floor already there.
+
+**Gap gym**: `scratchpad/gap_gym.mjs` cuts a walkway with gaps of a given width and drives
+`!navTo` across. **7/7 at widths 1-6 and 8, one block per width, 3-7s each.** `--noblocks` and
+`--void` prove the refusals: both stop at the lip with 0 blocks laid and **the walkway west of
+the gap intact** - no mining the floor apart looking for material.
+
+*(Probe gotcha: `execute if block <pos> <block> run say OK` is NOT echoed back over RCON, so
+every column reads as missing and it looks like the bot destroyed the terrain. Use
+`execute if block <pos> <block>` and match "Test passed".)*
 
 ### Cliffs, caves and water
 
@@ -801,6 +1033,78 @@ server after ~13 rapid cycles, and `socket.setTimeout` does not fire on it.
 Full engine: **`src/agent/library/chest.js`**. `skills.js` holds only the policy (which
 container, which items, what to say); **nothing outside `chest.js` may call `bot.openContainer`.**
 
+### We own the container protocol - mineflayer's is unusable here
+
+`src/agent/library/container_io.js`. **Nothing in this project calls `win.deposit`,
+`win.withdraw` or `bot.transfer` any more.** Three independent defects, each measured:
+
+- **Every chest click waits forever.** `clickWindow` ends in `waitForWindowUpdate`, whose chest
+  branch is a bare `await once(window, 'updateSlot:' + slot)` with **no deadline**
+  (`mineflayer/lib/plugins/inventory.js:477-480`). On 1.17+ the client PREDICTS the click locally
+  (`window.acceptClick`) and the server answers **only when the prediction is wrong** - so a
+  click that works produces no packet and the await never settles. Seen as
+  `withdraw timed out after 6000ms` on ordinary withdrawals: our deadline firing, not a slow
+  server.
+- **`transfer` is cursor-based and asserts.** It picks a stack onto the cursor and places it,
+  recursing, with `assert.notStrictEqual` on the cursor. A desync throws
+  `null is not an object (evaluating 'window.selectedItem.type')` and returns **with items still
+  on the cursor** - which the server drops on the floor when the window closes. That is the
+  item-loss path: source chest emptied, destination untouched, a cobblestone entity on the pad.
+- **`bot.inventory` is FROZEN while a window is open.** mineflayer copies the player slots back
+  only in `closeWindow` -> `copyInventory` (`inventory.js:412`). So `bot.inventory.items()`,
+  `emptySlotCount()` and everything derived from them - including mineflayer's own
+  "Unable to withdraw, Bot inventory is full" guard - report pre-transfer values for the whole
+  session. Our counts read them, so **`moved` came out 0 however much actually moved**, and
+  `transferBetweenChests` (which builds its carry list from `moved`) aborted with
+  "my inventory is full" on a bag with 30 free slots.
+
+What we do instead:
+
+- **Shift-click (mode 1) is the workhorse.** One click moves a whole stack across the
+  container/bag divide and never touches the cursor - nothing to strand, nothing to drop.
+- **We never await the click.** By the time `clickWindow` reaches its unresolvable await it has
+  already applied the local prediction and written the packet, which is all a click consists of.
+  Fire it, swallow the pending promise, settle one tick.
+- **Every number comes from `window.slots`**, which is live: locally predicted, server-corrected.
+- **A partial count uses right-clicks**, one item at a time, and always puts the remainder back,
+  so the cursor is empty by construction - the property mineflayer's version does not have.
+- **`safeClose` empties the cursor first**, because closing while holding something is what
+  scattered items on the ground.
+
+Measured on the rig (`scratchpad/chest_rig.mjs`, `chest_full.mjs`, `chest_loss.mjs`): a full
+27-slot chest into an empty double chest moves **1728 items, nothing on the floor, no timeouts**;
+a part-stack `!chestTake("cobblestone", 10)` takes exactly 10. Pure arithmetic is unit-tested in
+`tests/container_io.test.mjs`.
+
+### A transfer must never empty the source on spec
+
+`!chestTransfer` used to withdraw everything it could and only *then* walk to the destination.
+Into a full chest that left the source at **0/27**, 1728 items stranded in the bag, and the
+message `Transferred 0 items`. Now:
+
+- the destination's free space is **surveyed first**, and the withdraw is bounded by it;
+- anything the destination refuses is **put back in the source** before returning;
+- the round trip repeats while progress is made, so `("all", -1)` moves everything even when the
+  bag can only carry part of it at a time.
+
+The invariant is that items are either in a chest or in transit, never abandoned. More container
+opens, all bounded; the alternative is a bot that strips a chest and wanders off with it.
+
+### A double chest is ONE container, not two
+
+`findBlocks` returns both halves, so a pad with one single and one double chest reported
+`Found 3 storage containers`, listing the same 54-slot window twice at neighbouring coordinates.
+`chest.doublePartner` reads the block state - `type` is `single`/`left`/`right`, and only a
+matching `facing` makes a pair, so two unrelated chests side by side stay two containers. It
+checks all four horizontal neighbours rather than deriving the axis from `facing`: that mapping
+is easy to get backwards and yields a listing wrong for half the orientations, which is worse
+than one wrong always. Fails to "single" on missing data.
+
+**When measuring a double chest from RCON, read BOTH halves.** `data get block` on one half
+shows only that half's 27-slot `Items` list, so counting 54 slots at one coordinate silently
+loses whatever landed in the other - and that reads exactly like the engine eating the items. It
+cost a full round of false "128 items UNACCOUNTED FOR".
+
 ### `bot.openContainer` has no timeout, and that killed the process
 
 `mineflayer/lib/plugins/inventory.js:385` is `activateBlock()` + `await once(bot, 'windowOpen')`.
@@ -919,6 +1223,46 @@ no timeout, and a mode action that cannot finish then pins `currentActionLabel` 
 which no action can ever start again. Nine call sites were missing one (2026-08-26);
 `tests/modes.test.mjs` now fails the build if a new one appears.
 
+**`night_safety` must never dig a hole it cannot roof, and must never become a metronome.**
+Found while testing containers: on the bare stone pad, with no pickaxe and nothing to place, it
+printed `Dug in at y=111 but could not seal the roof` **every twenty seconds all night**, and
+each one interrupted whatever the bot was doing. Four separate faults:
+
+- **It dug first and asked later.** `emergencyShelter` called `digDown(bot, 2)` and *ignored its
+  return value*, then tried to seal regardless. `shelterFeasibility` now runs BEFORE any ground
+  is broken and answers two questions: can we break the block below **and keep the drop**
+  (`tools.canBreak` - `bot.canDigBlock` is not this question; stone is diggable bare-handed, it
+  just drops nothing), and is there something to roof with, carried or minable from a wall.
+  Every failure now names itself - `no tool for stone`, `nothing to seal with`, `nothing_to_dig`
+  - where before every distinct failure printed the same "could not seal the roof".
+- **Two blocks is the wrong depth on flat ground.** With the top solid block at `Y-1` and the
+  bot's feet at `Y`, digging 2 leaves it at feet `Y-2` / head `Y-1` and puts the seal at `Y` -
+  open sky, four air neighbours, `nothing to place on`. **Digging 3** puts the seal at `Y-1`,
+  the old surface layer, walled on every side. It looked right for a long time because in
+  natural terrain the bot usually dug into a slope, where that cell had neighbours anyway.
+  `digOut` climbs 3 to match, or the bot is let out into a hole it still cannot leave.
+- **The descent has to be measured after the bot lands.** `digDown` returns when the blocks are
+  broken, not when the body has fallen through them: measured `Dug down 2 blocks.` immediately
+  followed by `only got down 1.0 blocks`. `settleY` waits for two equal readings. Same class of
+  mistake as counting a chest transfer the instant the deadline fires.
+- **A failure must not be retried on a fixed beat.** The mode interrupts every action in the
+  agent, so a flat 20s cooldown cancelled the bot's work three times a minute until dawn.
+  Nothing about the ground or the inventory changes while the bot stands still, so the third
+  identical failure is evidence: back off 20s, then 60s, then **give up for the night** with a
+  named log line. Reset at dawn - and gate that reset on **full daylight**, not `!isNight`:
+  those two predicates do not partition the day (`isNight` starts at 13000, dusk 600 ticks
+  earlier), so resetting on `!isNight` clears the counter on every tick of exactly the window
+  the mode is failing in. Measured as 35 attempts in 110s with the give-up never latching.
+
+And whatever happens, **it climbs back out rather than leaving an open pit** - a roofless hole
+is worse than the flat ground it started on: the bot is cornered in it and the terrain is spent.
+
+Verified live (`scratchpad/night_test.mjs`, which pins the bot to a test pad - left alone the
+agent picks up a goal and walks off onto different ground between attempts, and then the run
+measures wandering): bare stone -> refuses before digging, gives up after 3, no pit; with a
+pickaxe and dirt -> `VERIFIED SHELTER: sealed at (4566, 107, 4706)`, and at dawn
+`Dug out of the shelter at dawn` back to the exact level it started from.
+
 **`night_safety` stands down whenever sheltering cannot pay for itself.** It interrupts every
 action in the agent, so a needless trigger cancels whatever the bot was asked to do - observed
 killing a user's marathon 12 seconds after it started. It now skips when:
@@ -935,12 +1279,34 @@ killing a user's marathon 12 seconds after it started. It now skips when:
 
 All of these sit AFTER the dawn dig-out branch, so a bot sealed in last night is always let out.
 
-**`bot.game.difficulty` is a lie on Peaceful worlds - mineflayer bug.** `lib/plugins/game.js`
-assigns it with `if (packet.difficulty)`, and **peaceful is 0, which is falsy** - so on a world
-that was already Peaceful when the bot logged in, the field is NEVER set and reads `undefined`.
-Every guard written against it fails open. That is exactly how the Peaceful check below appeared
-to work and did not. `agent.js` now re-reads the `login` and `difficulty` packets itself with a
-`!= null` test. If you add a difficulty check anywhere, do not trust the raw field.
+**`bot.game.difficulty` is a lie on Peaceful worlds, and it took THREE fixes.** Never read the
+raw field - use `src/agent/difficulty.js` (`isPeaceful`, `difficultyName`), which is unit-tested
+in `tests/difficulty.test.mjs`. Each failed attempt looked exactly like the last (the guard reads
+`undefined`, `night_safety` digs the bot in at dusk on a world where nothing can hurt it, and
+whatever a person asked for is cancelled):
+
+1. **Peaceful is 0, which is falsy.** `lib/plugins/game.js` assigns with
+   `if (packet.difficulty)`, so on a Peaceful world the field is never set. Any guard against it
+   fails open. Fix: an `== null` test, not truthiness.
+2. **The listener was attached too late.** It went in `startEvents()`, which runs from the
+   `spawn` handler - long after the `login` and `difficulty` packets were dispatched, so it could
+   never fire. Fix: wire it in the same synchronous block as `initBot`. Careful:
+   **`bot.game` does not exist yet there** - mineflayer injects its plugins after `createBot`
+   returns, and touching `this.bot.game.difficulty` at construction throws and kills the agent
+   process before it logs in.
+3. **The wire form is a STRING, and mineflayer overwrites us.** Captured on this server
+   (protocol 774): the `login` packet has **no `difficulty` field at all** any more, and the
+   `difficulty` packet carries `"peaceful"`, not an index. mineflayer's
+   `difficultyNames[packet.difficulty]` is therefore `undefined` - and because its listener is
+   registered during that late plugin injection, it always runs *after* ours and puts the
+   `undefined` back a moment after we set the right value.
+
+The third one cannot be won by registering later, so `installDifficultyField` makes the field
+**ignore writes of `undefined`/`null`**: that means "this client could not parse the packet",
+never "the difficulty is now unknown". Ordering stops mattering in both directions.
+
+Verified live: `difficulty="peaceful"`, 38 guard evaluations across a full night, **0**
+`night_safety` executions - against 3 per night before.
 
 **`night_safety` does nothing on Peaceful.** Nothing hostile spawns, so a night shelter costs a
 whole night and buys nothing - and because the mode interrupts everything, it was a pure tax on
@@ -969,6 +1335,54 @@ the log named what had been cancelled.
 
 `tests/action_owner.test.mjs` covers all four cases, including the leak that would make a safety
 mode inherit "user" and become uninterruptible itself.
+
+### `elbow_room` killed a follow, and the pause that should have stopped it lands too late
+
+Reported as *"check why he stopped following me just now"*. The bot then stood motionless on one
+block until it was restarted. Log times are **UTC while this host is +0800** - read that offset
+before concluding an event is hours old; it made a six-minute-old incident look like yesterday's.
+
+```
+00:32:51  pinned: pos=(4744.5, 65.50, 4810.7)                  <- stuck in sand
+00:32:52  mode:elbow_room interrupts action:followPlayer
+00:32:52  dig sand at (4744, 65, 4811): Digging aborted         <- the recovery, cancelled
+00:32:52  pinned: nothing worked (climb=no bridge=nothing to build with dig=no) - recentring
+00:32:55  mode:elbow_room interrupts action:followPlayer        (third time in 16 seconds)
+00:32:57  follow resumes, target now out of entity range, REFUSES
+```
+
+Three faults compounded, and the mode is only the first:
+
+- **`elbow_room` listed `action:followPlayer` in its `interrupts`.** Its own description says
+  *"when idle"* - and being 0.5 blocks from the person you are FOLLOWING is the goal state, not a
+  problem to fix. Worse, its remedy (shuffle half a block) competes with the navigator's stall
+  ladder: it aborted the dig that was getting the bot out of the sand, three times.
+- **`followPlayer` already pauses `elbow_room` when within `distance + 2` - but that line sits at
+  the BOTTOM of a loop iteration that blocks for seconds inside `navigateTo`.** A player walking
+  up to a stuck bot beats the pause every time. The pause stays as belt-and-braces; `interrupts:
+  []` is what actually fixes it. **A pause applied after a blocking await is not a guard.**
+- **`followPlayer` captured the target entity ONCE**, before its loop
+  (`let player = playerObj.entity`). mineflayer DESTROYS a player's entity across render distance
+  and builds a new object on return, so that reference becomes an orphan frozen at the last
+  position it saw - the bot chases a ghost, confidently, with nothing in chat to say so. Same
+  shape as the `GoalFollow` bug `navToGoal` had to fix. It is re-read every iteration now.
+
+**A mode interrupt tears the follow down and restarts it from the top**, so the entry check runs
+constantly - and a target who keeps walking will be out of entity range during one of those gaps.
+Refusing there threw away a position the bot knew perfectly well a second earlier, which is what
+made the failure permanent. `lastSeenPos` (module-level, `skills.js`) now survives across calls,
+so a resumed follow walks to where it last saw you and re-acquires. Only *no entity **and** no
+memory* refuses.
+
+The decision is the pure `followVerdict` (`tests/follow.test.mjs`): `follow` / `seek` / `lost` /
+`gone`. Giving up needs **both** conditions - arrived at the last-seen spot AND still nothing
+there. Time alone abandons a chase mid-walk; distance alone abandons it the instant the target
+teleports from right beside the bot. `gone` is checked first: a player who quit is not out of
+render distance, and walking to their last position would end in a timeout instead of a reason.
+
+`tests/modes.test.mjs` asserts `elbow_room` interrupts nothing, and that `hunting`,
+`item_collecting` and `torch_placing` still DO interrupt a follow - those are deliberate, since
+`followPlayer` pauses them by distance ("these modes slow down the bot, and we want to catch up").
 
 ### A mode must PAUSE an action, not END it
 
@@ -1082,6 +1496,31 @@ result.
 
 **To enable Mem0:** Change `andy.json` model to `"api": "mem0"` and set model/url to Azure Foundry endpoint. Mem0 event hooks (`recordDeath`, `recordPlayerJoin`, `recordChestDeposit`) are already wired in `agent.js` and `actions.js` — they become active automatically.
 
+### A stuck bot narrates its loop into memory - the store now folds paraphrases (2026-08-29)
+
+bob spent ~2h oscillating in bedrock; every summarisation restated the episode, and the store
+grew to 101 rows of which **90 were lessons** - six spellings of "on reconnect read memory
+first", six of "non-terminating code killed at 10s". Only 10 lessons ever render; the rest sat
+in storage queued to evict real facts, because `KIND_CAPS` bounded the RENDER only and the
+global 200-row eviction drops the OLDEST agent rows - the durable facts - for the newest noise.
+
+`memory_store.js` fixes, all unit-tested:
+
+- A lesson's identity is its **set of content words** (`proseTokens`/`proseSimilarity`, fold
+  at Jaccard >= 0.6): labels stripped, stopwords out, order ignored - so a reworded
+  restatement UPDATES the row. Digits are kept ("10s", "Y=-58" ARE the identity) and
+  sentences under 5 content words never fold - both guards exist because tests caught the
+  false merges without them.
+- `KIND_CAPS` enforced at **storage** - a runaway section can only crowd out itself.
+- Eviction is **least-reinforced first** (a fold bumps `revision`), then oldest. Recency
+  eviction handed the whole section to the current bad episode; revision eviction keeps what
+  was independently re-learned.
+
+One-time compaction for an already-polluted store: `scratchpad/compact.mjs <store.json>` (bot
+stopped, `.bak` first; sums revisions on fold). bob done, 102 -> 21 rows; **andy still needs
+this** and a restart to pick up the new code. Before deleting a "false" lesson, check the
+bot's gamemode - "broke bedrock" is TRUE in creative.
+
 ### Ending a goal - there are TWO of them
 
 `!endGoal` used to stop only the self-prompt LOOP. The goal ALSO lives as a record in the typed
@@ -1109,6 +1548,84 @@ counterpart, so nothing anywhere could clear it.
   in which it was ended. The store already refused to let the model OVERWRITE a user's goal;
   nothing stopped it INVENTING one where none stood.
 - A goal is a **directive**, not a memory. It arrives through `!goal` or not at all.
+
+### On reconnect, the last thing a PERSON said wins
+
+Reported as *"after a restart Andy still does the past task even though I asked it to stop
+before restarting"*. Two separate mechanisms, both of which had to go.
+
+**`settings.init_message` asked the model to decide.** It read, on every single reconnect:
+
+> "Check your MEMORY for an unfinished task: if there is one, resume it right now with
+> `!goal("<the task>")` instead of greeting."
+
+`$MEMORY` is a summarised blob of lines like `Forest target: 4140,111,5132` and
+`Target dry spot: 4465,62,4685`. **A small model told to find an unfinished task in that will
+always find one** - nothing was ever *stored* as a goal, one was invented from ambient memory.
+It is the same failure as "Memory summarisation must not mint goals" above, through a different
+door, and a person's "stop" a minute earlier had no way to be heard at all.
+
+`src/agent/resume_policy.js` decides from STATE and hands the model the answer instead of the
+question. Three outcomes, all pure and unit-tested (`tests/resume_policy.test.mjs`):
+
+- a **stand-down** since the goal was set: quote the person back to themselves and forbid
+  resuming;
+- a **real goal record or a live self-prompt**: quote it verbatim, and say *do not invent a
+  different task from your memory*;
+- **neither**: say so plainly, and that memory is a record of where things are, **not a list of
+  work**.
+
+`settings.init_message` is now only an on/off switch; the text is replaced at spawn.
+
+**The self-prompt loop is the teeth.** Telling the model not to resume is not enough. `!stop`
+leaves self-prompting running *by design* ("Agent stopped. Self-prompting still active."), the
+loop is persisted to `memory.json`, and `handleLoad` restarts it on the next boot - that is the
+bot carrying on regardless of what the prompt says. `agent.js` now skips that restart when a
+stand-down stands. **The goal RECORD is deliberately left intact**: deleting a user-authored
+goal is `!endGoal`'s authority, not something a fuzzy text match should do behind the user's
+back. `!stop` says so now.
+
+**And the agent restarts its own loop - it must never delegate that to the model.** The
+reconnect message first read "resume exactly that with `!goal(...)`", and for a **user-authored**
+goal that instruction cannot succeed: `!goal` from the model is refused outright
+(`Kept the existing goal: ... `) and the refusal path never reaches `self_prompter.start`. So
+the one case where resuming matters most is exactly the case where asking the model to do it
+cannot work. Caught by the CONTROL half of the test, not the case half: the model obeyed,
+emitted `!goal("count to ten out loud")`, and the loop never started.
+
+Two supports underneath it:
+
+- **`save_data.self_prompt` is not a reliable signal on its own.** It is written as
+  `isStopped() ? null : prompt`, so whether a restart finds a task at all depended on *when* the
+  last save happened to be taken - and `!endGoal` forces one while the loop is down, persisting
+  null with the goal record still standing. `agent.js` falls back to the **goal record**, which
+  is the durable statement of what a person asked for.
+- **`SelfPrompter` now persists on its own transitions** (`start`/`stop`), so the file tracks
+  the loop instead of sampling it.
+
+Verified live in all three states: persisted loop -> replayed; goal record with `self_prompt`
+forced to null (the exact shape of the bug) -> `restarting the self-prompt loop from the goal
+record`; stand-down -> neither.
+
+Details that matter:
+
+- **"Last message" means the last one, not the last stand-down.** Someone who says "stop", then
+  "now go mine", then restarts must come back to the mining. `standDownIsCurrent` compares the
+  directive's timestamp against the goal record's `updated`.
+- **A message that ISSUES a command is an instruction, whatever words it contains.** Caught live:
+  the test goal read `!goal("count to ten out loud and stop")`, and the prose matcher classified
+  the very message that created the task as cancelling it. An explicit `!stop`/`!endGoal`/`!stfu`
+  /`!stay` still outranks the rest of the line.
+- **A stand-down is saved the moment it arrives.** The ordinary `history.save()` sits at the
+  bottom of `handleMessage` and is never reached for a message that is a command - `!stop`
+  returns from the forced-command branch above it - which is exactly the case this exists for.
+- Only humans count. A system prompt is our own words coming back, and another bot's chatter is
+  not an instruction.
+
+Verified live, both directions: goal + `stop` + restart -> `reconnect: ... Do NOT resume`, loop
+not restarted, `"Hello, I'm Andy! What can I do for you?"`. Goal + restart with no stop -> loop
+restarted and the task continued. **The control matters as much as the case**: a fix that stops
+the bot resuming anything has removed the feature, not fixed the bug.
 
 ## Andy notices when he is teleported
 
@@ -1170,6 +1687,39 @@ sentence" was initially ignored because rule 9 tells Andy to be proactive and of
 substantially but not to the letter. This is a 9B local model - treat steering as a strong
 nudge, not a hard constraint, and prefer directives that add or remove a concrete behaviour over
 ones that fight an existing rule.
+
+## Two `main.js` processes = an endless bot crash-loop
+
+Symptom: a bot joining and leaving every ~14 seconds, forever.
+
+```
+[Event] bob left the game
+[Event] bob joined the game
+Agent bob disconnected
+WARN: Bot kicked! { translate: "multiplayer.disconnect.duplicate_login" }
+[Watchdog] Force restart scheduled in 5000ms
+```
+
+Two `main.js` instances were running, each with its own MindServer (the second binds **8082**
+because 8080 is taken) and each spawning its own `bob`. Two clients on one account evict each
+other with `duplicate_login`, and `agent.js`'s `kicked` handler schedules a 5-second auto-restart
+for whichever was evicted - so the pair kick each other in perpetuity, burning a model call per
+respawn. `mc "list"` shows only ONE bob, which is what makes it confusing: the duplicate is never
+online long enough to be listed.
+
+Diagnosis is one command - **look for two mains, or a second MindServer port**:
+
+```bash
+ps -eo pid,etimes,cmd | grep -E "bun (run main|.*init_agent)"
+```
+
+`scratchpad/restart_bot.sh` now kills the parents first (`main.js` respawns a dead agent by
+itself, so killing `init_agent.js` alone just brings it back), waits until they are really gone
+rather than sleeping a fixed 4 seconds, and **refuses to start if anything survives**.
+
+**Anchor any `ps | grep` guard at the executable.** An unanchored pattern also matches any SHELL
+whose command line contains it - including the command invoking the check - so the guard refused
+to start with nothing running at all.
 
 ## Common Issues
 

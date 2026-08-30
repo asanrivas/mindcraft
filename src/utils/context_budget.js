@@ -155,8 +155,17 @@ export async function applyContextBudget(settings, profile) {
     autoSet('num_examples', active.num_examples);
     autoSet('relevant_docs_count', active.relevant_docs_count);
 
-    if (profile?.model?.params && profile.model.params.max_tokens === 'auto') {
-        profile.model.params.max_tokens = active.max_tokens;
-    }
+    // Every model in the chain, not just the primary. A backup left on "auto" reaches its
+    // server as the string and 400s - so the failover the whole FallbackModel exists to
+    // provide would fail at exactly the moment it was needed, and only then.
+    const resolveAuto = (entry) => {
+        if (entry?.params && entry.params.max_tokens === 'auto') {
+            entry.params.max_tokens = active.max_tokens;
+        }
+    };
+    resolveAuto(profile?.model);
+    const backups = profile?.backup_model;
+    if (Array.isArray(backups)) backups.forEach(resolveAuto);
+    else resolveAuto(backups);
     return active;
 }

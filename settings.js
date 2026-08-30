@@ -42,7 +42,7 @@ const settings = {
         // MindServer automatically. NOTE: with him commented out andy is a single agent
         // again, so getNumOtherAgents() is 0 and the smart public-chat filter goes back to
         // "respond to all public chat" - that only matters if a second bot returns.
-        // "./bob.json",
+        "./bob.json",
         // "./rosetta.json", // Letta-powered agent with persistent memory (requires ~/letta running)
         // "./profiles/andy-4-reasoning.json",
         // "./profiles/claude.json",
@@ -60,7 +60,17 @@ const settings = {
     ],
 
     load_memory: true, // load memory from previous session
-    init_message: "You just (re)connected. Check your MEMORY for an unfinished task: if there is one, resume it right now with !goal(\"<the task>\") instead of greeting. Otherwise greet briefly with your name.", // sends to all on spawn
+    // Sent to every agent on spawn. THE TEXT HERE IS NO LONGER USED VERBATIM: `agent.js`
+    // replaces it with `resume_policy.reconnectDirective(...)`, which decides from state
+    // (a real goal record, a running self-prompt loop, the last thing a human said) and hands
+    // the model the answer instead of the question. Treat this as an on/off switch - set it to
+    // null for a silent reconnect.
+    //
+    // It used to read: "Check your MEMORY for an unfinished task: if there is one, resume it
+    // right now with !goal(...)". That is an invitation to invent a task out of location notes,
+    // and no amount of a person saying "stop" beforehand could outvote it - reported as "after
+    // a restart Andy still does the past task even though I asked it to stop".
+    init_message: "reconnected", // replaced at spawn; see resume_policy.js
     only_chat_with: [], // users that the bots listen to and send general messages to. if empty it will chat publicly
 
     speak: false,
@@ -89,11 +99,32 @@ const settings = {
     // rejection, endConversation). Re-block them if the two start burning tokens on chatter.
     blocked_actions: ["!checkBlueprint", "!checkBlueprintLevel", "!getBlueprint", "!getBlueprintLevel",
                       "!help",
-                      // !fill and !serverFill take DIFFERENT argument orders; exposing both
-                      // reliably confuses a 9B model (it corrupted its own memory over it).
-                      // !serverFill is also far more reliable - !fill managed 3/9 blocks on
-                      // flat ground. Keep exactly one fill command visible.
-                      "!fill",
+                      // OPERATOR AND CREATIVE COMMANDS ARE BLOCKED FOR TRAINING-DATA HONESTY.
+                      // These are RCON/creative shortcuts: they edit the world, grant items or
+                      // teleport without the bot playing the game. In a corpus captured for
+                      // fine-tuning they are poison twice over - the model learns to reach for
+                      // a cheat instead of the survival skill, and the resulting trajectory
+                      // teaches nothing about how the task is actually done. Measured before
+                      // blocking: 161 of 589 usable examples (27%) invoked one, and
+                      // !serverSetblock alone was the second most common command in the whole
+                      // dataset at 100 mentions.
+                      //
+                      // These stay reachable BY HAND over RCON (`mc "setblock ..."`), which is
+                      // where world setup belongs. Blocking only stops the MODEL choosing them.
+                      "!serverFill", "!serverSetblock", "!serverGive", "!serverSummon",
+                      "!serverGamemode", "!serverSpawnpoint", "!serverTp",
+                      "!forceFill", "!forceSetblock",
+                      "!creativeGive", "!creativeKit", "!creativeClear", "!creativeStatus",
+
+                      // !fill is deliberately UNBLOCKED now. It and !serverFill take different
+                      // argument orders and exposing both reliably confused the 9B (it corrupted
+                      // its own memory over it), so the rule was "keep exactly one fill command
+                      // visible" - and !serverFill won on reliability (!fill managed 3/9 blocks
+                      // on flat ground). With !serverFill gone, !fill is that one command;
+                      // leaving both blocked would give the bot no way to fill an area at all,
+                      // and the observed behaviour was andy substituting !serverFill every time
+                      // !fill was asked for. Expect it to be flaky - that is the honest cost of
+                      // not cheating, and a failed !fill is still a real training record.
                       // !goToCoordinates is mineflayer-pathfinder, which cannot move this bot.
                       // Measured 2026-08-26: a 14-block walk on flat ground at constant Y hung
                       // for 6+ hours, position unchanged to eight decimals across 24 checks,
@@ -110,7 +141,7 @@ const settings = {
     // must not see them: each burns a whole action slot producing numbers it cannot act
     // on, and !climbBankTest rendered in the compact docs as "Debug: repeatedly attempt
     // swim" - which reads like an ordinary swim command.
-    hidden_actions: ["!climbBankTest", "!buildFooting", "!swimProbe", "!creativeIdSweep",
+    hidden_actions: ["!climbBankTest", "!buildFooting", "!swimProbe", "!groundProbe", "!pillarTest", "!creativeIdSweep",
                      // !goToSurface is skills.goToSurface -> goToPosition -> bot.pathfinder,
                      // the same executor !goToCoordinates was blocked for, and it is registered
                      // with runAsAction(fn) i.e. timeout -1. A hang therefore pins
@@ -147,13 +178,23 @@ const settings = {
 
     log_all_prompts: true, // log ALL prompts to file
 
+    // Append every LLM turn to bots/<name>/corpus/<date>.jsonl for fine-tuning.
+    // Independent of log_all_prompts: that flag governs the rotated debug dump in
+    // bots/<name>/logs/, which cleanupOldLogs prunes to the newest 20 files once a minute -
+    // useless as a dataset. The corpus is never rotated. See src/utils/corpus.js.
+    collect_corpus: true,
+
     // Auto-login settings
     // Enabled 2026-08-26: only run andy while a human is on the server, so he stops burning
     // model calls into an empty world. main.js polls the server ping every auto_login_interval
     // minutes; on `online > 0` it starts the agents, and when they all exit it loops straight
     // back to polling. The two settings below are HALVES OF ONE FEATURE - auto_login gets him
     // back on, idle_disconnect_timeout is the only thing that ever gets him off.
-    auto_login: true, // wait for players before logging in (or use --auto_login flag)
+    // Turned OFF 2026-08-30 to keep andy in the world unattended while the training corpus
+    // fills (collect_corpus). idle_disconnect_timeout MUST be 0 alongside it: auto_login is
+    // the only thing that ever brings him back, so leaving the timeout armed here would let
+    // him idle out once and stay off forever.
+    auto_login: false, // wait for players before logging in (or use --auto_login flag)
     auto_login_interval: 5, // minutes between server checks for players
 
     // Idle disconnect settings
@@ -163,7 +204,7 @@ const settings = {
     // goal ("mine minerals below the base..."), so while that goal is set he will NEVER idle
     // out and auto_login can never recycle him. Clear it with !endGoal if you want him to
     // actually go offline between sessions.
-    idle_disconnect_timeout: 10, // minutes of idle time before disconnecting (0 = disabled)
+    idle_disconnect_timeout: 0, // minutes of idle time before disconnecting (0 = disabled)
 };
 
 export default settings;

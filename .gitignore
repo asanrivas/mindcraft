@@ -41,3 +41,5 @@ minedmap_output/
 # timelapse output (tools/timelapse.mjs)
 recordings/
 scratchpad/
+data/
+bots/*/corpus/

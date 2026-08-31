@@ -5471,13 +5471,20 @@ export function wetLiftVerdict(s) {
     // vel.y write that collision cancels before the next position packet never reaches the wire
     // at all. Rate cannot matter for a quantity that is not transmitted.
     //
-    // IT STAYS ANYWAY, for two honest reasons and not for the one above. It costs nothing - real
-    // impulses land ~500ms apart, so the gate almost never binds and the working case is
-    // unchanged. And the measurement covered ONLY the fully-jammed, zero-clearance case that the
+    // IT STAYS ANYWAY, but for ONE honest reason, not two. The measurement covered ONLY the
+    // fully-jammed, zero-clearance case that the
     // old justification cited; a partial-rise bank, where re-arming produces REAL displacement,
     // is untested, and that is precisely where rate would become visible on the wire. Removing it
     // on this evidence would repeat the mistake the evidence just corrected: generalising from
     // the case that was measured to the case that was not.
+    //
+    // DO NOT WRITE "IT COSTS NOTHING" HERE. That was in an earlier draft and it is the same
+    // over-generalisation in the other direction: "impulses land ~500ms apart so the gate rarely
+    // binds" is measured only where NOTHING RISES. In a real partial rise each impulse produces
+    // displacement, drag bleeds it within a few ticks, and 350ms is a third of a second of
+    // sinking between pushes - so the gate could plausibly slow the very case it is kept for.
+    // Unexplained supporting thread: three escapes of the identical wet pocket took 6.0s, 24.1s
+    // and 44.2s, and the gate is one candidate among several for that spread.
     if ((s.sinceLastMs ?? Infinity) < (s.minGapMs ?? 350)) return false;
     return (s.velY ?? 0) <= (s.risingVelY ?? 0.05);  // already on the way up: leave it alone
 }

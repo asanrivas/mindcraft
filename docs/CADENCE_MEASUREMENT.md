@@ -1,6 +1,15 @@
 # Does the wet-lift 350ms cadence gate prevent an anti-cheat trip?
 
 **Verdict: the gate is UNNECESSARY, for the mechanism it was written to guard against.**
+
+**The general principle, which outlives this gate.** The protocol reports POSITION, not
+velocity. A `vel.y` write that collision cancels before the next position packet never reaches
+the wire, so no re-arm rate can make an invisible quantity visible. That retro-explains every
+valve trip either session traced - all of them came from real DISPLACEMENT (setup teleports,
+the dry/pinned path) and none from an assist writing velocity. It is also the principled
+justification for the displacement-band filters both sessions arrived at by trial and error
+(`CORRECTION_MIN_BLOCKS` / `TELEPORT_MIN_BLOCKS`): those are not heuristics, they are matching
+the counter to what the server can actually observe.
 Zero server corrections and zero valve trips in the gated arm; zero in the ungated arm too -
 3 runs each, alternating, in the exact zero-net-displacement scenario the gate's own
 justification cites. This is a null result, not a "the code is fine" pass - see Caveats for
@@ -58,12 +67,18 @@ started):
 4. **Fresh `JumpAssist`/`SwimAssist` instances every run** (not reused), so a trip in one run
    cannot mask or inflate the next - each run is an independent trial, and the 60s stand-down
    never has to be waited out.
-5. **Both valves watched.** `JumpAssist`'s own forcedMove counter only counts while
-   `this.active` (between `begin()`/`end()`), and wet-lift never calls `begin()` - it bypasses
-   JumpAssist entirely (confirmed by reading `jump_assist.js`), so JumpAssist's valve cannot
-   fire from this mechanism by construction. `SwimAssist`'s valve requires `boosted`
-   (submerged + sprinting), so the probe holds `forward`+`sprint` into the wall the whole
-   measured window specifically to keep that valve live and comparable, not just present.
+5. **Both valves watched, via the phrase `stood down for 60s` rather than either valve's
+   name.** This is not belt-and-braces, it is required. An earlier draft of this document
+   claimed JumpAssist's valve was unreachable here because wet-lift "never calls `begin()`".
+   **That was wrong**, corrected 2026-08-31 by the concurrent session: `pillarUp` opens a
+   flight around the whole lift loop (`skills.js:5607` `bot.jumpAssist?.begin(0, 0)`, `wetLift()`
+   at :5646/:5672, `end()` at :5703), and `begin()` needs only `grounded()`, which a WADING bot
+   satisfies - it has solid ground under the feet cell. Live confirmation:
+   `pillarUp: ... apex 0.75, assisted=true, jumpAssist.disabled=false`. So JumpAssist's counter
+   IS live throughout a wet lift; it simply did not trip. Anyone repeating this must watch both
+   valves. `SwimAssist`'s valve additionally requires `boosted` (submerged + sprinting), so the
+   probe holds `forward`+`sprint` into the wall the whole measured window to keep it live and
+   comparable, not merely present.
    Both classes' `console.warn` output was captured and grepped for `stood down` per run, and
    every `forcedMove` was independently classified by the harness itself using the exact
    `[CORRECTION_MIN_BLOCKS, TELEPORT_MIN_BLOCKS)` band `SwimAssist._forcedMove` uses, so a trip
@@ -134,11 +149,15 @@ not zero) - that is explicitly outside what this rig tested; see Caveats.
   enough to read as anomalous. If a future incident shows the valve tripping on a *partial-rise*
   bank rather than a fully-jammed one, this result would not contradict it and should not be
   read as covering that case.
-- **The probe held `forward`+`sprint` the whole time** to keep SwimAssist's own boosted-gated
-  valve live; JumpAssist's valve is structurally unreachable by this mechanism (confirmed by
-  reading `jump_assist.js` - its forcedMove counter only counts inside an active `begin()`/`end()`
-  flight, which wet-lift never opens), not merely "didn't happen to fire" - so a future change
-  that routes wet-lift through JumpAssist would need this re-measured.
+- **The probe held `forward`+`sprint` the whole time** to keep SwimAssist's boosted-gated valve
+  live. Both valves were genuinely at risk: JumpAssist's counter is live during a wet lift too
+  (see rig note 5 - `pillarUp` holds a flight open across it), so "0 trips" means neither fired,
+  not that one could not.
+- **Two systems write the same quantities during a wet lift, and this measurement does not
+  judge that.** Because `pillarUp` holds a JumpAssist flight open, `JumpAssist._tick` is
+  asserting the ground flag and pressing jump concurrently with the hand-injected impulse. It
+  produced no corrections here, but "nothing contends for the jump key while wet" is NOT
+  established by this run and should not be inferred from it.
 - Ungated ran at ~26Hz measured, not the 100Hz the comment describes as the ceiling. That gap is
   real (JS timer + event-loop jitter, not a design choice), so this result rules out anti-cheat
   sensitivity at ~26Hz but is silent on whether a true 100Hz re-arm (e.g. driven by the physics

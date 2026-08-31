@@ -114,3 +114,120 @@ export class LearnedSkills {
             .slice(0, 60) || 'skill';
     }
 }
+
+/**
+ * Cross-invocation memory of code-generation FAILURES, keyed by intent (the same
+ * `LearnedSkills._makeKey` key `add`/`recordFailure` use).
+ *
+ * The gap this closes: `LearnedSkills.recordFailure` only bumps a counter on a skill that has
+ * ALREADY succeeded once under that key - the write gate that keeps the skill library honest
+ * (docs at the top of this file) means an intent that has never worked leaves no trace there at
+ * all. That is exactly the reported incident: 17 generated-code failures in three minutes,
+ * invented mineflayer APIs and unparseable output, never a single success - so nothing informed
+ * the next `!newAction` about any of it. `code_guard.js`'s `priorSignatures` dedupe only lives
+ * for one `generateCode` call, so it cannot see across invocations either.
+ *
+ * This is deliberately a separate store from `LearnedSkills.skills`, not a field bolted onto
+ * it: the skill store's shape (key -> one skill record) has no room for "many distinct failure
+ * signatures per key" without changing what every existing reader of skills.json expects.
+ *
+ * Read back as CONTEXT, not as a gate - see coder.js's usage. Folding `bot.setBlock` ->
+ * `bot.placeBlock` is exactly the correction a retry is FOR, and it necessarily shows up as a
+ * *different* error on the next attempt; refusing on failure history would cut that off before
+ * it has a chance to happen. Ranking is most-repeated-first, same principle `memory_store.js`
+ * uses for eviction ("least-reinforced first, because recency hands the whole slot to whatever
+ * just happened") - a failure that has recurred across several separate runs is more informative
+ * than whatever happened to fail most recently.
+ */
+export class FailureLog {
+    constructor(agentName) {
+        this.fp = `./bots/${agentName}/skill_failures.json`;
+        this.entries = {}; // key -> { signature -> {count, message, last_seen} }
+        this.load();
+    }
+
+    load() {
+        try {
+            if (existsSync(this.fp)) {
+                this.entries = JSON.parse(readFileSync(this.fp, 'utf8')) || {};
+            }
+        } catch (err) {
+            // FAIL OPEN: a corrupt or unreadable store must never block code generation. Worst
+            // case we simply forget prior failures, which is the status quo this closes a gap in.
+            console.warn('[FailureLog] Failed to load store, starting empty:', err.message);
+            this.entries = {};
+        }
+    }
+
+    save() {
+        try {
+            mkdirSync(this.fp.substring(0, this.fp.lastIndexOf('/')), { recursive: true });
+            writeFileSync(this.fp, JSON.stringify(this.entries, null, 2));
+        } catch (err) {
+            console.warn('[FailureLog] Failed to save store:', err.message);
+        }
+    }
+
+    /**
+     * Record one occurrence of a failure for an intent key.
+     * @param {string} key        LearnedSkills._makeKey(intent) - stable per intent
+     * @param {string} signature  code_guard.failureSignature(code, error) - stable per distinct failure
+     * @param {string} message    short human-readable tail, for display only
+     */
+    record(key, signature, message) {
+        if (!key || !signature) return;
+        try {
+            const bucket = this.entries[key] || (this.entries[key] = {});
+            const existing = bucket[signature];
+            if (existing) {
+                existing.count += 1;
+                existing.last_seen = Date.now();
+            } else {
+                bucket[signature] = { count: 1, message: String(message || '').slice(0, 200), last_seen: Date.now() };
+            }
+            // Bound distinct signatures per intent so one flailing intent can't grow forever.
+            // Evict least-reinforced (lowest count, then oldest) - same rule as below.
+            const sigs = Object.keys(bucket);
+            if (sigs.length > FailureLog.MAX_SIGNATURES_PER_KEY) {
+                sigs.sort((a, b) => (bucket[a].count - bucket[b].count) || (bucket[a].last_seen - bucket[b].last_seen));
+                delete bucket[sigs[0]];
+            }
+            // Bound total intents tracked, same eviction rule, so the store itself cannot grow
+            // without limit across a long-running bot's whole history of intents.
+            const keys = Object.keys(this.entries);
+            if (keys.length > FailureLog.MAX_KEYS) {
+                const weakest = (k) => Object.values(this.entries[k])
+                    .reduce((acc, v) => Math.max(acc, v.count), 0);
+                keys.sort((a, b) => weakest(a) - weakest(b));
+                delete this.entries[keys[0]];
+            }
+            this.save();
+        } catch (err) {
+            console.warn('[FailureLog] Failed to record failure:', err.message);
+        }
+    }
+
+    /**
+     * Prior failures for this intent, most-repeated first, capped - meant for injection as
+     * CONTEXT the model can act on, never as a refusal. Fails open (empty array) on any missing
+     * or corrupt data.
+     * @param {string} key
+     * @param {number} limit
+     * @returns {Array<{signature:string, count:number, message:string}>}
+     */
+    getTop(key, limit = 3) {
+        try {
+            const bucket = this.entries[key];
+            if (!bucket || typeof bucket !== 'object') return [];
+            return Object.entries(bucket)
+                .map(([signature, v]) => ({ signature, count: v && v.count || 0, message: v && v.message || '' }))
+                .sort((a, b) => b.count - a.count)
+                .slice(0, Math.max(0, limit));
+        } catch (err) {
+            console.warn('[FailureLog] Failed to read store:', err.message);
+            return [];
+        }
+    }
+}
+FailureLog.MAX_SIGNATURES_PER_KEY = 12;
+FailureLog.MAX_KEYS = 300;

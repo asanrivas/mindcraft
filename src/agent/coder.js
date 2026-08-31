@@ -6,10 +6,16 @@ import * as skills from './library/skills.js';
 import * as world from './library/world.js';
 import { Vec3 } from 'vec3';
 import {ESLint} from "eslint";
-import { LearnedSkills } from './library/learned_skills.js';
+import { LearnedSkills, FailureLog } from './library/learned_skills.js';
 import { validateGeneratedCode, failureSignature, shouldRetry } from './library/code_guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+// How many prior failures for this same intent get surfaced to the model, at most. Bounded for
+// the same reason `steering.js` caps directives at 8: an unbounded list injected into every
+// prompt is a token cost that grows forever, and a small model sits on the exponential-decay
+// branch of instruction following anyway - more than a handful buys nothing.
+const MAX_PRIOR_FAILURES_SHOWN = 3;
 
 export class Coder {
     constructor(agent) {
@@ -19,6 +25,10 @@ export class Coder {
         this.code_template = '';
         this.code_lint_template = '';
         this.learned = new LearnedSkills(agent.name);
+        // Cross-invocation half of the failure-memory gap: `priorSignatures` below only lives
+        // for one generateCode() call, so nothing previously carried a failure from one
+        // !newAction to the next. See learned_skills.js's FailureLog header.
+        this.failureLog = new FailureLog(agent.name);
 
         readFile(path.join(__dirname, '../../bots/execTemplate.js'), 'utf8', (err, data) => {
             if (err) throw err;
@@ -67,8 +77,36 @@ export class Coder {
         this.agent.bot.modes.pause('unstuck');
         lockdown();
         // this message history is transient and only maintained in this function
-        let messages = agent_history.getHistory(); 
+        let messages = agent_history.getHistory();
         messages.push({role: 'system', content: 'Code generation started. Write code in codeblock in your response:'});
+
+        // Read-back half of the failure-memory gap (docs/gaps - the KNOWN LIMITATION in
+        // tests/code_guard.test.mjs): surface failures recorded against this SAME intent by an
+        // EARLIER !newAction call, so a model that keeps reaching for the same invented API
+        // across separate invocations finally sees that history. This INFORMS - it is fed in as
+        // context on the same feedback path lint/guard errors already use, and never refuses
+        // generation; see FailureLog's header for why a hard block here would be wrong (folding
+        // `bot.setBlock` -> `bot.placeBlock` arrives as a DIFFERENT error and must be allowed to
+        // retry). Fails open: any error here is swallowed and generation proceeds uninformed,
+        // exactly as if the store were empty.
+        try {
+            const intent = this._describeIntent(agent_history);
+            if (intent) {
+                const key = this.learned._makeKey(intent);
+                const priorFailures = this.failureLog.getTop(key, MAX_PRIOR_FAILURES_SHOWN);
+                if (priorFailures.length) {
+                    const lines = priorFailures.map((f, i) => `${i + 1}. (seen ${f.count}x before) ${f.message}`);
+                    messages.push({
+                        role: 'system',
+                        content: 'Note: earlier attempts at this same request failed, in previous '
+                            + 'action(s):\n' + lines.join('\n')
+                            + '\nThese are known dead ends - do not repeat them; try a different approach.'
+                    });
+                }
+            }
+        } catch (err) {
+            console.warn('[Coder] Could not read failure history:', err.message);
+        }
 
         const MAX_ATTEMPTS = 5;
         const MAX_NO_CODE = 3;
@@ -182,7 +220,17 @@ export class Coder {
                 priorSignatures.push(sig);
                 try {
                     const intent = this._describeIntent(agent_history);
-                    if (intent) this.learned.recordFailure(this.learned._makeKey(intent));
+                    if (intent) {
+                        const key = this.learned._makeKey(intent);
+                        this.learned.recordFailure(key);
+                        // The read-back half: recordFailure above only affects a skill that has
+                        // already succeeded once (the write gate learned_skills.js documents), so
+                        // an intent that has NEVER worked - the reported incident - would
+                        // otherwise leave no trace anywhere. FailureLog is keyed the same way but
+                        // has no such gate; it exists purely to be read back at the top of the
+                        // NEXT generateCode call for this intent.
+                        this.failureLog.record(key, sig, e.toString());
+                    }
                 } catch (recordErr) {
                     console.warn('[Coder] Could not record learned-skill failure:', recordErr.message);
                 }

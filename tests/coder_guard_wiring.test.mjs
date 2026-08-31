@@ -46,6 +46,9 @@ async function captureLogs(fn) {
 /** A fake prompter whose promptCoding always returns the same canned code block. */
 function makeAgent(codeFixture, extraDocs = []) {
     let promptCalls = 0;
+    // Every call's message array, in order - lets a test inspect exactly what the model was
+    // shown on a given attempt (e.g. whether a failure-history note was injected).
+    const promptMessages = [];
     const agent = {
         name: NAME,
         bot: {
@@ -59,8 +62,9 @@ function makeAgent(codeFixture, extraDocs = []) {
             skill_libary: {
                 getAllSkillDocs: async () => ['skills.wait', ...extraDocs],
             },
-            promptCoding: async () => {
+            promptCoding: async (messages) => {
                 promptCalls++;
+                promptMessages.push(messages);
                 return '```\n' + codeFixture + '\n```';
             },
         },
@@ -68,7 +72,7 @@ function makeAgent(codeFixture, extraDocs = []) {
     const history = {
         getHistory: () => ([{ role: 'user', content: 'test intent for coder wiring' }]),
     };
-    return { agent, history, calls: () => promptCalls };
+    return { agent, history, calls: () => promptCalls, promptMessages };
 }
 
 function loadTemplates(coder) {
@@ -130,6 +134,102 @@ function loadTemplates(coder) {
         lines.some(l => l.includes('Generated code threw error')));
     check('recordFailure incremented the matching learned skill',
         coder.learned.skills[key].failures >= 1);
+}
+
+/* ==========================================================================================
+ * 3. Cross-invocation read-back (the KNOWN LIMITATION comment in code_guard.test.mjs): a
+ *    failure recorded on one generateCode() call must inform - never gate - the NEXT one for
+ *    the same intent, and a first-time intent must see nothing at all.
+ * ======================================================================================== */
+{
+    // Isolate from whatever the earlier blocks wrote under this same agent name.
+    fs.rmSync(BOTS_DIR, { recursive: true, force: true });
+
+    const src = `await skills.wait(bot, 1);\nawait skills.stillNotReal(bot);`;
+    const { agent, history, promptMessages } = makeAgent(src, ['skills.stillNotReal']);
+    const coder = new Coder(agent);
+    loadTemplates(coder);
+    const flatten = (msgs) => msgs.map(m => m.content).join('\n');
+
+    // First call: this exact intent has never failed before, so nothing is injected.
+    await captureLogs(() => coder.generateCode(history));
+    check('first-time intent: no failure-history note on the very first prompt',
+        !flatten(promptMessages[0]).includes('earlier attempts at this same request failed'));
+
+    // A second, SEPARATE generateCode() call for the same intent (same Coder instance, exactly
+    // how one bot process reuses its Coder across many !newAction commands - the persisted
+    // FailureLog is what makes this durable across a restart too, unlike `priorSignatures`).
+    const secondCallStart = promptMessages.length;
+    const { result: secondResult } = await captureLogs(() => coder.generateCode(history));
+    const secondFirstPrompt = promptMessages[secondCallStart];
+    check('the prior failure now surfaces, on the very first prompt of the second call',
+        flatten(secondFirstPrompt).includes('earlier attempts at this same request failed'));
+    check('it reads as guidance, not a refusal',
+        flatten(secondFirstPrompt).includes('try a different approach'));
+    // It informs, it does not block: the second call still ran generation exactly like the
+    // first (same dedupe-driven early stop after 2 identical attempts), not a hard refusal.
+    check('generation still ran normally on the second call (informed, not blocked)',
+        typeof secondResult === 'string' && secondResult.startsWith('Code generation failed: the same failure has now happened'));
+}
+
+/* ==========================================================================================
+ * 4. The injection is bounded, and ranks by repeat count rather than recency.
+ * ======================================================================================== */
+{
+    fs.rmSync(BOTS_DIR, { recursive: true, force: true });
+
+    const src = `await skills.wait(bot, 1);`; // succeeds - only the INJECTED note is under test
+    const { agent, history, promptMessages } = makeAgent(src);
+    const coder = new Coder(agent);
+    loadTemplates(coder);
+
+    const intent = 'test intent for coder wiring';
+    const key = coder.learned._makeKey(intent);
+    // Five distinct manufactured failures with different repeat counts - more than the cap
+    // (3, see MAX_PRIOR_FAILURES_SHOWN in coder.js), so bounding has something real to cut, and
+    // the most-repeated one is NOT also the most recently recorded (recorded last, below).
+    for (let i = 0; i < 5; i++) {
+        const times = 5 - i; // fake0 repeated 5x (most) down to fake4 repeated 1x (least)
+        for (let j = 0; j < times; j++) {
+            coder.failureLog.record(key, `cg:fake${i}`, `fake failure number ${i}`);
+        }
+    }
+
+    await captureLogs(() => coder.generateCode(history));
+    const note = promptMessages[0].find(m =>
+        typeof m.content === 'string' && m.content.includes('earlier attempts at this same request failed'));
+    check('a note was injected', !!note);
+    const shown = note ? (note.content.match(/fake failure number \d/g) || []) : [];
+    check('injection is capped at 3, not all 5 distinct failures', shown.length === 3);
+    check('ranked most-repeated first: fake0 (5x) appears before fake1 (4x)',
+        !!note && note.content.indexOf('fake failure number 0') < note.content.indexOf('fake failure number 1'));
+    check('the least-repeated of the 5 (1x) is the one dropped',
+        !!note && !note.content.includes('fake failure number 4'));
+}
+
+/* ==========================================================================================
+ * 5. A corrupt or missing failure store must never block code generation (fail open).
+ * ======================================================================================== */
+{
+    fs.rmSync(BOTS_DIR, { recursive: true, force: true });
+    fs.mkdirSync(BOTS_DIR, { recursive: true });
+    fs.writeFileSync(path.join(BOTS_DIR, 'skill_failures.json'), '{not valid json');
+
+    const src = `await skills.wait(bot, 1);`;
+    const { agent, history } = makeAgent(src);
+
+    // FailureLog.load() runs synchronously in the constructor, so it has to be inside the
+    // capture too, or the warning prints straight to the real console instead of being caught.
+    let coder;
+    const { result, lines } = await captureLogs(async () => {
+        coder = new Coder(agent);
+        loadTemplates(coder);
+        return coder.generateCode(history);
+    });
+    check('generation still succeeds despite a corrupt failure store',
+        typeof result === 'string' && result.includes('Agent wrote this code'));
+    check('the corrupt store was logged rather than thrown',
+        lines.some(l => l.includes('[FailureLog] Failed to load store')));
 }
 
 fs.rmSync(BOTS_DIR, { recursive: true, force: true });

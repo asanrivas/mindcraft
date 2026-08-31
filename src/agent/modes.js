@@ -7,6 +7,7 @@ import * as nav from "./library/nav.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
 import * as farming from "./library/farming.js";
+import * as furnaceIO from "./library/furnace_io.js";
 import * as shield_guard from "./library/shield_guard.js";
 import settings from "./settings.js";
 import convoManager from "./conversation.js";
@@ -720,7 +721,19 @@ const modes_list = [
         // Sits after night_safety (skeletons at dusk still outrank dinner) and before the
         // recreational `hunting` mode below (which now need-gates on this mode's own supply
         // check - see F3, docs/gaps/food-survival.exec.md). Every decision routes through the
-        // pure `farming.decideFoodAction` - this update() only gathers live state and dispatches.
+        // pure `farming.explainFoodAction` - this update() only gathers live state and dispatches.
+        //
+        // THE FAILURE LADDER. Measured live: 53 x `Mode food_supply finished executing` /
+        // `There is no furnace nearby and you have no furnace.` / `Could not cook anything`,
+        // contending with `mode:unstuck` and `mode:self_preservation` because this mode
+        // interrupts everything. Two halves, both from `night_safety`'s written cure:
+        //
+        //  - **It gives up**, on a named line, after `FOOD_BACKOFF_MS` runs out (20s, 60s, stop).
+        //  - **The reset is an INPUT CHANGE, not a clock.** Nothing about the world or the bag
+        //    changes while the bot stands still, so a timer can only re-run a failure that is
+        //    still impossible. A furnace appearing, the inventory changing, or the bot moving
+        //    `FOOD_MOVE_RESET_BLOCKS` is new information; more time is not. That is the same
+        //    distinction as gating night_safety's reset on FULL DAYLIGHT rather than `!isNight`.
         name: "food_supply",
         description: "Acquire food when supply is low: cook raw meat, harvest crops, hunt only when starving.",
         interrupts: ["all"],
@@ -729,8 +742,9 @@ const modes_list = [
             "action:harvestCrops", "action:huntFood"],
         on: true,
         active: false,
-        cooldownUntil: 0,   // exponential backoff on a failed acquisition - the night_safety pattern
-        failures: 0,
+        // `{ signature, failures, cooldownUntil, gaveUp, reason, pos }` or null - see
+        // farming.recordFoodFailure / farming.foodRetryVerdict. Null means "no failure stands".
+        failure: null,
         update: async function (agent) {
             const bot = agent.bot;
             // Hunger cannot drain on Peaceful, so acquiring food buys nothing and the mode
@@ -738,49 +752,89 @@ const modes_list = [
             // night_safety. difficulty.isPeaceful, never the raw bot.game.difficulty field
             // (CLAUDE.md: it is a lie on Peaceful worlds).
             if (isPeaceful(bot.game)) return;
-            if (this.cooldownUntil && Date.now() < this.cooldownUntil) return;
             // Never contest the jump key with SwimAssist, and never start a land errand
             // (walking to a furnace, chasing an animal) from inside a lake.
             if (swim.inWater(bot)) return;
 
             const inv = world.getInventoryCounts(bot);
             const supply = farming.summarizeFoodSupply(inv);
-            // Existence checks only (capped at 1 result) - decideFoodAction only needs
+            // Cheapest gate first: everything below is a findBlocks sweep or an entity scan, and
+            // for a well-fed bot the answer is "do nothing" for the whole day. A full larder is
+            // also the most decisive input change there is, so any standing failure is void.
+            if (!supply.low) { this.failure = farming.clearFoodFailure(); return; }
+
+            // Existence checks only (capped at 1 result) - explainFoodAction only needs
             // "is there at least one", and scanning further every ~300ms tick is wasted work.
             const matureCropCount = world.getNearestBlocksWhere(bot, (block) => {
                 const props = typeof block.getProperties === 'function' ? block.getProperties() : undefined;
                 return farming.isMatureCrop(block.name, props);
             }, 16, 1).length;
             const huntableCount = world.getNearestEntityWhere(bot, (entity) => mc.isHuntable(entity), 24) ? 1 : 0;
+            // The COOK precondition, as an input rather than a discovery. smeltItem needs a
+            // furnace within 16 (or one in the bag to place) AND fuel; without both, "cook" is
+            // an action that cannot succeed however many times it is chosen.
+            const furnaceReachable = !!world.getNearestBlock(bot, 'furnace', 16);
+            const furnaceInBag = (inv['furnace'] || 0) > 0;
+            const fuelInBag = !!furnaceIO.pickFuelName(
+                Object.keys(inv).map((name) => ({ name, count: inv[name] })));
 
-            const action = farming.decideFoodAction({
+            const state = {
                 food: bot.food,
                 ediblePoints: supply.ediblePoints,
                 rawCookableCount: supply.rawCookableCount,
                 matureCropCount,
                 huntableCount,
-                inWater: false,   // already refused above; kept explicit so the pure call reads standalone
-                peaceful: false,  // already refused above
-                cooldownActive: false, // already refused above
-            });
+                furnaceReachable,
+                furnaceInBag,
+                fuelInBag,
+                inWater: false,        // already refused above; kept explicit so the pure call reads standalone
+                peaceful: false,       // already refused above
+                cooldownActive: false, // the backoff is the gate below, not a field of the decision
+            };
+            const { action, reason } = farming.explainFoodAction(state);
             if (action === 'none') return;
 
+            // May we attempt this again? A give-up is permanent with respect to TIME and
+            // temporary with respect to the WORLD, so the reset conditions are tested first.
+            const signature = farming.foodAttemptSignature({ action, ...state });
+            const pos = bot.entity.position;
+            const movedBlocks = this.failure && this.failure.pos
+                ? Math.hypot(pos.x - this.failure.pos.x, pos.z - this.failure.pos.z)
+                : 0;
+            const gate = farming.foodRetryVerdict(this.failure, { now: Date.now(), signature, movedBlocks });
+            if (gate.verdict === 'backoff' || gate.verdict === 'gave_up') return;
+            if (gate.reset) {
+                console.log(`[${agent.name}] food_supply retrying (${gate.reason}).`);
+                this.failure = farming.clearFoodFailure();
+            }
+
             // Cooking/harvesting are maintenance - they wait for a genuinely idle moment.
-            // Hunting is the one branch decideFoodAction reaches while actually starving
+            // Hunting is the one branch explainFoodAction reaches while actually starving
             // (food<=6 and nothing edible at all), so it alone may interrupt other work.
             if (action !== 'hunt' && !agent.isIdle()) return;
 
             const label = action === 'hunt' ? 'hunting' : action === 'cook' ? 'cooking' : 'harvesting';
             say(agent, `Food supply low - ${label}.`);
             const onDone = (result) => {
-                const worked = typeof result === 'string' && result.startsWith('VERIFIED');
-                if (worked) {
-                    this.failures = 0;
-                } else {
-                    // Back off exponentially rather than retrying on a fixed beat - the
-                    // night_safety lesson: a flat cooldown re-fires the same failure forever.
-                    this.failures = Math.min(this.failures + 1, 5);
-                    this.cooldownUntil = Date.now() + 60_000 * Math.pow(2, this.failures - 1);
+                // The skills refuse to say VERIFIED over an empty bag (farming.harvestOutcome /
+                // huntOutcome), which is what makes this test mean anything: it used to read a
+                // `VERIFIED HARVEST ... gained nothing` as a success and reset the escalation.
+                if (typeof result === 'string' && result.startsWith('VERIFIED')) {
+                    this.failure = farming.clearFoodFailure();
+                    return;
+                }
+                const next = farming.recordFoodFailure(this.failure, {
+                    now: Date.now(), signature, reason: typeof result === 'string' ? result : reason,
+                });
+                // Where the bot was when it FAILED, not where it set off from: "have I moved
+                // since?" is only new information if it is measured from the place that failed.
+                next.pos = { x: bot.entity.position.x, z: bot.entity.position.z };
+                this.failure = next;
+                if (next.gaveUp) {
+                    // Name the give-up, the way night_safety's "I cannot shelter here tonight"
+                    // does. Silence here is indistinguishable from the mode never running.
+                    say(agent, `Giving up on ${label} for now: ${next.reason} Nothing here changes by waiting, so I will try again when a furnace, my inventory or my position does.`);
+                    console.log(`[${agent.name}] food_supply gave up on ${action} after ${next.failures} identical failures: ${next.reason}`);
                 }
             };
             // Two literal-timeout call sites rather than one with a computed value - a hunt
@@ -797,9 +851,8 @@ const modes_list = [
         },
         unpause: function () {
             // New information from a person putting the mode back in charge - last attempt's
-            // failure no longer stands.
-            this.cooldownUntil = 0;
-            this.failures = 0;
+            // failure, and any give-up, no longer stand.
+            this.failure = farming.clearFoodFailure();
         },
     },
     {

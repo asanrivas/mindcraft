@@ -6384,16 +6384,22 @@ export async function huntForFood(bot, maxKills = 3, range = 48) {
 
     return finishHunt();
 
+    // An empty bag is not a VERIFIED anything. This used to read
+    // `VERIFIED HUNT: killed 0/3 (3 fled), gained nothing.` - and `mode:food_supply` keys its
+    // backoff on that word, so a hunt that caught nothing reset the escalation and the mode
+    // tried again immediately, forever. Same false success as the harvest.
     function finishHunt() {
         const afterInv = world.getInventoryCounts(bot);
         const gained = {};
+        let gainedCount = 0;
         for (const k of new Set([...Object.keys(beforeInv), ...Object.keys(afterInv)])) {
             const d = (afterInv[k] || 0) - (beforeInv[k] || 0);
-            if (d > 0) gained[k] = d;
+            if (d > 0) { gained[k] = d; gainedCount += d; }
         }
         const gainedStr = Object.entries(gained).map(([k, v]) => `${v} ${k}`).join(', ') || 'nothing';
-        const msg = `VERIFIED HUNT: killed ${kills}/${Math.min(maxKills, ranked.length)}`
-            + (fled > 0 ? ` (${fled} fled)` : '') + `, gained ${gainedStr}.`;
+        const msg = farming.huntOutcome({
+            kills, attempted: Math.min(maxKills, ranked.length), fled, gainedCount, gainedStr,
+        }).message;
         log(bot, msg);
         return msg;
     }
@@ -6449,12 +6455,28 @@ export async function cookFood(bot) {
 }
 
 /**
- * Harvest mature crops within range and replant their seeds.
+ * Harvest mature crops within range, collect what they drop, and replant them.
  *
  * Skips any crop inside an active blueprint's protected footprint (`build_guard`) - a farm must
  * not be harvested out from under the builder mid-build. Approaches through `breakBlockAt`/
- * `tillAndSow`, both of which already route through the `navToGoal` seam (S2/S3 in
- * docs/gaps/food-survival.exec.md - both were re-verified safe to reuse as-is).
+ * `tillAndSow`, both of which already route through the `navToGoal` seam.
+ *
+ * TWO ORDERING BUGS, both measured live as `VERIFIED HARVEST: broke 1/2, replanted 0/1, gained
+ * nothing.` - a crop destroyed, no food, no replant, and a string the mode read as a SUCCESS:
+ *
+ * - **The drop is collected before the replant, not after the loop.** The seed a wheat plant is
+ *   replanted with is the one it just dropped, so replanting first can only ever reach
+ *   `tillAndSow` -> `No wheat_seeds to plant.` The old code picked up every fourth crop and at
+ *   the end, which is never in time for any replant. It also settles ~300ms first: `bot.dig`
+ *   resolves when the block breaks, and the item entity arrives a tick or two later.
+ * - **The gain is MEASURED, per crop.** `farming.harvestStepVerdict` stops after
+ *   `HARVEST_NO_GAIN_LIMIT` crops broken for nothing, because a harvest that gains nothing is
+ *   strictly worse than doing nothing: the crop is gone and the bot is no better fed. Same rule
+ *   as everywhere else here - trust measured state over the block scan that said it was ripe.
+ *
+ * The report comes from `farming.harvestOutcome`, which refuses to say VERIFIED over an empty
+ * bag. `mode:food_supply` keys its backoff on that word, so a false success there is what let
+ * one impossible harvest retry 53 times.
  */
 export async function harvestCrops(bot, range = 16, replant = true) {
     const crops = world.getNearestBlocksWhere(bot, (block) => {
@@ -6466,42 +6488,66 @@ export async function harvestCrops(bot, range = 16, replant = true) {
     }, range, 64);
 
     if (crops.length === 0) {
-        const msg = `No mature crops within ${range} blocks.`;
+        const msg = farming.harvestOutcome({ found: 0, range }).message;
         log(bot, msg);
         return msg;
     }
 
     const beforeInv = world.getInventoryCounts(bot);
-    let harvested = 0;
+    const gainSince = () => {
+        const now = world.getInventoryCounts(bot);
+        let total = 0;
+        for (const k of Object.keys(now)) total += Math.max(0, (now[k] || 0) - (beforeInv[k] || 0));
+        return total;
+    };
+
+    let broke = 0;
     let replanted = 0;
-    let processed = 0;
+    let brokenSinceGain = 0;
+    let bestGain = 0;
+    let stopped = null;
 
     for (const block of crops) {
-        if (bot.interrupt_code) break;
+        if (bot.interrupt_code) { stopped = 'interrupted'; break; }
         const { x, y, z } = block.position;
         const seed = farming.seedItemFor(block.name);
-        const broke = await breakBlockAt(bot, x, y, z);
-        if (broke) {
-            harvested++;
-            if (replant && seed) {
+        if (!await breakBlockAt(bot, x, y, z)) continue;
+        broke++;
+
+        // Let the drop spawn, then collect it - BEFORE the replant, which needs the seed it
+        // just produced, and before the verdict, which is measured on what reached the bag.
+        await new Promise(r => setTimeout(r, 300));
+        await pickupNearbyItems(bot);
+
+        const gained = gainSince();
+        if (gained > bestGain) { bestGain = gained; brokenSinceGain = 0; }
+        else brokenSinceGain++;
+
+        if (replant && seed) {
+            if ((world.getInventoryCounts(bot)[seed] || 0) > 0) {
                 try {
                     if (await tillAndSow(bot, x, y - 1, z, seed)) replanted++;
-                } catch (e) { /* replanting is best-effort; the harvest itself already counted */ }
+                } catch (e) { /* best effort; the break itself already counted */ }
+            } else {
+                log(bot, `Cannot replant ${block.name}: no ${seed} in the bag (the drop did not reach me).`);
             }
         }
-        processed++;
-        if (processed % 4 === 0) await pickupNearbyItems(bot);
+
+        if (farming.harvestStepVerdict({ brokenSinceGain }) === 'stop_no_gain') { stopped = 'no_gain'; break; }
     }
     await pickupNearbyItems(bot);
 
     const afterInv = world.getInventoryCounts(bot);
     const gained = {};
+    let gainedCount = 0;
     for (const k of new Set([...Object.keys(beforeInv), ...Object.keys(afterInv)])) {
         const d = (afterInv[k] || 0) - (beforeInv[k] || 0);
-        if (d > 0) gained[k] = d;
+        if (d > 0) { gained[k] = d; gainedCount += d; }
     }
     const gainedStr = Object.entries(gained).map(([k, v]) => `${v} ${k}`).join(', ') || 'nothing';
-    const msg = `VERIFIED HARVEST: broke ${harvested}/${crops.length}, replanted ${replanted}/${harvested}, gained ${gainedStr}.`;
+    const msg = farming.harvestOutcome({
+        found: crops.length, broke, replanted, gainedCount, gainedStr, range, stopped,
+    }).message;
     log(bot, msg);
     return msg;
 }

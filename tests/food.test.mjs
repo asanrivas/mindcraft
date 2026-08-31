@@ -18,8 +18,11 @@
  */
 import {
     isMatureCrop, seedItemFor, summarizeFoodSupply, foodSupplyLine, rankHuntTargets,
-    killConfirmed, huntVerdict, cookPlan, decideFoodAction,
-    DEFAULT_BANNED, LOW_POINTS,
+    killConfirmed, huntVerdict, cookPlan, decideFoodAction, explainFoodAction,
+    cookFeasibility, harvestFeasibility, huntFeasibility,
+    foodAttemptSignature, foodRetryVerdict, recordFoodFailure, clearFoodFailure,
+    harvestStepVerdict, harvestOutcome, huntOutcome,
+    DEFAULT_BANNED, LOW_POINTS, FOOD_BACKOFF_MS, FOOD_MOVE_RESET_BLOCKS, HARVEST_NO_GAIN_LIMIT,
 } from '../src/agent/library/farming.js';
 
 let failures = 0;
@@ -208,28 +211,91 @@ checkDeep('empty', cookPlan({}), []);
 checkDeep('undefined', cookPlan(undefined), []);
 checkDeep('zero counts', cookPlan({ beef: 0 }), []);
 
+// --- feasibility: the precondition is an INPUT, never a discovery ------------------------------
+// THE 53-RETRY BUG, INVERTED. `decideFoodAction` returned 'cook' on "there is something raw in
+// the bag" and the furnace was discovered three layers down inside `smeltItem`, AFTER the mode
+// had interrupted whatever a person asked for. Same shape as `emergencyShelter` calling
+// `digDown` and ignoring its return value; the cure there was `shelterFeasibility` FIRST.
+const COOKABLE = { rawCookableCount: 4, furnaceReachable: true, furnaceInBag: false, fuelInBag: true };
+const feas = (over) => cookFeasibility({ ...COOKABLE, ...over });
+check('a furnace in range and coal in the bag', feas({}).ok, true);
+check('nothing raw is not a cook', feas({ rawCookableCount: 0 }).ok, false);
+check('...and names itself', feas({ rawCookableCount: 0 }).reason, 'nothing_raw');
+// The exact live failure: `There is no furnace nearby and you have no furnace.`
+check('NO FURNACE ANYWHERE is not a cook', feas({ furnaceReachable: false }).ok, false);
+check('...and names itself', feas({ furnaceReachable: false }).reason, 'no_furnace');
+// A furnace in the bag is a furnace: smeltItem places it and picks it back up.
+check('a carried furnace counts', feas({ furnaceReachable: false, furnaceInBag: true }).ok, true);
+// `furnaceIO.smeltVerdict` refuses without fuel just as hard as without a furnace.
+check('no fuel is not a cook', feas({ fuelInBag: false }).ok, false);
+check('...and names itself', feas({ fuelInBag: false }).reason, 'no_fuel');
+check('fuel already in the furnace counts', feas({ fuelInBag: false, fuelInFurnace: true }).ok, true);
+// Missing information is refusal, not optimism: an empty state must never authorise a cook.
+check('an empty state cannot cook', cookFeasibility({}).ok, false);
+
+check('mature crops are harvestable', harvestFeasibility({ matureCropCount: 3 }).ok, true);
+check('no crops', harvestFeasibility({ matureCropCount: 0 }).ok, false);
+check('...and names itself', harvestFeasibility({ matureCropCount: 0 }).reason, 'no_mature_crops');
+check('an empty state cannot harvest', harvestFeasibility({}).ok, false);
+
+check('starving with animals in sight', huntFeasibility({ huntableCount: 2, food: 3, ediblePoints: 0 }).ok, true);
+check('an empty desert is not a hunt', huntFeasibility({ huntableCount: 0, food: 3, ediblePoints: 0 }).ok, false);
+check('...and names itself', huntFeasibility({ huntableCount: 0, food: 3, ediblePoints: 0 }).reason, 'nothing_huntable');
+check('merely hungry is not a hunt', huntFeasibility({ huntableCount: 2, food: 12, ediblePoints: 0 }).ok, false);
+check('...and names itself', huntFeasibility({ huntableCount: 2, food: 12, ediblePoints: 0 }).reason, 'not_starving');
+check('some edible left is not a hunt', huntFeasibility({ huntableCount: 2, food: 3, ediblePoints: 5 }).ok, false);
+check('an empty state cannot hunt', huntFeasibility({}).ok, false);
+
 // --- decideFoodAction: the must-NOT-fire cases first -------------------------------------------
 const STARVING = {
     food: 3, ediblePoints: 0, rawCookableCount: 0, matureCropCount: 0, huntableCount: 4,
+    furnaceReachable: false, furnaceInBag: false, fuelInBag: false,
     inWater: false, peaceful: false, cooldownActive: false,
 };
 const decide = (over) => decideFoodAction({ ...STARVING, ...over });
+const why = (over) => explainFoodAction({ ...STARVING, ...over }).reason;
 // Peaceful freezes hunger entirely, so the whole mode is a tax on whatever a person asked for -
 // the same stand-down `night_safety` had to learn. (NOTE: this server is currently on EASY;
 // this branch exists so the mode is still correct the day the difficulty changes.)
 check('peaceful stands down', decide({ peaceful: true }), 'none');
+check('...and names itself', why({ peaceful: true }), 'peaceful');
 check('...even with everything else screaming',
-    decide({ peaceful: true, rawCookableCount: 9, matureCropCount: 9 }), 'none');
+    decide({ peaceful: true, rawCookableCount: 9, furnaceReachable: true, fuelInBag: true, matureCropCount: 9 }), 'none');
 check('in water stands down', decide({ inWater: true }), 'none');
-check('...even with raw meat in the bag', decide({ inWater: true, rawCookableCount: 9 }), 'none');
+check('...even with raw meat and a furnace',
+    decide({ inWater: true, rawCookableCount: 9, furnaceReachable: true, fuelInBag: true }), 'none');
 check('a failed attempt backs off', decide({ cooldownActive: true }), 'none');
+check('...and names itself', why({ cooldownActive: true }), 'backing_off');
 check('stocked does nothing', decide({ ediblePoints: LOW_POINTS, food: 3 }), 'none');
 check('stocked and full does nothing', decide({ ediblePoints: 40, food: 20 }), 'none');
 
-// Cheapest first: cooking needs no travel at all.
-check('raw meat in the bag means cook', decide({ rawCookableCount: 6 }), 'cook');
-check('cook wins over harvest', decide({ rawCookableCount: 6, matureCropCount: 9 }), 'cook');
-check('cook wins over hunt even while starving', decide({ rawCookableCount: 1, huntableCount: 9 }), 'cook');
+// THE DEFECT. Raw meat in the bag and no furnace within reach anywhere: this used to return
+// 'cook' and did so 53 times in one night, each time cancelling whatever the bot was doing.
+check('raw meat with NO FURNACE is never a cook', decide({ rawCookableCount: 6 }) === 'cook', false);
+check('...and with nothing else available, nothing happens at all',
+    decide({ rawCookableCount: 6, huntableCount: 0 }), 'none');
+check('...and says why', why({ rawCookableCount: 6, huntableCount: 0 }), 'no_furnace');
+check('raw meat with a furnace but no fuel is never a cook',
+    decide({ rawCookableCount: 6, furnaceReachable: true }) === 'cook', false);
+check('...and says why',
+    why({ rawCookableCount: 6, furnaceReachable: true, huntableCount: 0 }), 'no_fuel');
+// It falls through to the branch that CAN work rather than failing the one that cannot - the
+// whole point of the precondition being an input.
+check('an impossible cook falls through to a possible hunt',
+    decide({ rawCookableCount: 6 }), 'hunt');
+// ...and the blocker reported is the one worth fixing, not whichever branch happened to be last.
+check('a fixable cook outranks "no animals" in the report',
+    why({ rawCookableCount: 6, huntableCount: 0 }), 'no_furnace');
+// An impossible cook must not stop a possible harvest - it is skipped, not chosen and failed.
+check('no furnace falls through to the crops',
+    decide({ rawCookableCount: 6, matureCropCount: 4 }), 'harvest');
+
+const COOKS = { rawCookableCount: 6, furnaceReachable: true, fuelInBag: true };
+// Cheapest FEASIBLE first: cooking needs no travel at all.
+check('raw meat and a working furnace means cook', decide(COOKS), 'cook');
+check('cook wins over harvest', decide({ ...COOKS, matureCropCount: 9 }), 'cook');
+check('cook wins over hunt even while starving', decide({ ...COOKS, huntableCount: 9 }), 'cook');
+check('a carried furnace is enough', decide({ rawCookableCount: 6, furnaceInBag: true, fuelInBag: true }), 'cook');
 check('mature crops mean harvest', decide({ matureCropCount: 4 }), 'harvest');
 check('harvest wins over hunt', decide({ matureCropCount: 4, huntableCount: 9 }), 'harvest');
 
@@ -239,8 +305,138 @@ check('hungry but not starving does not hunt', decide({ food: 10 }), 'none');
 check('some edible left does not hunt', decide({ ediblePoints: 5 }), 'none');
 // An empty desert must produce silence, not a thrash - the mode interrupts everything it fires on.
 check('nothing to hunt, say nothing', decide({ huntableCount: 0 }), 'none');
+check('...and names itself', why({ huntableCount: 0 }), 'nothing_huntable');
 check('missing fields default to doing nothing', decideFoodAction({}), 'none');
 check('a completely empty state', decideFoodAction(), 'none');
+
+// --- the backoff: a failure retried on a fixed beat is the same failure forever ----------------
+// 53 x "Mode food_supply finished executing" / "There is no furnace nearby". The mode
+// interrupts everything, so each retry cancelled the bot's work; the log shows it contending
+// with `mode:unstuck` and `mode:self_preservation`. night_safety's written cure: 20s, 60s, GIVE
+// UP with a named line, and reset only on new information.
+const SIG = { action: 'cook', rawCookableCount: 4, matureCropCount: 0, huntableCount: 1, ediblePoints: 0,
+              furnaceReachable: false, furnaceInBag: false, fuelInBag: true };
+const sig = foodAttemptSignature(SIG);
+check('the same inputs give the same signature', foodAttemptSignature({ ...SIG }), sig);
+// HUNGER IS DELIBERATELY NOT IN THE SIGNATURE. It ticks down on its own, so including it would
+// reset the backoff every few seconds - a clock wearing an input's costume.
+check('hunger alone is not an input change', foodAttemptSignature({ ...SIG, food: 19 }), sig);
+check('a furnace appearing IS an input change',
+    foodAttemptSignature({ ...SIG, furnaceReachable: true }) !== sig, true);
+check('the inventory changing IS an input change',
+    foodAttemptSignature({ ...SIG, rawCookableCount: 5 }) !== sig, true);
+check('food arriving in the bag IS an input change',
+    foodAttemptSignature({ ...SIG, ediblePoints: 8 }) !== sig, true);
+check('a different action is a different attempt',
+    foodAttemptSignature({ ...SIG, action: 'harvest' }) !== sig, true);
+
+// The ladder. `now` is supplied, never read from a clock, so this is deterministic.
+check('nothing has failed yet, so run', foodRetryVerdict(null, { now: 0, signature: sig }).verdict, 'run');
+check('a cleared state runs', foodRetryVerdict(clearFoodFailure(), { now: 0, signature: sig }).verdict, 'run');
+const f1 = recordFoodFailure(null, { now: 1000, signature: sig, reason: 'There is no furnace nearby.' });
+check('the first failure counts once', f1.failures, 1);
+check('...and waits the first step', f1.cooldownUntil, 1000 + FOOD_BACKOFF_MS[0]);
+check('...and has not given up', f1.gaveUp, false);
+check('inside the first wait, back off', foodRetryVerdict(f1, { now: 5000, signature: sig }).verdict, 'backoff');
+check('one millisecond before the wait ends, still backing off',
+    foodRetryVerdict(f1, { now: f1.cooldownUntil - 1, signature: sig }).verdict, 'backoff');
+check('after the wait, try again', foodRetryVerdict(f1, { now: f1.cooldownUntil, signature: sig }).verdict, 'run');
+const f2 = recordFoodFailure(f1, { now: f1.cooldownUntil, signature: sig, reason: 'There is no furnace nearby.' });
+check('the second identical failure escalates', f2.failures, 2);
+check('...to the second step', f2.cooldownUntil - f1.cooldownUntil, FOOD_BACKOFF_MS[1]);
+check('...and still has not given up', f2.gaveUp, false);
+const f3 = recordFoodFailure(f2, { now: f2.cooldownUntil, signature: sig, reason: 'There is no furnace nearby.' });
+// THE POINT. There is no third wait: the ladder runs out and the mode stops, on a named reason.
+check('the third identical failure GIVES UP', f3.gaveUp, true);
+check('...carrying the refusal verbatim so the line names itself',
+    f3.reason, 'There is no furnace nearby.');
+check('a give-up does not expire with time',
+    foodRetryVerdict(f3, { now: f3.cooldownUntil + 86400000, signature: sig }).verdict, 'gave_up');
+check('...however long you wait',
+    foodRetryVerdict(f3, { now: Number.MAX_SAFE_INTEGER, signature: sig, movedBlocks: 0 }).verdict, 'gave_up');
+
+// THE RESET IS AN INPUT CHANGE, NOT A CLOCK. A furnace appearing, the bag changing, or the bot
+// standing somewhere else. This is the same distinction as gating night_safety's reset on FULL
+// DAYLIGHT rather than on `!isNight`.
+const sigFurnace = foodAttemptSignature({ ...SIG, furnaceReachable: true });
+const reset = foodRetryVerdict(f3, { now: f3.cooldownUntil + 1, signature: sigFurnace });
+check('a furnace appearing resets the give-up', reset.verdict, 'run');
+check('...and tells the caller to drop the stale state', reset.reset, true);
+check('...and names the trigger', reset.reason, 'inputs_changed');
+check('an input change beats a live backoff too',
+    foodRetryVerdict(f1, { now: 1001, signature: sigFurnace }).verdict, 'run');
+check('moving far enough resets it',
+    foodRetryVerdict(f3, { now: 0, signature: sig, movedBlocks: FOOD_MOVE_RESET_BLOCKS }).verdict, 'run');
+check('...but shuffling on the spot does not',
+    foodRetryVerdict(f3, { now: 0, signature: sig, movedBlocks: FOOD_MOVE_RESET_BLOCKS - 0.01 }).verdict, 'gave_up');
+check('no movement information is not movement',
+    foodRetryVerdict(f3, { now: 0, signature: sig }).verdict, 'gave_up');
+// A DIFFERENT problem starts its own count - inheriting the last one's escalation would give up
+// after zero evidence about the new one.
+const other = recordFoodFailure(f2, { now: 0, signature: sigFurnace, reason: 'no fuel' });
+check('a different failure restarts the count', other.failures, 1);
+check('...and does not inherit the give-up', other.gaveUp, false);
+// Success is the strongest reset there is.
+check('clearing means the next attempt runs',
+    foodRetryVerdict(clearFoodFailure(), { now: 0, signature: sig }).verdict, 'run');
+
+// MUTATION CHECK. If the backoff were removed - if `foodRetryVerdict` always said 'run' - the
+// sequence below would be 53 identical attempts. Replaying the exact live scenario against the
+// real functions must terminate; the count is the assertion.
+let mutState = null, attempts = 0, clock = 0;
+for (let tick = 0; tick < 2000; tick++) {          // ~10 minutes of 300ms mode ticks
+    clock += 300;
+    const g = foodRetryVerdict(mutState, { now: clock, signature: sig, movedBlocks: 0 });
+    if (g.verdict !== 'run') continue;
+    if (g.reset) mutState = clearFoodFailure();
+    attempts++;
+    mutState = recordFoodFailure(mutState, { now: clock, signature: sig, reason: 'There is no furnace nearby.' });
+}
+// 3 = one attempt per rung of the ladder plus the one that latches the give-up. Anything more
+// and the escalation is not escalating; anything less and the first try never happened.
+check('a permanently impossible action is attempted exactly 3 times, not 53', attempts, FOOD_BACKOFF_MS.length + 1);
+check('...and the state says so', mutState.gaveUp, true);
+
+// --- the harvest that destroyed a crop and gained nothing --------------------------------------
+// Live: `VERIFIED HARVEST: broke 1/2, replanted 0/1, gained nothing.` The crop is gone, the bot
+// is no better fed, and the word VERIFIED made the mode read it as a SUCCESS and reset its
+// backoff. A harvest that gains nothing must refuse, and it must replant what it takes.
+check('a crop that gained something keeps going', harvestStepVerdict({ brokenSinceGain: 0 }), 'continue');
+check('a crop broken for nothing stops the harvest',
+    harvestStepVerdict({ brokenSinceGain: HARVEST_NO_GAIN_LIMIT }), 'stop_no_gain');
+check('the limit is one crop, not a field', HARVEST_NO_GAIN_LIMIT, 1);
+check('an empty state continues', harvestStepVerdict({}), 'continue');
+
+const gainedNothing = harvestOutcome({ found: 2, broke: 1, replanted: 0, gainedCount: 0, gainedStr: 'nothing', range: 16 });
+check('THE EXACT LIVE STRING is not a success', gainedNothing.ok, false);
+check('...and does not say VERIFIED', gainedNothing.message.startsWith('VERIFIED'), false);
+check('...it says REFUSED', gainedNothing.message.includes('HARVEST REFUSED'), true);
+check('...and names the reason', gainedNothing.reason, 'no_gain');
+const good = harvestOutcome({ found: 9, broke: 9, replanted: 9, gainedCount: 22, gainedStr: '9 wheat, 13 wheat_seeds', range: 16 });
+check('a real harvest is VERIFIED', good.ok, true);
+check('...and says so', good.message.startsWith('VERIFIED HARVEST'), true);
+check('...and reports the replant', good.message.includes('replanted 9/9'), true);
+const partial = harvestOutcome({ found: 9, broke: 3, replanted: 3, gainedCount: 7, gainedStr: '3 wheat, 4 wheat_seeds', stopped: 'no_gain' });
+check('stopping early is still a success if food arrived', partial.ok, true);
+check('...and says it stopped', partial.message.includes('Stopped early'), true);
+check('nothing mature is not a refusal to be ashamed of',
+    harvestOutcome({ found: 0, range: 8 }).message, 'No mature crops within 8 blocks.');
+check('...and is not a success', harvestOutcome({ found: 0, range: 8 }).ok, false);
+check('found but unbreakable names itself', harvestOutcome({ found: 4, broke: 0 }).reason, 'nothing_broken');
+check('an empty state is not a VERIFIED harvest', harvestOutcome().ok, false);
+
+// The same false success in the hunt: `VERIFIED HUNT: killed 0/3 (3 fled), gained nothing.`
+const emptyHunt = huntOutcome({ kills: 0, attempted: 3, fled: 3, gainedCount: 0, gainedStr: 'nothing' });
+check('a hunt that caught nothing is not VERIFIED', emptyHunt.ok, false);
+check('...and says so', emptyHunt.message.startsWith('HUNT FAILED'), true);
+check('...and names it', emptyHunt.reason, 'no_kills');
+// Killed it and never picked the meat up: still an empty bag, still not a success.
+check('a kill with no drops collected is not a success',
+    huntOutcome({ kills: 2, attempted: 3, gainedCount: 0 }).reason, 'no_drops');
+const realHunt = huntOutcome({ kills: 2, attempted: 3, fled: 1, gainedCount: 5, gainedStr: '3 beef, 2 porkchop' });
+check('meat in the bag is a VERIFIED hunt', realHunt.ok, true);
+check('...and reports the fled', realHunt.message.includes('(1 fled)'), true);
+check('an empty state is not a VERIFIED hunt', huntOutcome().ok, false);
 
 console.log(failures === 0 ? 'food: all checks passed' : `food: ${failures} FAILED`);
 process.exit(failures);

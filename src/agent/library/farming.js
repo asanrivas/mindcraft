@@ -328,39 +328,292 @@ export function cookPlan(invCounts) {
     return plan;
 }
 
-/**
- * The mode's whole decision, as one pure function.
+/* ------------------------------------------------------------------------------------------ *
+ * FEASIBILITY - the precondition is an INPUT to the decision, never a discovery made after it
  *
- * `s`: `{ food, ediblePoints, rawCookableCount, matureCropCount, huntableCount, inWater,
- *        peaceful, cooldownActive }`. Returns 'none' | 'cook' | 'harvest' | 'hunt'.
+ * `decideFoodAction` used to return 'cook' on "there is something raw in the bag", full stop.
+ * The furnace was discovered by `smeltItem`, three layers down, AFTER the mode had already
+ * interrupted whatever a person asked for and announced "Food supply low - cooking." Measured
+ * live: 53 x `Mode food_supply finished executing` / `There is no furnace nearby and you have
+ * no furnace.` / `Could not cook anything (stopped at potato).`
+ *
+ * This is the same shape as `emergencyShelter`, which used to call `digDown` and ignore its
+ * return value; the cure there was `shelterFeasibility` running BEFORE any ground is broken.
+ * A decision function that cannot see the precondition will keep choosing the impossible
+ * action forever, and every refusal below therefore names itself.
+ * ------------------------------------------------------------------------------------------ */
+
+/** Hunger at or below which a 45-second chase is worth starting. */
+export const HUNT_HUNGER = 6;
+
+/**
+ * Can we actually cook? `smeltItem` needs a furnace it can reach (skills.js: nearest 'furnace'
+ * within 16, else one placed from the bag) AND fuel (`furnaceIO.smeltVerdict` refuses without
+ * `hasFuelInSlot || fuelAvailable`).
+ *
+ * `fuelInFurnace` exists as an input because a furnace already burning does not need fuel from
+ * the bag - but nothing outside an open window can see that, so its default is `false` and the
+ * refusal is conservative. A refusal costs the model one manual `!cookFood`; a false "yes"
+ * costs every action in the agent, repeatedly.
+ */
+export function cookFeasibility(s = {}) {
+    if ((s.rawCookableCount ?? 0) <= 0) return { ok: false, reason: 'nothing_raw' };
+    if (!s.furnaceReachable && !s.furnaceInBag) return { ok: false, reason: 'no_furnace' };
+    if (!s.fuelInBag && !s.fuelInFurnace) return { ok: false, reason: 'no_fuel' };
+    return { ok: true, reason: 'ok' };
+}
+
+/** Are there mature crops in range at all? (`matureCropCount` is already `isMatureCrop`-filtered.) */
+export function harvestFeasibility(s = {}) {
+    if ((s.matureCropCount ?? 0) <= 0) return { ok: false, reason: 'no_mature_crops' };
+    return { ok: true, reason: 'ok' };
+}
+
+/**
+ * Hunting is a 45-second chase that ends in a fight, so it is reserved for actual starvation
+ * with nothing else available - `not_starving` is a refusal, not a fallback.
+ */
+export function huntFeasibility(s = {}) {
+    if ((s.huntableCount ?? 0) <= 0) return { ok: false, reason: 'nothing_huntable' };
+    const points = Number.isFinite(s.ediblePoints) ? s.ediblePoints : 0;
+    const food = Number.isFinite(s.food) ? s.food : 20;
+    if (!(food <= HUNT_HUNGER && points === 0)) return { ok: false, reason: 'not_starving' };
+    return { ok: true, reason: 'ok' };
+}
+
+/**
+ * The mode's whole decision, with the reason attached.
+ *
+ * `s`: `{ food, ediblePoints, rawCookableCount, matureCropCount, huntableCount,
+ *         furnaceReachable, furnaceInBag, fuelInBag, fuelInFurnace,
+ *         inWater, peaceful, cooldownActive }`
+ *
+ * Returns `{ action: 'none'|'cook'|'harvest'|'hunt', reason }`. When the answer is 'none' the
+ * reason is the FIRST thing that blocked it, most-relevant-first: a bag of raw pork and no
+ * furnace reads `no_furnace`, not `nothing_huntable`, so the log says what to fix.
  *
  * The stand-downs come first and every one of them is load-bearing:
  *  - **peaceful**: hunger does not drain at all, so acquiring food buys nothing and the mode is
  *    a pure tax on whatever a person asked for - the same reasoning that made `night_safety`
  *    stand down. (Read it via `difficulty.isPeaceful`; `bot.game.difficulty` is a lie here.)
  *  - **inWater**: never contest the jump key, and never start a land errand from a lake.
- *  - **cooldownActive**: a failed acquisition must back off, not retry on a beat -
- *    `night_safety` printed the same failure every 20s all night before it learned this.
+ *  - **cooldownActive**: a failed acquisition must back off, not retry on a beat - see
+ *    `foodRetryVerdict`.
  *  - **stocked**: judged on SUPPLY, not on hunger. A hungry bot with three loaves needs no
  *    acquisition; auto-eat will handle the meal.
  *
- * Then cheapest-first: cooking needs no travel, harvesting is a short walk to a known plot, and
- * hunting is a 45-second chase - so hunting is reserved for actual starvation with nothing else
- * available. `huntableCount === 0` falls through to 'none' rather than to a search, so an empty
- * desert produces silence instead of a thrash.
+ * Then cheapest-FEASIBLE-first: cooking needs no travel, harvesting is a short walk, hunting is
+ * a chase. An infeasible branch is skipped rather than chosen and failed.
  */
-export function decideFoodAction(s = {}) {
-    if (s.peaceful) return 'none';
-    if (s.inWater) return 'none';
-    if (s.cooldownActive) return 'none';
+export function explainFoodAction(s = {}) {
+    if (s.peaceful) return { action: 'none', reason: 'peaceful' };
+    if (s.inWater) return { action: 'none', reason: 'in_water' };
+    if (s.cooldownActive) return { action: 'none', reason: 'backing_off' };
 
     const points = Number.isFinite(s.ediblePoints) ? s.ediblePoints : 0;
-    if (points >= LOW_POINTS) return 'none';
+    if (points >= LOW_POINTS) return { action: 'none', reason: 'stocked' };
 
-    if ((s.rawCookableCount ?? 0) > 0) return 'cook';
-    if ((s.matureCropCount ?? 0) > 0) return 'harvest';
+    const cook = cookFeasibility(s);
+    if (cook.ok) return { action: 'cook', reason: 'ok' };
+    const harvest = harvestFeasibility(s);
+    if (harvest.ok) return { action: 'harvest', reason: 'ok' };
+    const hunt = huntFeasibility(s);
+    if (hunt.ok) return { action: 'hunt', reason: 'ok' };
 
-    const food = Number.isFinite(s.food) ? s.food : 20;
-    if (food <= 6 && points === 0 && (s.huntableCount ?? 0) > 0) return 'hunt';
-    return 'none';
+    // Nothing is possible. Report the blocker of the branch that was closest to being taken:
+    // raw meat with no furnace is a fixable situation and must not be reported as "no animals".
+    if (cook.reason !== 'nothing_raw') return { action: 'none', reason: cook.reason };
+    if (hunt.reason === 'not_starving') return { action: 'none', reason: 'not_starving' };
+    return { action: 'none', reason: harvest.reason === 'no_mature_crops' ? hunt.reason : harvest.reason };
+}
+
+/** The action alone. Kept as its own export because that is what the mode dispatches on. */
+export function decideFoodAction(s = {}) {
+    return explainFoodAction(s).action;
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * BACKOFF AND GIVE-UP - a failure retried on a fixed beat is the same failure forever
+ *
+ * `night_safety` printed `Dug in at y=111 but could not seal the roof` every twenty seconds all
+ * night, interrupting the bot three times a minute, and the cure documented in CLAUDE.md is:
+ * back off 20s, then 60s, then GIVE UP with a named line, and reset only on genuinely new
+ * information (there: full daylight, deliberately NOT `!isNight`, because those two predicates
+ * do not partition the day).
+ *
+ * `food_supply` had the escalating cooldown but neither of the other two halves, and the log
+ * shows what that costs: 53 attempts contending with `mode:unstuck` and
+ * `mode:self_preservation`. Two changes:
+ *
+ * 1. **It gives up.** Two identical failures is evidence; there is no third.
+ * 2. **The reset is an INPUT CHANGE, not a clock.** Nothing about the world or the bag changes
+ *    while the bot stands still, so a timer can only re-run a failure that is still impossible.
+ *    A furnace appearing, the inventory changing, or the bot moving `FOOD_MOVE_RESET_BLOCKS` is
+ *    new information; the passage of time is not. (Hunger is deliberately NOT in the signature:
+ *    it ticks down on its own and would reset the backoff every few seconds - a clock wearing
+ *    an input's costume.)
+ * ------------------------------------------------------------------------------------------ */
+
+/** Escalating waits, then give up. Same ladder as `night_safety`. */
+export const FOOD_BACKOFF_MS = Object.freeze([20000, 60000]);
+/** How far the bot must move for "somewhere else" to count as new information. */
+export const FOOD_MOVE_RESET_BLOCKS = 16;
+
+/**
+ * The identity of an attempt: everything the decision was made from, EXCEPT the clock and
+ * anything that drifts on its own. Two attempts with the same signature are the same attempt,
+ * so failing twice is failing at the same impossible thing twice.
+ */
+export function foodAttemptSignature(s = {}) {
+    const n = (v) => (Number.isFinite(v) ? Math.min(Math.max(Math.trunc(v), 0), 999) : 0);
+    return [
+        s.action ?? 'none',
+        s.furnaceReachable ? 'F' : '-',
+        s.furnaceInBag ? 'B' : '-',
+        s.fuelInBag ? 'U' : '-',
+        n(s.rawCookableCount),
+        n(s.matureCropCount),
+        n(s.huntableCount),
+        n(s.ediblePoints),
+    ].join('|');
+}
+
+/** A clean slate. Success, and being genuinely stocked, both produce one. */
+export function clearFoodFailure() {
+    return null;
+}
+
+/**
+ * May we attempt again? `state` is whatever `recordFoodFailure` last returned (or null).
+ * `s`: `{ now, signature, movedBlocks }`.
+ *
+ * Returns `{ verdict: 'run'|'backoff'|'gave_up', reset, reason }`. `reset` means the stored
+ * failure state is stale and the caller must drop it - the inputs are not the ones that failed.
+ *
+ * **The reset conditions are checked BEFORE `gaveUp`, and nothing else is.** That ordering is
+ * the whole design: a give-up is permanent with respect to TIME and temporary with respect to
+ * the WORLD, which is exactly what `night_safety`'s dawn reset means and why it is gated on
+ * full daylight rather than on a timer.
+ */
+export function foodRetryVerdict(state, s = {}) {
+    if (!state || (!state.failures && !state.gaveUp)) {
+        return { verdict: 'run', reset: false, reason: 'first_attempt' };
+    }
+    if (state.signature != null && s.signature != null && s.signature !== state.signature) {
+        return { verdict: 'run', reset: true, reason: 'inputs_changed' };
+    }
+    if (Number.isFinite(s.movedBlocks) && s.movedBlocks >= FOOD_MOVE_RESET_BLOCKS) {
+        return { verdict: 'run', reset: true, reason: 'moved' };
+    }
+    if (state.gaveUp) return { verdict: 'gave_up', reset: false, reason: state.reason ?? 'gave_up' };
+    if (Number.isFinite(state.cooldownUntil) && Number.isFinite(s.now) && s.now < state.cooldownUntil) {
+        return { verdict: 'backoff', reset: false, reason: 'cooling_down' };
+    }
+    return { verdict: 'run', reset: false, reason: 'cooldown_expired' };
+}
+
+/**
+ * Fold one failed attempt into the state. `s`: `{ now, signature, reason }`.
+ *
+ * A failure under a DIFFERENT signature restarts the count at 1 - it is a different problem,
+ * and inheriting the previous one's escalation would give up on it after zero evidence.
+ * Running off the end of `FOOD_BACKOFF_MS` latches `gaveUp`, carrying the caller's `reason`
+ * verbatim so the give-up line names itself instead of saying "failed".
+ */
+export function recordFoodFailure(state, s = {}) {
+    const now = Number.isFinite(s.now) ? s.now : 0;
+    const signature = s.signature ?? null;
+    const same = state && state.signature != null && state.signature === signature;
+    const failures = (same ? (state.failures ?? 0) : 0) + 1;
+    const wait = FOOD_BACKOFF_MS[failures - 1];
+    if (wait === undefined) {
+        return { signature, failures, cooldownUntil: 0, gaveUp: true, reason: s.reason ?? 'repeated failure' };
+    }
+    return { signature, failures, cooldownUntil: now + wait, gaveUp: false, reason: s.reason ?? null };
+}
+
+/* ------------------------------------------------------------------------------------------ *
+ * HARVEST - a harvest that gains nothing is strictly worse than doing nothing
+ *
+ * Measured live: `VERIFIED HARVEST: broke 1/2, replanted 0/1, gained nothing.` The crop was
+ * destroyed, no food reached the bag, nothing was replanted - and the string still began with
+ * VERIFIED, so the mode read it as a SUCCESS and reset its own backoff.
+ *
+ * Two causes, both fixed in `skills.harvestCrops`: the drop was collected only every fourth
+ * crop and at the end, so the replant ran before the seed the crop had just dropped was in the
+ * bag (`tillAndSow` -> `No wheat_seeds to plant.` -> `replanted 0/1`); and nothing measured
+ * whether breaking crops was achieving anything.
+ * ------------------------------------------------------------------------------------------ */
+
+/**
+ * How many crops may be broken for zero gain before the harvest stops.
+ *
+ * ONE. The drop is now collected and measured immediately after each break, so a mature crop
+ * that yields nothing is not a slow tick - it is evidence that the drops are not reaching the
+ * bag. Continuing costs the field a block at a time for nothing; stopping costs the caller one
+ * retry. (`night_safety` waits for the third identical failure because each attempt there is
+ * free; here every attempt destroys a crop.)
+ */
+export const HARVEST_NO_GAIN_LIMIT = 1;
+
+/** Continue breaking crops? `s`: `{ brokenSinceGain }`. */
+export function harvestStepVerdict(s = {}) {
+    return (s.brokenSinceGain ?? 0) >= HARVEST_NO_GAIN_LIMIT ? 'stop_no_gain' : 'continue';
+}
+
+/**
+ * The harvest's report - **and whether it is a VERIFIED one**.
+ *
+ * `s`: `{ found, broke, replanted, gainedCount, gainedStr, range, stopped }`.
+ *
+ * `ok` is false whenever nothing reached the bag, and the mode keys its backoff on exactly
+ * that: a string that begins with VERIFIED while reporting `gained nothing` is how a permanent
+ * failure passed for success 53 times.
+ */
+export function harvestOutcome(s = {}) {
+    const found = s.found ?? 0;
+    const broke = s.broke ?? 0;
+    const replanted = s.replanted ?? 0;
+    const gainedCount = s.gainedCount ?? 0;
+    const gainedStr = s.gainedStr || 'nothing';
+    const range = s.range ?? 16;
+
+    if (found === 0) return { ok: false, reason: 'no_mature_crops', message: `No mature crops within ${range} blocks.` };
+    if (broke === 0) {
+        return { ok: false, reason: 'nothing_broken', message: `HARVEST REFUSED: found ${found} mature crop(s) but could not break any.` };
+    }
+    if (gainedCount <= 0) {
+        return {
+            ok: false, reason: 'no_gain',
+            message: `HARVEST REFUSED: broke ${broke}/${found} and gained nothing, so I stopped rather than destroy more crops for no food.`,
+        };
+    }
+    const tail = s.stopped === 'no_gain' ? ' Stopped early: the later crops gained nothing.'
+        : s.stopped === 'interrupted' ? ' Stopped early: interrupted.' : '';
+    return {
+        ok: true, reason: 'ok',
+        message: `VERIFIED HARVEST: broke ${broke}/${found}, replanted ${replanted}/${broke}, gained ${gainedStr}.${tail}`,
+    };
+}
+
+/**
+ * The hunt's report, with the same rule: an empty bag is not a VERIFIED anything.
+ *
+ * `finishHunt` used to say `VERIFIED HUNT: killed 0/3 (3 fled), gained nothing.` - which the
+ * mode counted as a success and reset its backoff on, the same false-success as the harvest.
+ */
+export function huntOutcome(s = {}) {
+    const kills = s.kills ?? 0;
+    const attempted = s.attempted ?? 0;
+    const fled = s.fled ?? 0;
+    const gainedCount = s.gainedCount ?? 0;
+    const gainedStr = s.gainedStr || 'nothing';
+    const fledStr = fled > 0 ? ` (${fled} fled)` : '';
+    if (gainedCount <= 0) {
+        return {
+            ok: false, reason: kills > 0 ? 'no_drops' : 'no_kills',
+            message: `HUNT FAILED: killed ${kills}/${attempted}${fledStr}, gained nothing.`,
+        };
+    }
+    return { ok: true, reason: 'ok', message: `VERIFIED HUNT: killed ${kills}/${attempted}${fledStr}, gained ${gainedStr}.` };
 }

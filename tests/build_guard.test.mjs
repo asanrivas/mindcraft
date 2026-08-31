@@ -156,5 +156,89 @@ check('a sealed bot can still plan an exit through its own wall',
 clearProtectedBuild();
 check('teardown after the world tests', isProtecting(), false);
 
+// ==================================================================================================
+// `bridgeAhead` had layer 2 (refuse) but not layer 3 (relent): it returned
+// `{ placed: false, reason: 'that cell belongs to the build' }` unconditionally the moment the
+// footing cell it wanted to bridge onto was protected - no escape path at all. That cannot
+// entomb the bot the way the digAhead bug could (bridging is only reached at a gap, not every
+// wall), but it can strand it at a gap it will refuse to span forever, with the goal on the
+// other side and no other route.
+//
+// `bridgeAhead` is not exported (it needs a live bot, block_io and skills.js to actually place a
+// block), so the pieces it is built from - `trappedByBuild` and `protectVerdict` - are exercised
+// directly with geometry shaped like a bridge, not a sealed room: a gap in a wall whose far
+// landing cell is inside the build. The wiring itself (does `bridgeAhead` actually call them, and
+// does it log the relent) is checked against the source, the same way this suite's sibling
+// `tests/bridge.test.mjs` already checks integration-level wiring it cannot mock (the pinned-leg
+// scaling, `goToPlayer`'s distance check) - by reading the function body and asserting on it.
+// ==================================================================================================
+
+// A straight wall with ONE gap in it (a doorway), and the footing cell a bridge would land on is
+// the far side of that gap, INSIDE the build. There is a way around, `trappedByBuild` sees the
+// doorway, so this is "merely walking past a wall" - the refusal must stand.
+const wallWithGap = new Set();
+for (let z = -10; z <= 10; z++) for (let y = 64; y <= 66; y++) {
+    if (z === 0) continue;   // the gap
+    wallWithGap.add(`10,${y},${z}`);
+}
+const gapWorld = plainWorld(wallWithGap);
+
+clearProtectedBuild();
+protectBuild(cells(wallWithGap));
+check('walking past a wall with an open route is NOT trapped',
+    trappedByBuild(gapWorld(10, 0)), false);
+check('...so the refusal for that footing cell must stand',
+    protectVerdict({ protectedCell: true, enclosed: trappedByBuild(gapWorld(10, 0)) }).allow, false);
+
+// A bot genuinely boxed in, where the only cell it could bridge across is protected: this is
+// the box from LAYER 3 above, reused for the bridging case specifically. `trappedByBuild` must
+// say true, and the policy must relent.
+clearProtectedBuild();
+protectBuild(cells(box));
+check('boxed in with only a protected cell to cross must be seen as trapped',
+    trappedByBuild(boxWorld(15, 15)), true);
+check('...and the policy relents rather than stranding the bot at the gap',
+    protectVerdict({ protectedCell: true, enclosed: trappedByBuild(boxWorld(15, 15)) }).allow, true);
+
+// A footing cell outside the build's footprint entirely must never enter this decision at all -
+// `bridgeAhead` only calls `trappedByBuild`/`protectVerdict` once `isProtected` says yes.
+check('a footing cell outside the build is simply unprotected, not evaluated',
+    isProtected(4900, 67, 4900), false);
+
+clearProtectedBuild();
+check('teardown after the bridge-relent geometry', isProtecting(), false);
+
+// --- the wiring: does bridgeAhead itself actually call the relent, and does it log it? ---------
+{
+    const src = (await import('fs')).readFileSync(
+        new URL('../src/agent/library/nav.js', import.meta.url), 'utf8');
+    const start = src.indexOf('async function bridgeAhead');
+    const end = src.indexOf('// Jumping - the cheap way across a gap', start);
+    check('found bridgeAhead in nav.js', start >= 0 && end > start, true);
+    const fn = src.slice(start, end);
+
+    check('bridgeAhead measures whether it is actually trapped before refusing',
+        /trappedByBuild\(bot\)/.test(fn), true);
+    check('...using the same enclosed() || trappedByBuild() pattern digAhead uses',
+        /enclosed\(bot\)\s*\|\|\s*trappedByBuild\(bot\)/.test(fn), true);
+    check('...and asks the same policy digAhead does',
+        /buildGuard\.protectVerdict\(\{\s*protectedCell:\s*true,\s*enclosed:/.test(fn), true);
+    // The refusal must be CONDITIONAL on the verdict, not unconditional - otherwise the relent
+    // is computed and then ignored, which reads identically to "fixed" in a diff but changes
+    // nothing at runtime.
+    check('the refusal only fires when the verdict disallows it',
+        /if\s*\(!v\.allow\)\s*\{\s*return \{ placed: false, reason: 'that cell belongs to the build' \};/.test(fn),
+        true);
+    // Refusals must be logged (CLAUDE.md: a silent refusal path is indistinguishable from a
+    // branch that never runs at all). The relent is the far more dangerous silence, since it is
+    // the one case where the bot is about to breach its own build. Require the log call, the
+    // verdict's own reason (`v.why`, matching digAhead rather than a hardcoded string that could
+    // drift from the policy), and the words that say what happened, all within the relent branch.
+    const afterAllow = fn.slice(fn.indexOf('if (!v.allow)'));
+    check('a relent is logged, naming the breach - never silent',
+        /console\.log/.test(afterAllow) && /v\.why/.test(afterAllow)
+        && /breaching the build/.test(afterAllow), true);
+}
+
 console.log(failures === 0 ? 'build_guard: all checks passed' : `build_guard: ${failures} FAILURE(S)`);
 process.exit(failures === 0 ? 0 : 1);

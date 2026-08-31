@@ -1143,8 +1143,22 @@ async function bridgeAhead(bot, yaw, wet) {
     // put dirt in a cell the blueprint wanted to hold a brown_carpet, and it was still there an
     // hour later. Self-healing eventually - the builder digs it out when it reaches that cell -
     // but until then it is litter inside the house, and the dig is work that need not exist.
+    //
+    // Same relent as `digAhead`: refuse, UNLESS there is no way off the build's footprint that
+    // does not cross this cell - a bot that will not bridge its own only way out is stuck at the
+    // gap forever, which is worse than a plank the builder's verification pass repairs. Computed
+    // only when a protected cell is actually in the way, since the flood fill is not free; see
+    // `digAhead` and `trappedByBuild` for why `enclosed(bot)` alone is not the right measurement.
     if (buildGuard.isProtected(f.x, f.y, f.z)) {
-        return { placed: false, reason: 'that cell belongs to the build' };
+        const trapped = enclosed(bot) || trappedByBuild(bot);
+        const v = buildGuard.protectVerdict({ protectedCell: true, enclosed: trapped });
+        if (!v.allow) {
+            return { placed: false, reason: 'that cell belongs to the build' };
+        }
+        // Say it out loud. Breaching the build is the one thing this guard exists to prevent,
+        // so the case where it is allowed must never be silent.
+        console.log(`[${bot.username ?? '?'}] bridge: ${v.why} - `
+            + `breaching the build at (${f.x}, ${f.y}, ${f.z})`);
     }
     // 'top' asks to build off the block BELOW the target first; the cell under our own feet is
     // solid and horizontally adjacent, so placeBlock's fallback sweep finds that face. At ~1.22

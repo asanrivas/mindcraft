@@ -1,5 +1,6 @@
 import { Vec3 } from 'vec3';
 import { digWithTool, isTreeTrunk, isLavaName, isSwimmable, isBubbleColumn, isWaterName } from './tools.js';
+import * as buildGuard from './build_guard.js';
 // swim.js imports only tools.js, so this is not a cycle.
 import { climbBank } from './swim.js';
 
@@ -73,6 +74,14 @@ const DEFAULTS = {
     // wide, so a detour is trivial, while chopping is slower and wrecks the landscape. Priced
     // as a strong preference rather than a ban so a bot boxed in by trees cannot deadlock.
     treeDigCost: 60,
+    // A cell the ACTIVE BUILD owns. Priced far above treeDigCost because the thing being
+    // protected is not scenery - it is the work in progress, and mining through it costs the
+    // build twice (once to breach, once to repair). The number is chosen against the site, not
+    // picked for feel: the footprint is ~32x31, so walking the long way round the outside is at
+    // most ~120 blocks, and 200 keeps "go around" cheaper than "go through" for every route
+    // that exists. FINITE on purpose - a bot sealed inside its own walls must still be able to
+    // plan an exit, which is why this is a price and build_guard's refusal has an escape valve.
+    buildDigCost: 200,
     // Digging a cell that will FLOOD is not a route, it is a longer swim. On land a dug block
     // yields a path; at or below the waterline it yields water, so the bot pays the effort and
     // gains nothing - then does it again one block further on. That is how it "dug a canal"
@@ -267,7 +276,12 @@ function digCostAt(ctx, x, y, z) {
     for (const dy of [0, 1]) {
         if ((dy === 0 ? feet : head) !== SOLID) continue;
         n++;
-        const base = isTreeTrunk(nameAt(ctx, x, y + dy, z)) ? o.treeDigCost : o.digCost;
+        // A cell the active build owns is priced so high that A* only routes through the
+        // structure when there is genuinely no way round it - high, but FINITE, because a bot
+        // sealed inside its own walls still has to be able to plan an exit. See build_guard.js.
+        const base = buildGuard.isProtected(x, y + dy, z) ? o.buildDigCost
+                   : isTreeTrunk(nameAt(ctx, x, y + dy, z)) ? o.treeDigCost
+                   : o.digCost;
         cost += floods(y + dy) ? Math.max(base, o.floodDigCost) : base;
     }
     if (n === 0) return null;
@@ -500,18 +514,23 @@ export function surfaceY(bot, x, z, from = 100, to = 0) {
 }
 
 /**
- * Look `range` blocks along a heading and report what is coming, so callers can react before
- * walking into it rather than after stalling against it.
- * @returns {{clear:boolean, distance:number|null, kind:string|null, rise:number, drop:number, water:number}}
- */
-/**
  * Is the bot walled in - no standable cell in any of the eight directions, at any of the heights
  * an ordinary move could reach?
  *
- * Not used to decide anything: the recovery ladder digs out perfectly well and the planner routes
- * through a wall in 1ms. This exists so the bot can SAY it is walled in. A bot grinding silently
- * against stone for minutes because it has no pickaxe is indistinguishable, from outside, from a
- * bot ignoring you.
+ * IT WAS WRITTEN TO DECIDE NOTHING, AND THAT IS NO LONGER TRUE. This docstring used to say "not
+ * used to decide anything" - it existed only so the bot could SAY it was walled in, because a bot
+ * grinding silently against stone with no pickaxe is indistinguishable, from outside, from a bot
+ * ignoring you. That reporting use is still live (`skills.js` names the obstacle with it).
+ *
+ * Two consumers now DECIDE on it: the `sealed` field below, and the trapped-relent valve in
+ * `digAhead`, which pairs it with `trappedByBuild`. Read the next paragraph before adding a third.
+ *
+ * WHAT IT CANNOT ANSWER: "am I sealed inside a structure?" It asks whether ONE adjacent standable
+ * cell exists, which is true for any bot standing in a room - it can walk around inside its own
+ * tomb. Passing it as the "walled in" signal is exactly the bug that made build_guard's relent
+ * valve unreachable, so a bot sealed in its own finished build refused every wall and recentred
+ * until the watchdog killed it. Reachability needs a search, not a neighbour probe:
+ * `trappedByBuild` does that. Keep this one for the local, one-step question only.
  */
 export function enclosed(bot) {
     const ctx = { bot, o: DEFAULTS, cache: new Map() };
@@ -524,6 +543,69 @@ export function enclosed(bot) {
     return true;
 }
 
+/**
+ * How much free space we will search before giving up on finding a way out. See FAILS OPEN below.
+ */
+const TRAP_FLOOD_BUDGET = 2000;
+
+/**
+ * Is the bot inside the ACTIVE BUILD with no way out that does not go through it?
+ *
+ * This is build_guard's layer 3 - the thing that makes the guard safe to turn on at all. A
+ * refusal to mine the walls has to relent when the walls are the only thing between the bot and
+ * the rest of the world, or, in build_guard's own words, the better the builder gets at walls
+ * the more reliably it entombs itself.
+ *
+ * `enclosed()` above cannot answer this and must not be used for it: it asks whether there is a
+ * standable cell in any of the eight directions, which is true for ANY bot standing in a room.
+ * A bot sealed in a finished house walks around inside it perfectly well, so `enclosed` reads
+ * false and the valve never fires in the one situation it exists for.
+ *
+ * So: a flood fill over standable cells, using the same moves the planner has (eight
+ * directions, one step up, `maxDrop` down), bounded to the build's own XZ footprint. Reaching
+ * any standable cell OUTSIDE the footprint means there is a way out - a door, an unfinished
+ * side, a gap - and the refusal stands. Running out of frontier means there is not.
+ *
+ * FAILS OPEN, the same way `openObstruction` in chest.js does. An exhausted budget answers
+ * "trapped", because being wrong that way costs one block that the builder's verification pass
+ * repairs, while being wrong the other way costs the bot until someone restarts it.
+ */
+export function trappedByBuild(bot) {
+    const box = buildGuard.protectedBox();
+    if (!box) return false;                       // no build registered: nothing to be trapped by
+    const p = bot.entity.position.floored();
+    const outside = (x, z) => x < box.minX || x > box.maxX || z < box.minZ || z > box.maxZ;
+    // Off the footprint already, or standing on top of it under open sky: whatever is pinning
+    // the bot, it is not the build sealing it in - and relenting there would let the navigator
+    // mine a wall it is merely walking past, which is the bug the guard exists to stop.
+    if (outside(p.x, p.z) || p.y > box.maxY) return false;
+
+    const ctx = { bot, o: DEFAULTS, cache: new Map() };
+    const seen = new Set([key(p.x, p.y, p.z)]);
+    const queue = [[p.x, p.y, p.z]];
+    for (let head = 0; head < queue.length; head++) {
+        if (seen.size > TRAP_FLOOD_BUDGET) return true;
+        const [x, y, z] = queue[head];
+        for (const [dx, dz] of [[1, 0], [-1, 0], [0, 1], [0, -1], [1, 1], [1, -1], [-1, 1], [-1, -1]]) {
+            for (let dy = DEFAULTS.stepUp; dy >= -DEFAULTS.maxDrop; dy--) {
+                const nx = x + dx, ny = y + dy, nz = z + dz;
+                const k = key(nx, ny, nz);
+                if (seen.has(k)) continue;
+                if (standCost(ctx, nx, ny, nz) === null) continue;
+                if (outside(nx, nz)) return false;   // a way out that is not through the build
+                seen.add(k);
+                queue.push([nx, ny, nz]);
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * Look `range` blocks along a heading and report what is coming, so callers can react before
+ * walking into it rather than after stalling against it.
+ * @returns {{clear:boolean, distance:number|null, kind:string|null, rise:number, drop:number, water:number}}
+ */
 export function scanAhead(bot, dx, dz, range = 10) {
     const o = DEFAULTS;
     const ctx = { bot, o, cache: new Map() };
@@ -1057,6 +1139,13 @@ async function bridgeAhead(bot, yaw, wet) {
 
     const material = skills.pickBuildMaterial(bot);
     const f = probe.footing;
+    // Never scaffold into the build. Measured 2026-08-30: `bridge: laid dirt at (4716, 67, 4614)`
+    // put dirt in a cell the blueprint wanted to hold a brown_carpet, and it was still there an
+    // hour later. Self-healing eventually - the builder digs it out when it reaches that cell -
+    // but until then it is litter inside the house, and the dig is work that need not exist.
+    if (buildGuard.isProtected(f.x, f.y, f.z)) {
+        return { placed: false, reason: 'that cell belongs to the build' };
+    }
     // 'top' asks to build off the block BELOW the target first; the cell under our own feet is
     // solid and horizontally adjacent, so placeBlock's fallback sweep finds that face. At ~1.22
     // blocks the target is outside placeBlock's 1.1 "too close" retreat, which is why the
@@ -1363,12 +1452,32 @@ async function digAhead(bot, yaw) {
     const p = bot.entity.position;
     const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
     const skipped = [];
+    let trapped = null;   // lazily measured, and only when a protected cell is actually in the way
     for (const dy of [0, 1]) {
         const t = new Vec3(Math.floor(p.x + fx * 0.8), Math.floor(p.y) + dy, Math.floor(p.z + fz * 0.8));
         const b = bot.blockAt(t);
         if (!b || b.name.includes('water')) { skipped.push(`${dy}:${b ? b.name : 'unloaded'}`); continue; }
         if (b.name === 'air' || b.name === 'cave_air') { skipped.push(`${dy}:air`); continue; }
         if (isTreeTrunk(b.name)) { skipped.push(`${dy}:tree`); continue; }   // walk around, do not fell
+        // Same rule, for the bot's own construction: walk around, do not demolish. Relented on
+        // only when there is no way out that is not through the build - a bot that cannot dig
+        // its way out of its own walls stays there until the watchdog kills it, and the builder
+        // repairs whatever it removes on the verification pass.
+        if (buildGuard.isProtected(t.x, t.y, t.z)) {
+            // `enclosed(bot)` is NOT the measurement this wants, and passing it made the valve
+            // decorative: it only fires for a bot in a literal one-cell pocket, and a bot sealed
+            // inside a finished room walks around inside it perfectly well. `trappedByBuild`
+            // asks the real question - is there any way off the footprint that is not through
+            // the build. `enclosed` is kept as the degenerate case, and it is the cheap one, so
+            // it goes first. Computed at most once per call: the flood fill is not free.
+            trapped ??= (enclosed(bot) || trappedByBuild(bot));
+            const v = buildGuard.protectVerdict({ protectedCell: true, enclosed: trapped });
+            if (!v.allow) { skipped.push(`${dy}:build`); continue; }
+            // Say it out loud. Breaching the build is the one thing this guard exists to
+            // prevent, so the case where it is allowed must never be silent.
+            console.log(`[${bot.username ?? '?'}] digAhead: ${v.why} - `
+                + `breaching the build at (${t.x}, ${t.y}, ${t.z})`);
+        }
         // REFUSE TO DIG A HOLE THAT WILL FLOOD. Underwater a dug block yields water, not
         // passage: the bot pays the effort, gains a longer swim, and repeats one block on. That
         // is exactly how it mined a canal instead of climbing a one-block bank - measured at
@@ -1452,6 +1561,12 @@ async function jumpTowardGoal(bot, goal, gate) {
     return await jumpAcross(bot, bot.entity.yaw, wet, gate);
 }
 
+/** A full block under the FEET CELL. The world's answer, never `onGround`. */
+function standingOnSolid(bot) {
+    const b = bot.blockAt?.(bot.entity.position.floored().offset(0, -1, 0));
+    return !!b && b.boundingBox === 'block';
+}
+
 /**
  * Should a stuck bot tower straight up?
  *
@@ -1472,7 +1587,7 @@ async function jumpTowardGoal(bot, goal, gate) {
 export function towerUpVerdict(s) {
     const no = (reason, rise = 0) => ({ ok: false, rise, reason });
     if (!s) return no('no state');
-    if (s.wet) return no('wet - climbBank owns leaving the water');
+    if (s.wet) return no('afloat - nothing under my feet to place against');
     if (!s.hasBlocks) return no('nothing stackable to pillar with');
 
     const cap = s.maxRise ?? 8;
@@ -1499,7 +1614,17 @@ async function towerTowardGoal(bot, goal, budget) {
     const v = towerUpVerdict({
         botY: p.y,
         goalY: goal.y,
-        wet: !!bot.entity.isInWater,
+        // AFLOAT, not merely WET. Those are different states and conflating them is documented
+        // (CLAUDE.md, "WADING is not AFLOAT") as paralysing the bot completely - which is exactly
+        // what it did here. Found live: andy in one block of water against a 0.50-block bank,
+        // `climbBank: jammed` on repeat, and BOTH fallbacks standing down for it -
+        // `jump: REFUSED (wet - SwimAssist owns the jump key)` and
+        // `tower: REFUSED (wet - climbBank owns leaving the water)`. Nothing was left to act.
+        //
+        // Afloat, towering is genuinely impossible: there is nothing under the feet to place
+        // against. WADING is land for this purpose - the bot is standing on solid ground with
+        // its head in air, and can place a block and step up like anywhere else.
+        wet: !!bot.entity.isInWater && !standingOnSolid(bot),
         hasBlocks: hasBuildingBlocks(bot),
         // Roofed AND with nowhere to walk. `enclosed` existed only so the bot could SAY it was
         // walled in; this is the first thing that decides anything on it, and the pairing is

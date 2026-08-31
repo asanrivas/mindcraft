@@ -9,10 +9,14 @@
  *   - `bot.collectBlock.collect(block)`  -> mineflayer-collectblock -> mineflayer-pathfinder
  *   - `goToPosition(...)`                -> mineflayer-pathfinder
  *
- * Pathfinder will not move this bot at all (see CLAUDE.md: `onGround` reads false while the bot
- * is provably standing, and pathfinder will not even plan over a 1-block step). Three live
- * `!collectBlocks` calls for gold, lapis and copper produced ZERO log output - not a failure
- * message, nothing. That silence is why the mining task looked stalled rather than broken.
+ * Pathfinder's EXECUTOR cannot move this bot. (Corrected 2026-08-26: this comment used to say
+ * pathfinder "will not even plan over a 1-block step", which is false and mattered - measured
+ * with tools/pathfinder_probe.mjs, a 1-block step PLANS in 6ms with status=success, and the
+ * `goto` that follows times out after 30s having moved 3.1 blocks. Planning is fine; only
+ * execution is broken, so a stale plan-blaming diagnosis sends the next reader hunting the
+ * wrong bug.) Three live `!collectBlocks` calls for gold, lapis and copper produced ZERO log
+ * output - not a failure message, nothing. That silence is why the mining task looked stalled
+ * rather than broken.
  *
  * So this module never calls pathfinder. It uses the same stack the navigation rebuild proved:
  * `nav.navigateTo` / `nav.planPath` for movement and `tools.digWithTool` for breaking blocks.
@@ -490,4 +494,204 @@ function verifiedLine(r) {
     if (r.stopped) s += ` Stopped: ${r.stopped}.`;
     if (r.descendStopped) s += ` Descent ended early: ${r.descendStopped}.`;
     return s;
+}
+
+// =================================================================================================
+// DESCENT - the pure decision layer
+// =================================================================================================
+//
+// WHY THIS EXISTS (the 2026-08-29 incident, docs/gaps/resource-progression.exec.md §2)
+// ------------------------------------------------------------------------------------
+// `staircaseDown` returned `no descent progress` at (4529,-45,4715) after digging ONE block in
+// FOUR seconds, and the model - given nothing but that generic stall - "fixed" it by freelancing
+// `digDown`/`navTo` down into the bedrock layer, where it oscillated for about two hours.
+//
+// Four faults, all of them visible in the code above:
+//
+//  1. `pickOpenDirection` scores AIR +1. That is exactly right for starting a CORRIDOR (air is
+//     rock you do not have to dig) and exactly backwards for a DESCENT: at deepslate-cave
+//     altitude the airiest direction is usually a cave mouth, and a staircase needs something
+//     to cut into.
+//  2. The direction is chosen ONCE, outside the loop, and never revised.
+//  3. Each step inspects three cells - feet, head, floor - and NEVER the landing at (0,-2,0),
+//     so it will happily cut a step that hangs over open air.
+//  4. Over that open air the digs return 'skipped' (already air), so `dug` stays ~0, and
+//     `planPath` has no move at all into a floorless column: a level move needs a standable
+//     cell (nav.js standCost), the drop scan needs ground within maxDrop, and the dig fallback
+//     needs `below === SOLID` (nav.js digCostAt). The plan fails in MILLISECONDS - which is the
+//     only way three stalls fit in four seconds. A tool stall would have cost 8s each
+//     (DIG_TIMEOUT_MS), and lava would have said 'unsafe cell'.
+//
+// Everything below is PURE: block NAMES in, a tagged verdict out, no bot and no clock, the same
+// shape as nav.js's `jumpVerdict` / `bridgeVerdict` / `waterExitVerdict`. The live wiring (turn
+// on stall) is deliberately a separate change; this layer only has to be right.
+
+/** How many steps ahead a direction is probed before it is scored. */
+export const DESCENT_PROBE = 6;
+
+/**
+ * The real floor of this world, and the honest limits above it.
+ *
+ * 1.18+ overworld generation runs from y=-64 up; bedrock occupies -64 (always) through -60
+ * (patchy noise). `DEEPEST_MINE_Y` is the post-incident clamp: diamond peaks near -59, but -59
+ * is INSIDE the noise band the model got lost in, so no plan may aim below -53. Four blocks of
+ * expected diamond density is a cheap price for never again standing in bedrock wondering why
+ * digging down does nothing.
+ */
+export const WORLD_BOTTOM_Y = -64;
+export const BEDROCK_TOP_Y = -60;
+export const DEEPEST_MINE_Y = -53;
+
+/** Re-base a relative reader on a cell offset, so `safeToBreak` can be asked about any of them. */
+const shiftReader = (at, [ox, oy, oz]) => (dx, dy, dz) => at(ox + dx, oy + dy, oz + dz);
+
+/**
+ * Decide ONE staircase step. PURE.
+ *
+ * The reader is relative to the cell directly AHEAD at the bot's foot level - the same
+ * `(dx,dy,dz) => name` shape `safeToBreak` takes. The four cells that matter:
+ *
+ *      (0, 1,0)  head    <- dug
+ *      (0, 0,0)  feet    <- dug
+ *      (0,-1,0)  floor   <- dug; this is where the bot ends up standing IN
+ *      (0,-2,0)  LANDING <- must be solid. NEVER CHECKED BEFORE; this is the whole bug.
+ *
+ * @param {(dx:number,dy:number,dz:number)=>string} at
+ * @returns {{ok:true, cells:number[][], landing:string}
+ *          | {ok:false, turn:boolean, reason:string}}
+ *   `turn: true`  - this direction is wrong but the bot is fine; try another bearing.
+ *   `turn: false` - fatal for the whole descent; turning would only re-open the same hazard
+ *                   from a different angle (a lava lake does not end at a cell boundary).
+ */
+export function descentStepVerdict(at) {
+    const FEET = [0, 0, 0], HEAD = [0, 1, 0], FLOOR = [0, -1, 0], LANDING = [0, -2, 0];
+
+    const landing = at(...LANDING);
+    // Unknown is never air and never rock - it is "I cannot see", the invariant the world guard
+    // and the swim code both had to learn the hard way.
+    if (landing === 'unknown')
+        return { ok: false, turn: false, reason: 'unloaded chunk below the landing' };
+    // LAVA IS NOT A LANDING. Every other verdict in this codebase refuses it outright rather
+    // than pricing it, because a miss costs the bot AND its inventory and nothing recovers that.
+    // Fatal rather than a turn: a lava lake is wider than one cell, so turning just breaks into
+    // the same lake from a different bearing.
+    if (landing === 'lava' || landing === 'flowing_lava')
+        return { ok: false, turn: false, reason: 'lava below the landing' };
+
+    // The cells we would actually break. Air is not dug (digCell returns 'skipped'), so it is not
+    // listed - and a step where ALL THREE are already air is the cave signature below.
+    const cells = [];
+    for (const cell of [FEET, HEAD, FLOOR]) {
+        const name = at(...cell);
+        if (name === 'unknown') return { ok: false, turn: false, reason: 'unloaded chunk' };
+        if (isAir(name)) continue;
+        const v = safeToBreak(shiftReader(at, cell));
+        if (!v.ok) return { ok: false, turn: false, reason: v.reason };
+        cells.push(cell);
+    }
+
+    if (isAir(landing)) {
+        // Nothing solid to stand on. Two shapes, named apart because they mean different things
+        // to whoever reads the log: an open landing under a solid step is a ledge over a cavity;
+        // an entirely open column is the bot staring straight into a cave.
+        return cells.length === 0
+            ? { ok: false, turn: true, reason: 'no floor ahead' }
+            : { ok: false, turn: true, reason: 'open landing' };
+    }
+    // Water is a benign hazard - the swim stack recovers from it - but a staircase into a
+    // flooded pocket floods the staircase, so turn rather than continue.
+    if (FLUIDS.has(landing))
+        return { ok: false, turn: true, reason: `${landing} below the landing` };
+
+    return { ok: true, cells, landing };
+}
+
+/**
+ * Score one horizontal bearing FOR DESCENT. PURE.
+ *
+ * THE INVERSION, and why it is not just a sign flip. `pickOpenDirection` scores air +1 and it is
+ * right to: a corridor is cheapest through rock that is already gone, and a corridor stays at
+ * one Y, so air ahead costs nothing. A staircase is the opposite problem in both halves - it
+ * needs material to cut a step INTO, and it needs a floor to land ON one block lower each step.
+ * Air fails both, so it is scored -1 here, once for the cut and once for the landing.
+ *
+ * The probe follows the DESCENDING DIAGONAL, not the flat ray `pickOpenDirection` walks: step i
+ * cuts at (i, -(i-1)) and lands on (i, -i-1), because the bot drops one block per step. Probing
+ * the flat ray would score the rock a corridor would meet, which is not the rock this move eats.
+ *
+ * @param {(step:number, dy:number)=>string} at  name `step` cells along the bearing, `dy` above
+ *                                               the bot's foot level
+ * @returns {number} >0 means "there is rock here worth cutting"; <=0 means refuse this bearing.
+ */
+export function descentDirectionScore(at, probe = DESCENT_PROBE) {
+    let score = 0;
+    for (let i = 1; i <= probe; i++) {
+        const cut = at(i, -(i - 1));       // what the step breaks into
+        const support = at(i, -i - 1);     // what the bot stands on afterwards
+        // Unloaded is the least attractive answer, exactly as in pickOpenDirection: we cannot
+        // price what we cannot see, and guessing "air" here is what walks a bot into a cave.
+        if (cut === 'unknown' || support === 'unknown') { score -= 5; break; }
+        if (FLUIDS.has(cut) || FLUIDS.has(support)) { score -= 20; break; }
+        // Bedrock ends the staircase in this bearing; it is not a hazard, it is a wall.
+        if (UNBREAKABLE.has(cut)) { score -= 2; break; }
+        score += isAir(cut) ? -1 : 1;
+        score += isAir(support) ? -1 : 1;
+    }
+    return score;
+}
+
+/**
+ * Pick a bearing to cut a staircase along. LIVE, but only as a reader over the pure scorer.
+ *
+ * @param {object} bot
+ * @param {{x:number,z:number}[]} exclude  bearings already tried (turn-on-stall passes these)
+ * @returns {{x:number,z:number,score:number}|null}
+ *   null means EVERY remaining bearing refuses - which, at depth, is the "open cavern" the
+ *   incident stalled in. A named refusal is the thing the model needed and did not get.
+ */
+export function pickDescentDirection(bot, exclude = []) {
+    const dirs = [{ x: 1, z: 0 }, { x: -1, z: 0 }, { x: 0, z: 1 }, { x: 0, z: -1 }];
+    const skip = new Set(exclude.map(d => `${d.x},${d.z}`));
+    const p = bot.entity.position.floored();
+    let best = null, bestScore = 0;    // 0, not -Infinity: no rock to cut into is a REFUSAL,
+                                       // not a least-bad choice to commit a whole descent to.
+    for (const d of dirs) {
+        if (skip.has(`${d.x},${d.z}`)) continue;
+        const at = (i, dy) => readBlock(bot, p.offset(d.x * i, dy, d.z * i)).name;
+        const score = descentDirectionScore(at);
+        if (score > bestScore) { bestScore = score; best = { x: d.x, z: d.z, score }; }
+    }
+    return best;
+}
+
+/**
+ * How far the bot is from the depth it wanted. PURE.
+ * @returns {{above:number}|{below:number}|{at:true}}
+ */
+export function depthDelta(y, targetY) {
+    const d = Math.round(y) - Math.round(targetY);
+    if (d > 0) return { above: d };
+    if (d < 0) return { below: -d };
+    return { at: true };
+}
+
+/**
+ * One line of depth awareness, or null. PURE.
+ *
+ * Null on the surface, so the normal prompt costs nothing - the same rule the in-water and
+ * jump lines in `!stats` follow. It exists because during the incident the model had no way to
+ * know it was BELOW the layer it was digging toward: from y=-58, "dig down to find diamond" is
+ * not slow, it is impossible, and it spent two hours proving that.
+ */
+export function depthAdvisory(y) {
+    const yi = Math.round(y);
+    if (yi >= 0) return null;
+    if (yi <= BEDROCK_TOP_Y)
+        return `y=${yi} is INSIDE the bedrock layer (${WORLD_BOTTOM_Y}..${BEDROCK_TOP_Y}); `
+             + 'there is no way down from here - dig UP.';
+    if (yi < DEEPEST_MINE_Y)
+        return `y=${yi} is ${DEEPEST_MINE_Y - yi} BELOW the deepest useful mining level `
+             + `(y=${DEEPEST_MINE_Y}); only bedrock lies under you - dig UP, not down.`;
+    return `y=${yi}: underground, ${yi - DEEPEST_MINE_Y} above the deepest useful mining level `
+         + `(y=${DEEPEST_MINE_Y}).`;
 }

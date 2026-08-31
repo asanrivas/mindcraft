@@ -82,9 +82,14 @@ check('sealed in rises even with a level goal', towerUpVerdict({ ...stuck, seale
 check('a level goal on open ground is refused', towerUpVerdict(stuck).ok, false);
 check('one block up is not enough to tower for', towerUpVerdict({ ...stuck, goalY: 61 }).ok, false);
 check('a goal BELOW us is refused', towerUpVerdict({ ...stuck, goalY: 50 }).ok, false);
-// Leaving water belongs to climbBank, which is tuned for it - and placing does not work afloat.
-check('wet is refused even when sealed and the goal is above',
+// AFLOAT is refused - there is nothing under the feet to place against. The caller passes
+// `wet` only when genuinely afloat, NOT merely in water: a WADING bot stands on solid ground
+// with its head in air and can pillar like anywhere else. Conflating the two deadlocked a bot
+// in one block of water with climbBank jammed and every fallback standing down for it.
+check('afloat is refused even when sealed and the goal is above',
       towerUpVerdict({ ...stuck, goalY: 70, sealed: true, wet: true }).ok, false);
+check('wading (not afloat) may tower toward a goal above',
+      towerUpVerdict({ ...stuck, goalY: 70, wet: false }).ok, true);
 check('no blocks is refused', towerUpVerdict({ ...stuck, goalY: 70, hasBlocks: false }).ok, false);
 check('a spent budget is refused', towerUpVerdict({ ...stuck, goalY: 70, maxRise: 0 }).ok, false);
 check('no state is a refusal, not a throw', towerUpVerdict(undefined).ok, false);

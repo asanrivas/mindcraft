@@ -1,15 +1,61 @@
 import * as world from '../library/world.js';
 import * as skills from '../library/skills.js';
 import * as swim from '../library/swim.js';
+import * as farming from '../library/farming.js';
+import * as mining from '../library/mining.js';
 import * as mc from '../../utils/mcdata.js';
 import { getCommandDocs } from './index.js';
 import convoManager from '../conversation.js';
 import { checkLevelBlueprint, checkBlueprint } from '../tasks/construction_tasks.js';
 import { load } from 'cheerio';
 import Vec3 from 'vec3';
+import fs from 'fs';
 
 const pad = (str) => {
     return '\n' + str + '\n';
+}
+
+/**
+ * Pure: describe one already-parsed blueprint JSON as a placement count and bounding-box
+ * footprint. `blueprint_builder.js` owns the actual build/status engines and its own
+ * `placements || raw` shape - mirrored here rather than imported, since queries.js is the only
+ * file this integration pass may edit for this feature (blueprint_builder.js is a different
+ * workstream's file). Never throws on junk: an empty or malformed placements array reads as
+ * `count: 0`, not an exception - the caller (`listBlueprints`, below) is what decides a file is
+ * unreadable, from a JSON.parse failure, not from a shape it merely didn't expect.
+ */
+export function summarizeBlueprint(parsed) {
+    const placements = Array.isArray(parsed?.placements) ? parsed.placements
+        : Array.isArray(parsed) ? parsed : [];
+    if (placements.length === 0) return { count: 0, size: null, name: parsed?.meta?.name || null };
+
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const p of placements) {
+        if (typeof p?.x !== 'number' || typeof p?.y !== 'number' || typeof p?.z !== 'number') continue;
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+    }
+    const size = Number.isFinite(minX)
+        ? { width: maxX - minX + 1, height: maxY - minY + 1, length: maxZ - minZ + 1 }
+        : null;
+    return { count: placements.length, size, name: parsed?.meta?.name || null };
+}
+
+/** Pure: render a `!blueprints` listing. Empty is a true answer, not an error. */
+export function formatBlueprintList(entries) {
+    if (!entries || entries.length === 0) return 'No blueprints found in blueprints/.';
+    let res = 'BLUEPRINTS:';
+    for (const e of entries) {
+        if (e.error) {
+            res += `\n- ${e.file} (unreadable: ${e.error})`;
+            continue;
+        }
+        const sizeStr = e.size ? `${e.size.width}x${e.size.height}x${e.size.length}` : 'unknown size';
+        res += `\n- ${e.file}: ${e.count} blocks, ${sizeStr}${e.name ? ` ("${e.name}")` : ''}`;
+    }
+    return res;
 }
 
 // queries are commands that just return strings and don't affect anything in the world
@@ -86,6 +132,17 @@ export const queryList = [
                 // than as "the bot is being weird today".
                 if (st) res += ` for ${st.downMinutes.toFixed(0)} min, ${st.failures} failed attempt(s), next retry in ${st.retryInSec}s`;
             }
+
+            // Only rendered when supply is low or hunger is about to matter - a well-fed bot
+            // with a full bag pays zero extra prompt tokens, same rule as the water/jump lines.
+            const foodLine = farming.foodSupplyLine(
+                farming.summarizeFoodSupply(world.getInventoryCounts(bot)), bot.food);
+            if (foodLine) res += `\n- ${foodLine}`;
+
+            // Only rendered underground (y < 0) - this is the awareness that was missing when
+            // the model dug DOWN toward an ore band it was already below, for two hours.
+            const depthLine = mining.depthAdvisory(pos.y);
+            if (depthLine) res += `\n- Depth: ${depthLine}`;
 
 
             let players = world.getNearbyPlayerNames(bot);
@@ -347,7 +404,8 @@ export const queryList = [
     },
     {
         name: '!getCraftingPlan',
-        description: "Provides a comprehensive crafting plan for a specified item. This includes a breakdown of required ingredients, the exact quantities needed, and an analysis of missing ingredients or extra items needed based on the bot's current inventory.",
+        description: "Provides a comprehensive crafting plan for a specified item. This includes a breakdown of required ingredients, the exact quantities needed, and an analysis of missing ingredients or extra items needed based on the bot's current inventory. "
+            + "Use !progressTo to actually acquire the item; this only prints the plan.",
         params: {
             targetItem: { 
                 type: 'string', 
@@ -418,7 +476,8 @@ export const queryList = [
     },
     {
         name: '!buildStatus',
-        description: 'Diff the world against a blueprint JSON: how much is built, and the nearest wrong blocks as Place/Replace fixes.',
+        description: 'Diff the world against a blueprint JSON: how much is built, and the nearest wrong blocks as Place/Replace fixes. '
+            + 'Use !blueprints to list valid file paths.',
         params: {
             'file': { type: 'string', description: 'Placements JSON path relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
             'x': { type: 'int', description: 'World X of the blueprint origin.' },
@@ -528,6 +587,33 @@ export const queryList = [
         description: 'Lists all available commands and their descriptions.',
         perform: async function (agent) {
             return getCommandDocs(agent);
+        }
+    },
+    {
+        name: '!blueprints',
+        description: 'List the blueprint JSON files available to !buildBlueprint and !buildStatus, with block counts and footprint. '
+            + 'Use this first to get a valid file path.',
+        params: {},
+        perform: function (agent) {
+            const dir = 'blueprints';
+            let files;
+            try {
+                files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+            } catch (e) {
+                return pad(`No blueprints directory found (${e.message}).`);
+            }
+            const entries = files.map((f) => {
+                const file = `${dir}/${f}`;
+                try {
+                    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+                    return { file, ...summarizeBlueprint(parsed) };
+                } catch (e) {
+                    // A malformed file is listed as unreadable, not hidden - it must not silently
+                    // drop the rest of an otherwise-good directory listing.
+                    return { file, error: e.message };
+                }
+            });
+            return pad(formatBlueprintList(entries));
         }
     },
 ];

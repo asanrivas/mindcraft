@@ -854,7 +854,7 @@ export const actionsList = [
     },
     {
         name: '!collectBlocks',
-        description: 'Collect the nearest blocks of a given type. Do NOT use for ores - use !branchMine, which digs down to the ore layer instead of searching for exposed ore.',
+        description: 'Collect the nearest blocks of a given type. Do NOT use for ores - use !branchMine, which digs down to the ore layer instead of searching for exposed ore. Do NOT use on wheat/carrots/potatoes - use !harvestCrops, which checks maturity and replants.',
         params: {
             'type': { type: 'BlockName', description: 'The block type to collect.' },
             'num': { type: 'int', description: 'The number of blocks to collect.', domain: [1, Number.MAX_SAFE_INTEGER] }
@@ -928,7 +928,8 @@ export const actionsList = [
     },
     {
         name: '!buildBlueprint',
-        description: 'Hand-build a blueprint JSON block by block, flying to each position and placing by hand. Slow, but leaves a survival-legal build.',
+        description: 'Hand-build a blueprint JSON block by block, flying to each position and placing by hand. Slow, but leaves a survival-legal build. '
+            + 'Use !blueprints to list valid file paths.',
         params: {
             'file': { type: 'string', description: 'Path to the placements JSON, relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
             'x': { type: 'int', description: 'World X of the blueprint origin (its local 0,0,0 min-corner).' },
@@ -1219,7 +1220,7 @@ export const actionsList = [
     },
     {
         name: '!attack',
-        description: 'Attack and kill the nearest entity of a given type.',
+        description: 'Attack and kill the nearest entity of a given type. Do NOT use to gather food - use !huntFood, which chases fleeing animals and confirms kills.',
         params: {'type': { type: 'string', description: 'The type of entity to attack.'}},
         perform: runAsAction(async (agent, type) => {
             await skills.attackNearest(agent.bot, type, true);
@@ -1453,7 +1454,8 @@ export const actionsList = [
     },
     {
         name: '!digDown',
-        description: 'Digs down a specified distance. Will stop if it reaches lava, water, or a fall of >=4 blocks below the bot.',
+        description: 'Digs down a specified distance. Will stop if it reaches lava, water, or a fall of >=4 blocks below the bot. '
+            + 'Do NOT use to reach an ore layer - use !progressTo or !branchMine, which stop at the right depth.',
         params: {'distance': { type: 'int', description: 'Distance to dig down', domain: [1, Number.MAX_SAFE_INTEGER] }},
         perform: runAsAction(async (agent, distance) => {
             await skills.digDown(agent.bot, distance)
@@ -1569,6 +1571,20 @@ export const actionsList = [
         }, false, 20)
     },
     {
+        name: '!progressTo',
+        description: 'Acquire an item via the full tech tree: gather, craft, smelt and mine every prerequisite automatically. '
+            + 'Use for tool or gear targets like iron_pickaxe. '
+            + 'Do NOT drive the steps yourself with !collectBlocks or !craftRecipe - one call runs the whole chain and reports VERIFIED counts. '
+            + 'Takes up to 55 minutes; interrupting it is safe, it resumes.',
+        params: {
+            'itemName': { type: 'ItemName', description: 'The item to acquire, e.g. iron_pickaxe.' },
+            'num': { type: 'int', description: 'How many to end up with. Default 1.', domain: [1, 64], optional: true }
+        },
+        perform: runAsAction(async (agent, itemName, num = 1) => {
+            return await skills.progressTo(agent.bot, itemName, num);
+        }, true, 60)
+    },
+    {
         name: '!creativeIdSweep',
         description: 'Diagnostic: give one of each id-sweep sample so item ids can be checked server-side.',
         perform: runAsAction(async (agent) => {
@@ -1589,5 +1605,39 @@ export const actionsList = [
                 ? `GAME MODE: creative. Item ids OK (asked ${p.asked}, got ${p.got}).`
                 : `GAME MODE: creative. ITEM ID MISMATCH - asked ${p.asked} (id ${p.askedId}), got ${p.got ?? 'nothing'} (id ${p.gotId ?? 'n/a'}).`;
         }, false, 1)
+    },
+    {
+        name: '!huntFood',
+        description: 'Hunt nearby passive animals for raw meat and pick up the drops. '
+            + 'Do NOT use !attack for food - it loses fleeing animals. '
+            + 'Refused while in water. Use !cookFood afterward - raw chicken cannot be eaten.',
+        params: {
+            'maxKills': { type: 'int', description: 'Animals to kill before stopping.', domain: [1, 5] }
+        },
+        perform: runAsAction(async (agent, maxKills) => {
+            return await skills.huntForFood(agent.bot, maxKills);
+        }, false, 5)
+    },
+    {
+        name: '!cookFood',
+        description: 'Cook all raw meat and potatoes in your inventory at a furnace. '
+            + 'Use this instead of !smeltItem for food - it cooks everything raw in one pass, chicken first. '
+            + 'Takes no arguments. Needs a furnace nearby or in inventory, and coal/charcoal/logs.',
+        params: {},
+        perform: runAsAction(async (agent) => {
+            return await skills.cookFood(agent.bot);
+        }, false, 10)
+    },
+    {
+        name: '!harvestCrops',
+        description: 'Harvest mature crops within range and replant their seeds. '
+            + 'Do NOT use !collectBlocks on crops - it ignores maturity and destroys immature plants. '
+            + 'Takes range in blocks. Skips immature crops and protected build cells.',
+        params: {
+            'range': { type: 'int', description: 'Search radius in blocks.', domain: [2, 32] }
+        },
+        perform: runAsAction(async (agent, range) => {
+            return await skills.harvestCrops(agent.bot, range);
+        }, false, 5)
     },
 ];

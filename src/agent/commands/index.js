@@ -60,7 +60,8 @@ export const COMMAND_ALIASES = {
     'ph': 'placeHere',
     'gtb': 'goToBed',
     'pt': 'plantTrees',
-    
+    'prg': 'progressTo',
+
     // Info commands
     'inv': 'inventory',
     'st': 'stats',

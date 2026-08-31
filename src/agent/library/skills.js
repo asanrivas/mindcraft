@@ -10,6 +10,10 @@ import * as blockIO from './block_io.js';
 import Vec3 from 'vec3';
 import settings from "../../../settings.js";
 import { existsSync, readFileSync } from 'fs';
+import * as farming from './farming.js';
+import * as build_guard from './build_guard.js';
+import * as progression from './progression.js';
+import * as mining from './mining.js';
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -5445,24 +5449,35 @@ export function wetLiftVerdict(s) {
     // that keeps driving while burning is.
     if (s.inLava) return false;
     if (!(s.rise < (s.clearance ?? 1.0))) return false;   // already clear; stop pushing
-    // A CADENCE, NOT A CONTINUOUS ASSERTION - and this is the guard that keeps the duty cycle
-    // inside vanilla parity, because `velY <= 0.05` on its own does not.
+    // A CADENCE - AND ITS ORIGINAL JUSTIFICATION WAS MEASURED AND DISPROVED. Read this before
+    // citing it as an anti-cheat guard, and before deleting it.
     //
-    // When collision resolution zeroes vel.y every tick the velocity gate is satisfied EVERY
-    // tick, so a 10ms sampler re-arms at up to 100Hz and asserts an impulse the bot is not
-    // getting. That state is not hypothetical; it is in the logs, at the very spot this change
-    // was measured (2026-08-30 17:16:35, andy, wading at 4752.5/62.0/4614.3):
+    // The mechanism is real and observed. When collision resolution zeroes vel.y every tick the
+    // velocity gate is satisfied EVERY tick, so a 10ms sampler re-arms and asserts an impulse the
+    // bot is not getting (2026-08-30 17:16:35, andy, wading at 4752.5/62.0/4614.3):
     //
     //   climbBank: t=0.0s vel=(0.000, 0.420, 0.000) pos=(4752.50, 62.00, 4614.30)
-    //   climbBank: t=1.0s vel=(0.000, 0.000, 0.000) pos=(4752.50, 62.00, 4614.30)
     //   climbBank: t=2.0s vel=(0.000, 0.420, 0.000) pos=(4752.50, 62.00, 4614.30)
     //
-    // Two seconds, the impulse applied twice, and the position identical to the last decimal.
-    // `climbBank` survives that state at 2.9Hz because it carries a 350ms gate; ungated, the
-    // same state is a sustained 100Hz. Both anti-cheat valves on this server have already
-    // tripped for real - `[SwimAssist] server rubber-banded 4 times in 10s` and the same for
-    // JumpAssist, 2026-08-30 17:05:29-34 - so "the server does not mind" is not available as an
-    // assumption. Match the cadence of the routine that is already live-verified.
+    // This gate was then claimed to be what keeps that inside vanilla parity. IT IS NOT. Measured
+    // 2026-08-31 as a controlled gated-vs-ungated comparison in exactly that jammed state, three
+    // runs each (docs/CADENCE_MEASUREMENT.md):
+    //
+    //   gated  (350ms):  171 lifts, 0 server corrections, 0 valve trips
+    //   ungated  (0ms): 1525 lifts, 0 server corrections, 0 valve trips
+    //
+    // Nine times the re-arm rate, sustained over a minute of wet time, and the server did not
+    // notice. The likely reason is structural: the protocol reports POSITION, not velocity, so a
+    // vel.y write that collision cancels before the next position packet never reaches the wire
+    // at all. Rate cannot matter for a quantity that is not transmitted.
+    //
+    // IT STAYS ANYWAY, for two honest reasons and not for the one above. It costs nothing - real
+    // impulses land ~500ms apart, so the gate almost never binds and the working case is
+    // unchanged. And the measurement covered ONLY the fully-jammed, zero-clearance case that the
+    // old justification cited; a partial-rise bank, where re-arming produces REAL displacement,
+    // is untested, and that is precisely where rate would become visible on the wire. Removing it
+    // on this evidence would repeat the mistake the evidence just corrected: generalising from
+    // the case that was measured to the case that was not.
     if ((s.sinceLastMs ?? Infinity) < (s.minGapMs ?? 350)) return false;
     return (s.velY ?? 0) <= (s.risingVelY ?? 0.05);  // already on the way up: leave it alone
 }
@@ -5868,4 +5883,355 @@ async function walkForward(bot, dx, dz, ms = 4000) {
     }
     await new Promise(r => setTimeout(r, 300));
     return bot.entity.position.distanceTo(start);
+}
+
+/**
+ * Work an inventory count toward `num` of `itemName`, one step at a time, by walking
+ * `progression.resolveProgression`'s pure tech-tree resolver (docs/gaps/resource-progression.exec.md).
+ *
+ * The loop RE-PLANS every iteration rather than executing a stale plan - firstUnsatisfied is
+ * judged against the CURRENT inventory, so a step consumed as an ingredient for a later step
+ * (e.g. planks spent on sticks) is picked up correctly on the next pass. Bounded three ways:
+ * a wall-clock deadline, three consecutive failures of the exact same step (kind+item), and
+ * `bot.interrupt_code` checked every iteration so a user/mode interrupt is honoured promptly.
+ *
+ * Dispatch deliberately reuses existing, already-owned primitives rather than a second engine:
+ *  - collect -> `collectBlock` (best-effort; ores never reach this branch - they resolve to a
+ *    'mine' step instead, see below - but surface materials like oak_log do, and that path is
+ *    documented elsewhere as unverified for logs specifically; a persistent failure here is
+ *    caught by the same 3-strikes stall guard as everything else)
+ *  - craft  -> `craftRecipe` (already routes through the navToGoal seam)
+ *  - smelt  -> `smeltItem` (known furnace-window risk, same family as the chest defects this
+ *    codebase owns elsewhere; not re-engineered here - a hang is still bounded by the
+ *    command's own runAction timeout)
+ *  - mine   -> `mining.branchMine`, targeted at the step's clamped `targetY`; progress is
+ *    judged by an inventory diff on the step's OWN item name, not on branchMine's own report,
+ *    since branchMine harvests every exposed ore it passes, not only the one asked for.
+ */
+export async function progressTo(bot, itemName, num = 1) {
+    if (typeof itemName !== 'string' || itemName.length === 0) {
+        log(bot, 'progressTo: no item name given.');
+        return `progressTo failed: no item name given.`;
+    }
+    const need = Number.isFinite(num) && num > 0 ? Math.floor(num) : 1;
+    const deadline = Date.now() + 55 * 60 * 1000; // stays under the command's 60-minute action timeout
+    let lastStepKey = null;
+    let stallCount = 0;
+
+    while (Date.now() < deadline) {
+        if (bot.interrupt_code) {
+            log(bot, `progressTo(${itemName}) interrupted.`);
+            return `progressTo(${itemName}) interrupted.`;
+        }
+
+        const inv = world.getInventoryCounts(bot);
+        const plan = progression.resolveProgression(itemName, need, inv);
+        if (plan.error) {
+            log(bot, `progressTo: ${plan.error}`);
+            return `progressTo failed: ${plan.error}`;
+        }
+        if (plan.satisfied) {
+            const have = world.getInventoryCounts(bot)[itemName] || 0;
+            const msg = `VERIFIED PROGRESSION: have ${have}x ${itemName} (wanted ${need}).`;
+            log(bot, msg);
+            return msg;
+        }
+
+        const step = progression.firstUnsatisfied(plan.steps, inv);
+        if (!step) {
+            // Resolver says unsatisfied but every planned step already reads met against the
+            // current inventory - re-plan on the next pass rather than looping tight on nothing.
+            await new Promise(r => setTimeout(r, 200));
+            continue;
+        }
+
+        const key = `${step.kind}:${step.item}`;
+        stallCount = key === lastStepKey ? stallCount + 1 : 0;
+        lastStepKey = key;
+        if (stallCount >= 3) {
+            const msg = `progressTo(${itemName}) stalled on ${step.kind} ${step.item} `
+                + `(x${step.count}) after 3 attempts - giving up.`;
+            log(bot, msg);
+            return msg;
+        }
+
+        let ok = false;
+        try {
+            switch (step.kind) {
+                case 'craft':
+                    ok = await craftRecipe(bot, step.item, 1);
+                    break;
+                case 'smelt':
+                    ok = await smeltItem(bot, step.input, step.count);
+                    break;
+                case 'mine': {
+                    const before = world.getInventoryCounts(bot)[step.item] || 0;
+                    await mining.branchMine(bot, {
+                        targetY: step.targetY,
+                        deadlineMs: Math.min(6 * 60 * 1000, Math.max(0, deadline - Date.now())),
+                    });
+                    const after = world.getInventoryCounts(bot)[step.item] || 0;
+                    ok = after > before;
+                    break;
+                }
+                case 'collect':
+                default:
+                    ok = await collectBlock(bot, step.item, step.count);
+                    break;
+            }
+        } catch (e) {
+            log(bot, `progressTo: step ${step.kind} ${step.item} threw: ${e?.message || e}`);
+            ok = false;
+        }
+        if (!ok) {
+            // Brief pause so a persistently-failing step (3-strikes above) does not spin the
+            // event loop tight while waiting to be recognised as a stall.
+            await new Promise(r => setTimeout(r, 500));
+        }
+    }
+
+    const have = world.getInventoryCounts(bot)[itemName] || 0;
+    const msg = `PROGRESSION INCOMPLETE: have ${have}x ${itemName} (wanted ${need}) after 55 minutes.`;
+    log(bot, msg);
+    return msg;
+}
+
+/** Exact block-name check - never a substring test (CLAUDE.md). Used to keep huntForFood from
+ *  chasing an animal into a lake: getting a bot OUT of water is this codebase's single largest
+ *  source of stuck bots, and a swimming cow is not worth that risk. */
+function isPositionInWater(bot, pos) {
+    const block = bot.blockAt(pos.floored());
+    return !!block && block.name === 'water';
+}
+
+/**
+ * Hunt nearby passive animals for raw meat, confirming each kill instead of trusting "it left
+ * range" (see `farming.killConfirmed`'s header for why that distinction matters).
+ *
+ * pvp/nav control-state contention (docs/gaps/food-survival.exec.md S11): `mineflayer-pvp` sets
+ * its own pathfinder `GoalFollow` on `bot.pvp.attack`, which fights our navigator's control
+ * states exactly the way raw mineflayer-pathfinder does everywhere else in this codebase. So
+ * `bot.pvp.attack` is NEVER used here - pvp is stopped before every nav leg, and the actual
+ * swing is our own `bot.attack` on a fixed cadence, the same alternation `defendSelf` already
+ * uses successfully.
+ *
+ * Refuses up front while `swim.inWater(bot)`: SwimAssist owns the jump key while wet and
+ * nothing else may touch it. `huntVerdict` also refuses per-target if the TARGET is in water -
+ * chasing a swimming cow puts the bot in the lake, which is worse than the meal is worth.
+ */
+export async function huntForFood(bot, maxKills = 3, range = 48) {
+    if (swim.inWater(bot)) {
+        const msg = 'Cannot hunt while in water - SwimAssist owns the jump key, refusing.';
+        log(bot, msg);
+        return msg;
+    }
+
+    const targets = world.getNearbyEntities(bot, range)
+        .filter(e => mc.isHuntable(e))
+        .map(e => ({ name: e.name, distance: bot.entity.position.distanceTo(e.position), metadata: e.metadata, entity: e }));
+    const ranked = farming.rankHuntTargets(targets);
+
+    if (ranked.length === 0) {
+        const msg = `No huntable animals within ${range} blocks.`;
+        log(bot, msg);
+        return msg;
+    }
+
+    const beforeInv = world.getInventoryCounts(bot);
+    const deadIds = new Set();
+    const onDead = (e) => { if (e && e.id != null) deadIds.add(e.id); };
+    bot.on('entityDead', onDead);
+
+    let kills = 0;
+    let fled = 0;
+    try {
+        for (const target of ranked) {
+            if (kills >= maxKills) break;
+            if (bot.interrupt_code) break;
+            const entity = target.entity;
+            if (!entity || entity.isValid === false) { fled++; continue; }
+
+            const startedAt = Date.now();
+            const deadlineMs = 45000;
+            let killedThis = false;
+            while (true) {
+                if (bot.interrupt_code) { bot.pvp.stop(); break; }
+                if (swim.inWater(bot)) {
+                    // The bot itself drifted/waded into water mid-chase - stand down entirely,
+                    // do not merely skip this target (S11/SwimAssist ownership).
+                    bot.pvp.stop();
+                    log(bot, 'Hunt stopped: entered water mid-chase.');
+                    return finishHunt();
+                }
+                const verdict = farming.huntVerdict({
+                    targetValid: entity.isValid !== false,
+                    dist: bot.entity.position.distanceTo(entity.position),
+                    elapsedMs: Date.now() - startedAt,
+                    deadlineMs,
+                    botInWater: false, // checked directly above; kept false here so a target-in-water refusal is distinguishable
+                    targetInWater: isPositionInWater(bot, entity.position),
+                });
+
+                if (verdict === 'refuse') { // target is swimming - not worth following into the lake
+                    bot.pvp.stop();
+                    fled++;
+                    break;
+                }
+                if (verdict === 'give_up') {
+                    bot.pvp.stop();
+                    fled++;
+                    break;
+                }
+                if (verdict === 'attack') {
+                    bot.pvp.stop(); // never contest control states with pvp's own GoalFollow
+                    await equipHighestAttack(bot);
+                    await bot.lookAt(entity.position.offset(0, entity.height ?? 0.9, 0));
+                    bot.attack(entity);
+                    await new Promise(r => setTimeout(r, 600));
+                    if (farming.killConfirmed(entity, { deathSeen: deadIds.has(entity.id) })) {
+                        killedThis = true;
+                        break;
+                    }
+                    continue;
+                }
+                // 'approach'
+                bot.pvp.stop();
+                try {
+                    const p = entity.position; // fresh read every leg - entities are re-created across render distance
+                    await nav.navigateTo(bot, { x: p.x, y: p.y, z: p.z },
+                        { arriveDist: 2.5, maxReplans: 2, waypointMs: 1500 });
+                } catch (e) { /* the animal may have moved or died mid-leg; the loop re-evaluates */ }
+            }
+            if (killedThis) {
+                kills++;
+                await pickupNearbyItems(bot);
+            }
+        }
+    } finally {
+        bot.removeListener('entityDead', onDead);
+        bot.pvp.stop();
+    }
+
+    return finishHunt();
+
+    function finishHunt() {
+        const afterInv = world.getInventoryCounts(bot);
+        const gained = {};
+        for (const k of new Set([...Object.keys(beforeInv), ...Object.keys(afterInv)])) {
+            const d = (afterInv[k] || 0) - (beforeInv[k] || 0);
+            if (d > 0) gained[k] = d;
+        }
+        const gainedStr = Object.entries(gained).map(([k, v]) => `${v} ${k}`).join(', ') || 'nothing';
+        const msg = `VERIFIED HUNT: killed ${kills}/${Math.min(maxKills, ranked.length)}`
+            + (fled > 0 ? ` (${fled} fled)` : '') + `, gained ${gainedStr}.`;
+        log(bot, msg);
+        return msg;
+    }
+}
+
+/**
+ * Cook every raw-and-worth-eating item in the bag, chicken first (see `farming.COOK_ORDER` -
+ * auto-eat refuses raw chicken outright, so until it is cooked it is dead weight).
+ *
+ * Deliberately thin: `smeltItem` (skills.js, above) already does the furnace work. This does
+ * NOT restart the agent between items - that restart lives only in the `!smeltItem` COMMAND's
+ * `perform` (actions.js), never in the `smeltItem` skill function itself, so calling the skill
+ * directly here is restart-free by construction. Counts are read by inventory diff AFTER each
+ * `smeltItem` call returns, never during - `bot.inventory` is frozen while a furnace window is
+ * open (CLAUDE.md "Chests"), and `smeltItem`'s own await already covers the close.
+ */
+export async function cookFood(bot) {
+    const plan = farming.cookPlan(world.getInventoryCounts(bot));
+    if (plan.length === 0) {
+        const msg = 'Nothing raw to cook.';
+        log(bot, msg);
+        return msg;
+    }
+
+    const cooked = [];
+    let hardFailure = null;
+    for (const { item, count } of plan) {
+        if (bot.interrupt_code) break;
+        const before = world.getInventoryCounts(bot)[item] || 0;
+        let ok = false;
+        try {
+            ok = await smeltItem(bot, item, count);
+        } catch (e) {
+            log(bot, `cookFood: smelting ${item} threw: ${e?.message || e}`);
+        }
+        const after = world.getInventoryCounts(bot)[item] || 0;
+        const consumed = Math.max(0, before - after);
+        if (consumed > 0) cooked.push(`${consumed} ${item}`);
+        if (!ok && consumed === 0) {
+            // Hard failure - no furnace, no fuel, or an occupied furnace. smeltItem already
+            // logged the specific reason; stop rather than retrying every remaining raw item
+            // against the same missing furnace.
+            hardFailure = item;
+            break;
+        }
+    }
+
+    const msg = cooked.length > 0
+        ? `VERIFIED COOK: cooked ${cooked.join(', ')}.`
+        : `Could not cook anything${hardFailure ? ` (stopped at ${hardFailure})` : ''}.`;
+    log(bot, msg);
+    return msg;
+}
+
+/**
+ * Harvest mature crops within range and replant their seeds.
+ *
+ * Skips any crop inside an active blueprint's protected footprint (`build_guard`) - a farm must
+ * not be harvested out from under the builder mid-build. Approaches through `breakBlockAt`/
+ * `tillAndSow`, both of which already route through the `navToGoal` seam (S2/S3 in
+ * docs/gaps/food-survival.exec.md - both were re-verified safe to reuse as-is).
+ */
+export async function harvestCrops(bot, range = 16, replant = true) {
+    const crops = world.getNearestBlocksWhere(bot, (block) => {
+        if (build_guard.isProtecting() && build_guard.isProtected(block.position.x, block.position.y, block.position.z)) {
+            return false;
+        }
+        const props = typeof block.getProperties === 'function' ? block.getProperties() : undefined;
+        return farming.isMatureCrop(block.name, props);
+    }, range, 64);
+
+    if (crops.length === 0) {
+        const msg = `No mature crops within ${range} blocks.`;
+        log(bot, msg);
+        return msg;
+    }
+
+    const beforeInv = world.getInventoryCounts(bot);
+    let harvested = 0;
+    let replanted = 0;
+    let processed = 0;
+
+    for (const block of crops) {
+        if (bot.interrupt_code) break;
+        const { x, y, z } = block.position;
+        const seed = farming.seedItemFor(block.name);
+        const broke = await breakBlockAt(bot, x, y, z);
+        if (broke) {
+            harvested++;
+            if (replant && seed) {
+                try {
+                    if (await tillAndSow(bot, x, y - 1, z, seed)) replanted++;
+                } catch (e) { /* replanting is best-effort; the harvest itself already counted */ }
+            }
+        }
+        processed++;
+        if (processed % 4 === 0) await pickupNearbyItems(bot);
+    }
+    await pickupNearbyItems(bot);
+
+    const afterInv = world.getInventoryCounts(bot);
+    const gained = {};
+    for (const k of new Set([...Object.keys(beforeInv), ...Object.keys(afterInv)])) {
+        const d = (afterInv[k] || 0) - (beforeInv[k] || 0);
+        if (d > 0) gained[k] = d;
+    }
+    const gainedStr = Object.entries(gained).map(([k, v]) => `${v} ${k}`).join(', ') || 'nothing';
+    const msg = `VERIFIED HARVEST: broke ${harvested}/${crops.length}, replanted ${replanted}/${harvested}, gained ${gainedStr}.`;
+    log(bot, msg);
+    return msg;
 }

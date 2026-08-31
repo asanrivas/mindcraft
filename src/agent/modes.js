@@ -6,6 +6,8 @@ import { isPeaceful } from "./difficulty.js";
 import * as nav from "./library/nav.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
+import * as farming from "./library/farming.js";
+import * as shield_guard from "./library/shield_guard.js";
 import settings from "./settings.js";
 import convoManager from "./conversation.js";
 
@@ -13,6 +15,45 @@ function say(agent, message) {
     agent.bot.modes.behavior_log += message + "\n";
     if (agent.shut_up || !settings.narrate_behavior) return;
     agent.openChat(message);
+}
+
+/**
+ * Live threats for `shield_guard.shieldVerdict`, gathered fresh every call - no persistent
+ * belief here for a caller to desync from (the SwimAssist lesson).
+ *
+ * Melee proximity (creeper/skeleton) is a plain `bot.entities` scan - reliable, cheap, and per
+ * CLAUDE.md's rule against trusting version-sensitive metadata alone, `ignited` is read
+ * best-effort and never the only qualifying signal (`shield_guard.qualifies` still requires
+ * proximity even when ignited is unknown). Arrows are read straight from the live entity
+ * object: mineflayer already populates `.velocity` from the `entity_velocity` packet, so there
+ * is no need to hand-roll the entitySpawn/next-tick-velocity tracking a physicsTick-driven
+ * class would need. `hurt_by` reads `bot.lastDamageTime`/`lastDamageTaken`, wired in agent.js.
+ */
+function shieldThreats(bot) {
+    const threats = [];
+    const botPos = bot.entity.position;
+    const entities = bot.entities || {};
+    for (const id in entities) {
+        const e = entities[id];
+        if (!e || e === bot.entity || !e.position) continue;
+        if (e.name === 'creeper' || e.name === 'skeleton') {
+            const dist = botPos.distanceTo(e.position);
+            if (dist > 16) continue;
+            let ignited = false;
+            if (e.name === 'creeper') {
+                try { ignited = !!(Array.isArray(e.metadata) && e.metadata[16]); }
+                catch (err) { /* version-sensitive index; absence just means "not confirmed ignited" */ }
+            }
+            threats.push({ kind: e.name, dist, ignited, entity: e });
+        } else if (e.name === 'arrow' || e.name === 'spectral_arrow') {
+            const r = shield_guard.arrowThreat(e.position, e.velocity, botPos);
+            if (r.incoming) threats.push({ kind: 'arrow', incoming: true, ticksToImpact: r.ticksToImpact, entity: e });
+        }
+    }
+    if (typeof bot.lastDamageTime === 'number' && bot.lastDamageTime > 0) {
+        threats.push({ kind: 'hurt_by', ageMs: Date.now() - bot.lastDamageTime });
+    }
+    return threats;
 }
 
 // a mode is a function that is called every tick to respond immediately to the world
@@ -289,7 +330,12 @@ const modes_list = [
         excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:travel", "action:navTo",
             "action:marathonRun",
             "action:swimTo", "action:dive", "action:surface", "action:swimProbe", "mode:drowning",
-            "action:goToBed", "action:shelter", "mode:night_safety"],
+            "action:goToBed", "action:shelter", "mode:night_safety",
+            // A bot parked on a vein, or working through progressTo's craft/smelt/mine chain,
+            // looks exactly like "stuck" to this mode - both have their own stall detection and
+            // deadlines (mining.js's MAX_STALLS, progressTo's 3-consecutive-failures guard), so
+            // unstuck firing on top just cancels real progress (docs/gaps/resource-progression.exec.md).
+            "action:branchMine", "action:progressTo"],
         on: true,
         active: false,
         prev_location: null,
@@ -418,6 +464,70 @@ const modes_list = [
                 execute(this, agent, async () => {
                     await skills.defendSelf(agent.bot, 8);
                 }, 2);
+            }
+        },
+    },
+    {
+        // A reflex, not an action: it NEVER calls execute() and NEVER sets `active`, so it
+        // never blocks a later mode in this list and never competes for currentActionLabel -
+        // the same "assist" shape as SwimAssist/AutoJump, just riding the ~300ms mode-update
+        // cadence (agent.js's update loop) rather than a physicsTick listener, since this
+        // integration deliberately does not touch agent.js. `interrupts: ["all"]` with no
+        // exclusions means update() runs on every tick regardless of what else is happening -
+        // required, because the whole point is to re-derive live state and re-assert every
+        // tick rather than trust a cached "I raised it" belief (the exact SwimAssist lesson
+        // that let a cached flag silently kill buoyancy while `!stats` reported `jump=true`).
+        name: "shield_guard",
+        description: "Raise a shield against creepers, skeletons and incoming arrows.",
+        interrupts: ["all"],
+        on: true,
+        active: false,
+        lastThreatAt: 0,
+        update: async function (agent) {
+            const bot = agent.bot;
+            const slot45 = bot.inventory?.slots?.[45];
+            // Exact name check, never a substring - the CLAUDE.md rule applies to item names
+            // exactly as it does to block names.
+            const hasShieldOffhand = !!slot45 && slot45.name === 'shield';
+            if (!hasShieldOffhand) return; // nothing to raise; cheapest possible exit
+
+            const wet = swim.inWater(bot);
+            const submerged = swim.isSubmerged(bot);
+            // bot.itemUseOwner: bow.js's lock over the same off-hand use channel. Reading it
+            // live (never cached) is what lets rule 1 of shield_guard.js work with zero changes
+            // to bow.js: it already refuses to draw while any other owner holds the channel.
+            const useOwner = bot.itemUseOwner ?? null;
+            // mineflayer-auto-eat exposes this as a live boolean (dist/index.js), no event
+            // wiring needed - it calls deactivateItem()/activateItem(offhand) on every health
+            // event while hungry, which is exactly the moment a shield matters most.
+            const eating = !!bot.autoEat?.isEating;
+            const pvpTargetSet = !!(bot.pvp && bot.pvp.target);
+            const now = Date.now();
+            const threats = shieldThreats(bot);
+
+            const sinceLastThreatMs = this.lastThreatAt ? now - this.lastThreatAt : null;
+            const verdict = shield_guard.shieldVerdict({
+                hasShieldOffhand, wet, submerged, useOwner, eating, pvpTargetSet,
+                cooldownUntil: 0, // axe-disable set_cooldown delivery is unverified on this server (docs/gaps/ranged-combat.exec.md); default to "no cooldown" rather than guess
+                now, sinceLastThreatMs, threats,
+            });
+
+            if (verdict.raise) {
+                this.lastThreatAt = now;
+                const faceEntity = verdict.faceIndex != null ? threats[verdict.faceIndex]?.entity : null;
+                if (faceEntity) {
+                    try { await bot.lookAt(faceEntity.position.offset(0, faceEntity.height ? faceEntity.height * 0.9 : 1, 0)); }
+                    catch (e) { /* the threat may have despawned between the scan and the look */ }
+                }
+                // Assert against REAL state every tick, never a cached "I raised it" flag.
+                if (!bot.usingHeldItem || bot.itemUseOwner !== 'shield') {
+                    bot.itemUseOwner = 'shield';
+                    try { bot.activateItem(true); } catch (e) { /* channel contention; retried next tick */ }
+                }
+            } else if (bot.itemUseOwner === 'shield') {
+                // Only ever lower a channel we ourselves own - never steal it from bow/pvp/auto-eat.
+                try { bot.deactivateItem(); } catch (e) { /* already released */ }
+                bot.itemUseOwner = null;
             }
         },
     },
@@ -607,12 +717,104 @@ const modes_list = [
         },
     },
     {
+        // Sits after night_safety (skeletons at dusk still outrank dinner) and before the
+        // recreational `hunting` mode below (which now need-gates on this mode's own supply
+        // check - see F3, docs/gaps/food-survival.exec.md). Every decision routes through the
+        // pure `farming.decideFoodAction` - this update() only gathers live state and dispatches.
+        name: "food_supply",
+        description: "Acquire food when supply is low: cook raw meat, harvest crops, hunt only when starving.",
+        interrupts: ["all"],
+        excludeFromInterrupt: ["action:surface", "action:dive", "action:swimTo", "mode:drowning",
+            "mode:self_preservation", "mode:self_defense", "action:cookFood",
+            "action:harvestCrops", "action:huntFood"],
+        on: true,
+        active: false,
+        cooldownUntil: 0,   // exponential backoff on a failed acquisition - the night_safety pattern
+        failures: 0,
+        update: async function (agent) {
+            const bot = agent.bot;
+            // Hunger cannot drain on Peaceful, so acquiring food buys nothing and the mode
+            // would be a pure tax on whatever a person asked for - same reasoning as
+            // night_safety. difficulty.isPeaceful, never the raw bot.game.difficulty field
+            // (CLAUDE.md: it is a lie on Peaceful worlds).
+            if (isPeaceful(bot.game)) return;
+            if (this.cooldownUntil && Date.now() < this.cooldownUntil) return;
+            // Never contest the jump key with SwimAssist, and never start a land errand
+            // (walking to a furnace, chasing an animal) from inside a lake.
+            if (swim.inWater(bot)) return;
+
+            const inv = world.getInventoryCounts(bot);
+            const supply = farming.summarizeFoodSupply(inv);
+            // Existence checks only (capped at 1 result) - decideFoodAction only needs
+            // "is there at least one", and scanning further every ~300ms tick is wasted work.
+            const matureCropCount = world.getNearestBlocksWhere(bot, (block) => {
+                const props = typeof block.getProperties === 'function' ? block.getProperties() : undefined;
+                return farming.isMatureCrop(block.name, props);
+            }, 16, 1).length;
+            const huntableCount = world.getNearestEntityWhere(bot, (entity) => mc.isHuntable(entity), 24) ? 1 : 0;
+
+            const action = farming.decideFoodAction({
+                food: bot.food,
+                ediblePoints: supply.ediblePoints,
+                rawCookableCount: supply.rawCookableCount,
+                matureCropCount,
+                huntableCount,
+                inWater: false,   // already refused above; kept explicit so the pure call reads standalone
+                peaceful: false,  // already refused above
+                cooldownActive: false, // already refused above
+            });
+            if (action === 'none') return;
+
+            // Cooking/harvesting are maintenance - they wait for a genuinely idle moment.
+            // Hunting is the one branch decideFoodAction reaches while actually starving
+            // (food<=6 and nothing edible at all), so it alone may interrupt other work.
+            if (action !== 'hunt' && !agent.isIdle()) return;
+
+            const label = action === 'hunt' ? 'hunting' : action === 'cook' ? 'cooking' : 'harvesting';
+            say(agent, `Food supply low - ${label}.`);
+            const onDone = (result) => {
+                const worked = typeof result === 'string' && result.startsWith('VERIFIED');
+                if (worked) {
+                    this.failures = 0;
+                } else {
+                    // Back off exponentially rather than retrying on a fixed beat - the
+                    // night_safety lesson: a flat cooldown re-fires the same failure forever.
+                    this.failures = Math.min(this.failures + 1, 5);
+                    this.cooldownUntil = Date.now() + 60_000 * Math.pow(2, this.failures - 1);
+                }
+            };
+            // Two literal-timeout call sites rather than one with a computed value - a hunt
+            // (3 min) is a shorter commitment than cooking/harvesting a whole plan (5 min), and
+            // tests/modes.test.mjs's execute() scan requires the timeout to be a plain literal
+            // it can read statically, not an expression.
+            if (action === 'hunt') {
+                execute(this, agent, async () => { onDone(await skills.huntForFood(bot)); }, 3);
+            } else if (action === 'cook') {
+                execute(this, agent, async () => { onDone(await skills.cookFood(bot)); }, 5);
+            } else {
+                execute(this, agent, async () => { onDone(await skills.harvestCrops(bot)); }, 5);
+            }
+        },
+        unpause: function () {
+            // New information from a person putting the mode back in charge - last attempt's
+            // failure no longer stands.
+            this.cooldownUntil = 0;
+            this.failures = 0;
+        },
+    },
+    {
         name: "hunting",
         description: "Hunt nearby animals when idle.",
         interrupts: ["action:followPlayer"],
         on: true,
         active: false,
         update: async function (agent) {
+            // Need-gated (F3, docs/gaps/food-survival.exec.md): this mode used to hunt
+            // recreationally regardless of supply, which fired in a bright desert at dawn with
+            // a full bag. Now it only engages while supply is actually low - food_supply above
+            // owns the dire-starvation branch (food<=6, nothing edible at all); this one is the
+            // gentler top-up for "low but not yet starving".
+            if (!farming.summarizeFoodSupply(world.getInventoryCounts(agent.bot)).low) return;
             const huntable = world.getNearestEntityWhere(
                 agent.bot,
                 (entity) => mc.isHuntable(entity),

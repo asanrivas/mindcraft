@@ -157,3 +157,33 @@ bun scripts/creative_ui_smoke.mjs
 
 Asserts the overlay opens, categories render, search filters, clicks compose the right command,
 counts clamp, and item names are sanitised.
+
+---
+
+## Moved here from CLAUDE.md (2026-08-31 restructure)
+
+CLAUDE.md keeps the RULES; this file keeps the EVIDENCE. The text below is verbatim
+from CLAUDE.md before it was compacted — the measurements, the incidents and the
+reasoning behind the one-line rules that remain there. Heading levels are demoted by one.
+
+### Creative mode
+
+Full story: **[docs/CREATIVE_MODE.md](docs/CREATIVE_MODE.md)**.
+
+`!creativeGive(item, count)`, `!creativeKit(building|mining|survival|all)`, `!creativeClear`,
+`!creativeStatus`, `!creativeIdSweep`. A web item picker lives behind the **Items** button on
+each agent card (`public/js/creative-panel.js`) and composes those same commands.
+
+- **mineflayer DOES support creative inventory.** `bot.creative` is a core auto-loaded plugin.
+  No `/give`, no operator permission, no chat round-trip.
+- **Every creative command refuses outside creative mode**, so the survival work stays honest.
+- **Never pass `waitTimeout: 0` to `setInventorySlot`.** mineflayer leaks its per-slot busy flag
+  on that path and every later write to that slot throws for the life of the process. It bricked
+  all 37 slots once. `WRITE_ACK_MS = 60` is a correctness constant, not a tuning knob.
+- **Item ids ride the wire as numbers**, resolved from 1.21.11 tables against a 26.1 server. A
+  registry shift would silently produce the wrong item and **no in-process check can see it** —
+  the server sends no ack, so our own echo confirms itself. Verify server-side by NAME:
+  `!creativeIdSweep` then `mc "clear andy <item> 0"`. Swept 2026-08-23, ids 150–1458, all correct.
+- **RCON truncates long NBT.** `data get entity andy Inventory` cut off at ~120 chars and made a
+  full bag look empty, which read as a bug in working code. Use `clear <player> <item> 0`.
+

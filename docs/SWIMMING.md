@@ -457,3 +457,344 @@ in the live world. It is covered by unit tests against a fake world only.
 **Banks taller than one block are out of scope for `climbBank`** by design (§5.4). Those are the
 traveller's job — `skills.climbLedgeByPlacing` pillars up and steps across, falling back to
 cutting stairs when there is nothing to build with.
+
+---
+
+## Moved here from CLAUDE.md (2026-08-31 restructure)
+
+CLAUDE.md keeps the RULES; this file keeps the EVIDENCE. The text below is verbatim
+from CLAUDE.md before it was compacted — the measurements, the incidents and the
+reasoning behind the one-line rules that remain there. Heading levels are demoted by one.
+
+#### Swimming, diving and oxygen
+
+*(The `prismarine-physics` internals cited throughout this section - `simulatePlayer`,
+`applyHeading`, `liquidAcceleration` - describe the layer `docs/CLIENT_REPLACEMENT.md`'s
+`src/mc/physics/` is taking ownership of. Each behavior below must be reproduced or
+deliberately diverged from there; `liquidAcceleration` in particular must stay a mutable field,
+not a computed one - see that doc's "riskiest assumptions".)*
+
+**Water is the one part of this server's physics that is NOT broken**, and the whole codebase
+was built on the opposite assumption. Everything else here works around `bot.entity.onGround`
+reading false while the bot is provably standing. Water does not care:
+
+- `isInWater` is recomputed every tick in prismarine-physics `simulatePlayer` from an AABB block
+  scan. It never reads `onGround`.
+- Swim-up works because the jump handler checks `if (isInWater || isInLava) vel.y += 0.04`
+  **before** it checks `onGround` - the branch that is dead on land is live in water.
+
+##### Measured, not assumed (`!swimProbe`, 7-block-deep water, 5 runs)
+
+| | predicted from the constants | measured |
+|---|---|---|
+| forward | 0.100 b/t | **0.098 b/t = 1.96 blocks/s** |
+| forward + sprint | 0.100 (sprint is a no-op in water) | **0.098** - confirmed |
+| sprint boost 0.026 | 0.130 | **0.127** |
+| rise, jump held | +0.175 | **+0.151** |
+| sink, nothing held | -0.025 | **-0.025** exactly |
+
+**1.96 blocks/s is ~118 blocks/minute, against this bot's ~25 blocks/min overland.** Swimming is
+roughly four times faster than walking here. `!travel("west", 40)` across a river now reports
+`moved 47/40 blocks (117.8%). Mined 0 block(s).`
+
+##### The pieces
+
+| File | What it does |
+|---|---|
+| `library/swim.js` | `inWater`, `isSubmerged`, `inLava`, `oxygen`, `waterSurfaceY`, `airPocketAbove`, `nearestOpenColumn`, `deepestWaterNear`, `swimTo`, `dive`, `surface`, `swimForward`, `verticalIntent` |
+| `library/swim_assist.js` | Always-on: buoyancy + the sprint-swim boost. Modelled on `auto_jump.js` |
+| `library/swim_probe.js` | `!swimProbe` - the measurement harness above |
+| `modes.js` -> `drowning` | First in `modes_list`. Surfaces before the air runs out |
+
+Commands: `!swimTo(x,y,z)`, `!dive(depth)`, `!surface`, `!swimProbe`. `!stats` grows an
+`In water: SUBMERGED, Air: 13 / 20` line **only while wet**, so the normal prompt costs nothing.
+
+##### Invariants - read before changing this
+
+- **Pitch is not a movement input.** prismarine-physics `applyHeading` uses `entity.yaw` only.
+  Vertical control is a **jump duty cycle**, not a look angle. Set pitch for the head and for
+  `bot.dig`; never as a control.
+- **SwimAssist owns the jump key while the bot is wet.** Nothing else may touch it - not
+  `followPath`, not AutoJump (which early-returns in water), not the idle `clearControlStates`
+  in `modes.js`. Jump contention is what the old drowning code got wrong.
+- **Its default mode is positive buoyancy.** That is deliberate: the failure mode of a crash
+  anywhere in the swimming code is then a bot *floating*, not one on the seabed out of air.
+- **Rising is 7x faster than sinking** (+0.175 vs -0.025 b/t), so vertical control is a
+  hysteresis band (`verticalIntent`), not a proportional controller. Without the dead band the
+  bot porpoises.
+- **Never hop or dig while afloat.** Jump is buoyancy, not propulsion, so pulsing it makes the
+  bot bob instead of advance; and mining and placing do nothing while floating, for the same
+  reason pillaring does not.
+- **`isInWater` and `isInLava` share the same physics branch** and can both be true at a
+  boundary. Every swim entry point refuses on lava, and the boost requires `isInWater && !isInLava`.
+
+##### WADING is not AFLOAT - and conflating them paralyses the bot completely
+
+Found 2026-08-26, after a bot sat at **vel=(0.000, 0.000, 0.000) with `forward` held, in one
+block of water, for twenty minutes and four process restarts** at (4281, 62, 4935), with dry
+land two blocks away.
+
+There are two wet states and they need opposite handling:
+
+| | what it is | who owns the jump key |
+|---|---|---|
+| **afloat** | head submerged, or nothing solid under the feet | SwimAssist. Jump is buoyancy; hopping only makes the bot bob. |
+| **wading** | in water, standing on solid ground, head in air - a puddle, a ford, a shoreline | *nobody was.* For propulsion this is **land**. |
+
+Every subsystem refused, each of them correctly:
+
+- `SwimAssist` `auto` mode presses jump only when the head is **submerged**. Wading, it releases.
+- `AutoJump` bailed on **any** `entity.isInWater`, to avoid fighting SwimAssist over the key.
+- `followPath`'s "hop to break the deadlock" branch was skipped for any `wet`, and it reset the
+  stall timer too, so the hop could never fire.
+- And `onGround` reads false while the bot is provably standing (see Movement, above), so
+  prismarine-physics withholds ground acceleration.
+
+Result: **no subsystem pressed jump, and jump is the only propulsion this server gives us.** The
+bot could not move a millimetre in any direction, and every diagnostic said the terrain was fine.
+
+All three now test for wading (`nav.js` `followPath`, `auto_jump.js` `_wading()`), so a bot in
+shallow water is driven like a bot on land. Signature to recognise it again: `wet=true`,
+`sub=false`, `jump=false`, `vel` exactly `(0,0,0)`, position identical to 12 decimal places.
+
+##### A bot at the WATER SURFACE cannot rise at all
+
+Also measured, and the reason `swim.climbBank` exists and is capped at `maxRise: 1`: holding
+jump in `climb` mode against an adjacent **one-block** bank produced `gained 0.00` every time.
+At the surface the bot is in neither regime - not "in water" enough for the swim impulse, and
+`onGround` is false so the land jump is dead. `climbBank` therefore:
+
+- searches the **forward cone** (heading +- 45 degrees), preferring the lowest step, because the
+  bank dead ahead is often two blocks while the same shore half a step to the side is one;
+- refuses a target it cannot **reach** - `corridorClear` - after it picked a real ledge three
+  blocks east with two solid blocks in between and swam into the wall for eight seconds;
+- **bails in 2.5s on measured progress**, not on its own block scan, the same invariant
+  `riseUntilBreathing` had to learn.
+
+**Consequence for the cost model: water is only cheap if you can get out of it.** `travelToward`
+takes `swimEnabled`, and a checkpoint marathon sets it **false**. A river has a far bank and is
+worth swimming; a pond is a route the bot can enter and cannot leave, and every attempt to mine
+its way out just widens the pond - it dug a canal east and the water followed it in.
+
+##### Sprint-swimming is ours, and it is capped at vanilla parity
+
+prismarine-physics never reads `control.sprint` inside its water branch - the 1.13+ swimming
+pose simply does not exist for this bot. SwimAssist restores it by raising
+`bot.physics.liquidAcceleration` while submerged and sprinting (the library re-reads that
+constant every tick, so the acceleration curve and strafing stay correct - adding to
+`bot.entity.velocity` fights `negligeableVelocity` and produces jerk).
+
+The ceiling is **vanilla parity and nothing more**: 0.032 gives 0.16 b/t, exactly what a real
+player gets holding sprint underwater. Currently shipped at the conservative **0.026** (measured
+0.127 b/t). A `forcedMove` valve disables the boost after 3 server corrections in 10s, so a
+hostile anti-cheat degrades us to plain swimming rather than a kick. **Restore
+`liquidAcceleration` on disable, on leaving water, and on death/respawn** - a leak silently
+alters *lava* movement forever.
+
+##### Bugs found by running it in survival - read these before touching SwimAssist
+
+- **The jump key must be asserted against `bot.controlState.jump`, never a cached flag.**
+  `_setJump` used to early-return when the requested state matched its own `holdingJump`
+  belief. Anything else calling `bot.clearControlStates()` - the action manager on an
+  interrupt, a mode, another skill's cleanup - then set jump false behind SwimAssist's back,
+  and because the flag still said "holding", it never pressed again. **Buoyancy died silently
+  while `!stats` reported `jump=true`.** Signature: `physics.isInWater=true`, `jump=true`,
+  `vel.y=-0.005` - textbook sinking with the key supposedly held. This is why `!stats` now
+  prints `[assist: ...] [physics.isInWater=... vel.y=...]` while wet: the failure is
+  indistinguishable from a ceiling collision without those three numbers.
+- **`!surface` and `mode:drowning` must not race.** Each interrupt sets `bot.interrupt_code`,
+  which aborts the other's climb, and the two traded interrupts while the bot drowned:
+  `mode:drowning` -> `action:surface` -> `mode:drowning`. Fixed on both sides - `drowning`
+  carries `excludeFromInterrupt: ["action:surface"]`, and `!surface` stands down when the mode
+  is already active.
+- **A rise must be judged on measured progress, not on `airPocketAbove`.** The scan looks
+  straight up from the *floored* position, so a bot whose 0.6-wide hitbox is caught on a
+  neighbouring block reads as "column open" while being unable to ascend. `riseUntilBreathing`
+  now gives up after 1.5s without vertical gain and hands over to the move-sideways and dig
+  phases. Same invariant as walking: **trust measured progress over the block scan.**
+- **`oxygen()` clamps.** `air_supply` keeps counting down past zero while drowning; it reached
+  chat as `Air: -1 / 20`.
+- **Known limitation, still unfixed:** a bot that swims into a horizontal crevice under an
+  overhang can end up fully immobilised - `vel.y` zeroed by collision above, and blocked
+  horizontally too. It holds jump, cannot rise, cannot slide out, and drowns. `unwedge` tries a
+  sideways shove but does not always free it. Do not send the bot on deep `!swimTo` legs under
+  an ice sheet without supervision.
+
+##### The drowning safety net was blind - `bot.oxygenLevel` does not update here
+
+`swim.oxygen()` reads `bot.oxygenLevel`, which mineflayer sets from the `air_supply` **entity
+metadata** for the bot's own entity. That packet does not reliably reach this client:
+`!stats` reported **`Air: 20 / 20` while the server's NBT had 13 ticks left**, so
+`mode:drowning`'s `oxygen(bot) > threshold` guard never tripped, the mode never fired once, and
+the bot drowned at (4322.60, 61.00, 5034.30) with its safety net silent from start to finish.
+
+`mode:drowning` now **measures submersion itself** and fires on either signal: oxygen at or
+below 8 bubbles, *or* 10 seconds of continuous submersion (vanilla air is 300 ticks = 15s).
+Same principle as everything else here - trust measured state over reported state. The log line
+says which trigger fired.
+
+`swim.surface()` also had to be bounded: its phase 2 (swim to a neighbouring open column) was
+allowed the whole remaining deadline, so when the bot was wedged and could not reach that
+column, **phase 3 - the one that cuts through the ceiling - never ran at all**. Observed as
+`surface()` returning `timeout, rose -0.2` with a single diggable stone block directly overhead.
+Phase 2 is now capped at 4s.
+
+##### The exit decision is made every tick, not after the stall ladder
+
+`nav.waterExitVerdict()` - pure, `tests/water_exit.test.mjs`.
+
+Getting out of water used to be decided by `followPath`'s stall ladder, whose branch order is
+`progress -> waypointMs(6000) -> afloat -> pinnedMs(2500) && hops>=2 -> hop(700ms)`. From a dead
+stop that is a hop at 700ms, a hop at 1400ms, and the **first climb attempt at 2500ms**. Measured
+on one real bank at (4434, 62, 4682):
+
+```
+16:02:02  leg 3 ends
+16:02:05  pinned   :07 pinned   :11 pinned   :13 pinned
+16:02:14  leg 4: moved=-0.01 -> RECOVERY     <- 12s spent CONCLUDING it was stuck
+16:02:14  climbBank attempt 1 -> jammed
+16:02:20  climbBank attempt 2 -> OUT
+```
+
+**Twelve seconds of detection for six seconds of climbing.** And the routine the 2500ms branch
+reaches is `climbAhead`, which only handles rises of **2 or 3** - so a ONE-block bank fell
+through to `digAhead` and the bot mined the shore at water level. That is the canal-digging
+behaviour, still live in the wading path; `swim.climbBank`, the routine that actually works, was
+gated behind the 6000ms leg timeout and `travelToward`'s recovery ladder.
+
+Every input the decision needs is already recomputed every tick (`isInWater` is an AABB scan,
+block reads are synchronous), so it now runs on **every loop iteration (~100ms)** and routes
+straight to `climbBank`. Gated by a 1200ms cooldown and a 3-attempt cap, because a failed climb
+must not re-fire every 100ms and the existing ladder must still get its turn.
+
+**A false positive costs a whole leg** - `climbBank` is an 8s commitment - so the refusals are
+the tested surface: not wet, lava (both fluids share one physics branch), nothing solid ahead,
+rise != 1, no landing, no headroom, bank further than 1.6 blocks.
+
+##### climbBank maintains its standoff - it is not a one-shot back-off
+
+The 400ms back-off was necessary and not sufficient: `forward` was then held for the whole climb,
+so the bot walked straight back into the face it had just left. That made the climb a RACE
+between rising (the `JUMP_IMPULSE` duty cycle) and closing (`forward` at ~0.1 b/t). Same target,
+same heading, 4 seconds apart:
+
+```
+t=1.0s fwd=true pos=(4434.31, 62.42) vel=(0.000, 0.000, 0.000)  <- flush, ALL axes dead -> jammed
+[retry] t=1.0s  pos=(4434.30, 62.72) vel=(0.000,-0.078, 0.001)  -> OUT
+```
+
+The face is x=4434.0 and the bot is 0.6 wide, so flush is 4434.30. **Both runs arrived flush; only
+the height at contact differed - 62.42 vs 62.72.** Three tenths of a block decided it, which is
+why retry counts looked like nondeterministic physics.
+
+Now sequenced: hold `FACE_GAP + 0.30` while below the lip, press `forward` only once over it.
+**The progress metric had to follow** - it was `rise + closing`, and backing off increases the
+gap, so a correct back-off scored as negative progress and could trip the 2.5s jam bail on the
+very move that unsticks the bot. Below the lip progress is height; above it, closing.
+
+Measured live, gym lane 3, one-block bank: **2.8s end to end, one climbBank attempt of 413ms, no
+`pinned` lines, 0 blocks mined** - against a 45.2s baseline for the same lane. One lane, one run;
+the full 10-lane sweep has not been re-run.
+
+##### The lip is TWO thresholds, and the step over it has to be DRIVEN (2026-08-27)
+
+The 10-lane sweep, re-run: **10/10, every lane in 1-4s, one `climbBank` call per lane, zero
+jams.** Getting there took three fixes, and the first sweep that passed 10/10 still had 15s,
+20s and 43s outliers that moved lane to lane between runs - that flakiness was the real bug.
+
+**A single `target.y - 0.05` was deciding two opposite questions.** Captured on lane 7:
+
+```
+t=2.0s pos=(4508.36, 111.05) wet=false   <- above the lip, so `forward` went on
+t=3.0s pos=(4508.68, 110.97) wet=true    <- fell back in; STILL counted as "over"
+t=4.1s pos=(4508.70, 110.97) vel=(0.000, -0.078, 0.000)  -> flush, jammed
+```
+
+At 111.05 the bot was five hundredths above the face and standing over WATER, with ~0.55 blocks
+still to walk - six ticks, in which an unsupported body falls most of a block. It could never
+have made it. Then, having fallen to 110.97, the same tolerance still read "over", so `forward`
+stayed on and drove it flush, while the rise impulse - gated on `y < target.y - 0.05` - was
+switched off by that very number. **A 0.05-block dead band in which the bot may not climb and
+must not stop pressing.** Now `LIP_CLEAR` separates them: walking in needs real clearance, the
+impulse keeps firing right up to it, and *dry and level with the face is not the same as
+supported* - only a solid block under the feet (`standingOnSolid`) proves the bot is on the bank.
+
+**`STEP_IN_SPEED` - the run-up, for the same reason `JUMP_IMPULSE` is the jump.** Over the lip
+the bot is above the water and above nothing, so it has about a third of a second of fall to
+cover the last half block - and `onGround` being false means prismarine-physics grants it only
+AIRBORNE acceleration for the one moment it most needs to run. It reached y=111.46 with
+`forward` held and moved **0.04 blocks** horizontally before falling back, five times in one
+lane. 0.14 b/tick is a vanilla walk; this is not a boost, it is the run-up the broken ground
+flag denies us, applied only while over the lip and only until the bot is over the target cell.
+
+**The dip is ONE-SHOT.** `submergeUntil` alone was not, and that is what made the whole routine
+stochastic: reaching submersion clears it, the next tick sees the bot still below the lip,
+`!submergeUntil` is true again, and it arms another 1.5 seconds of *sinking*. Lane 5 fell to
+y=109.20 from a start of 110.35 - a block the wrong way - and the same lane cleared in 0.4s on
+one run and took 18s on the next. Nothing about it was depth-specific; it was whether a dip
+happened to submerge.
+
+##### Climbing out of the water onto a bank
+
+Getting *out* of water was the single biggest source of stuck bots - it is what produced the
+"Andy dug a canal" behaviour, because failing to climb a 1-block bank fell through to the dig
+recovery and the bot mined through the bank instead of stepping over it.
+
+`swim.climbBank(bot, dx, dz)` is the primitive. Three things make it work, and each was found
+by measurement, not reasoning:
+
+- **Supply the jump impulse directly.** A real player rises **+0.75 in a single tick** from
+  `onGround=1` (captured from a live player trace, `tools/trace_player.mjs`). Our `onGround`
+  reads false permanently, so prismarine-physics never grants that impulse and buoyancy alone
+  (~0.16 b/t) tops out **~0.2 blocks short of the lip** - measured peaking at y=110.81 against a
+  bank whose top face is 111.0, then falling back. `climbBank` adds `JUMP_IMPULSE = 0.42` to
+  `velocity.y` whenever it is wet, below the target and not already rising.
+- **BACK OFF THE WALL BEFORE CLIMBING.** Pressed flush against the bank the bot cannot rise
+  *at all*. Measured, same lane, same depth: from **x=4508.70** (hitbox edge exactly on the
+  block boundary at 4509.0) it held y=110.000 with **zero movement for 22 seconds**; from
+  **x=4508.40** - a 0.3 block gap - it was out in **0.8s**. The collision resolution appears to
+  cancel the entire move, vertical included, while the AABB is touching. `climbBank` now holds
+  `back` for 400ms first when it starts within 1.05 blocks of the target.
+- **Success requires being OVER the target, not merely dry and high.** The old test passed the
+  moment the bot cleared the water line, which it does while still in the water column.
+
+**`walkForward` must never run while wet.** It exists for a *land* problem - the pathfinder
+refuses to plan a 1-block step, and AutoJump carries the bot over once it is walking - and
+AutoJump early-returns in water. Wet, all it does is hold `forward` into the bank for 4
+seconds, which is precisely the flush-against-the-wall state that makes the climb impossible,
+and it delayed `climbBank` past the leg budget. Gating it on `!inWater(bot)` took the gym from
+**2 of the first 3 depths failing to all of them passing**.
+
+**Result: 10/10 depths climb out** (2026-08-27, 1-10 blocks deep, 16-37s each), against a
+pre-fix baseline of **3/10** - depths 1, 2, 4, 6, 7, 8 and 10 all sat in the water until the
+timeout. Every failure was the same flush-against-the-bank state; nothing here is depth-specific.
+
+**Test rig**: `scratchpad/build_gym.mjs` builds 10 lanes of water 1-10 blocks deep against a
+1-block bank; `gym_run.mjs` drives `!travel` through each and reports CLIMBED OUT / STUCK.
+**Repair the lanes between runs** - a bot that mined a lane once will swim its own tunnel on
+every later run and the suite reports a pass it did not earn.
+
+##### Traps this cost real time
+
+- **`forcedMove` fires on every server position packet**, including login and teleports. Counting
+  them unconditionally tripped the anti-cheat valve during spawn, before the bot had seen water.
+  Only corrections that arrive *while boosting* are evidence against the boost.
+- **`setMode('off')` must mean hands off *everything*.** It originally skipped only the buoyancy
+  logic while still rewriting `liquidAcceleration` every tick, which silently overwrote the
+  probe's own value - so a boost that works measured as "no effect".
+- **`!placeHere` placed blocks INSIDE the bot.** It passed the bot's own position to
+  `placeBlock`, which cannot work - the body occupies that cell - and the failure surfaced as
+  mineflayer's generic 500ms `blockUpdate` timeout, which reads like the known flake rather
+  than "you asked me to place a block inside myself". A bed made it obvious by needing two
+  cells. `skills.placeNearby` now picks a free neighbouring cell, and requires a free PAIR for
+  beds and doors.
+- **Andy's own self-prompt loop will interrupt a measurement.** It issued `!goToCoordinates` in
+  reaction to each command's output and zeroed every probe phase. `!endGoal` plus a `!steer`
+  directive is how to get a clean run.
+- **Depth 1 is still a valid horizontal measurement.** The obvious story - "the bot is standing
+  on the riverbed in the broken land-physics regime" - was tested and is false; the same
+  one-block water read 0.098 b/t on a clean run. Only the *vertical* rates need depth.
+- **Rise must be sampled in an early window.** At 0.175 b/t the bot reaches the surface in ~10
+  ticks and then bobs, so a steady-state average over ticks 40-100 measures floating and reports
+  "the bot cannot rise" when it plainly can.
+

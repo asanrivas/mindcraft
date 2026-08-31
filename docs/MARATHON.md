@@ -217,3 +217,73 @@ filling GPU VRAM. Both directions are now covered by tests.
 - **Avoid large `!serverFill` operations near the bot.** Those repeatedly dropped it into pits,
   buried it in sand, and opened a cave under it.
 - **Prefer `!travel` / `!navTo` over `!goToCoordinates`** for anything non-trivial.
+
+---
+
+## Moved here from CLAUDE.md (2026-08-31 restructure)
+
+CLAUDE.md keeps the RULES; this file keeps the EVIDENCE. The text below is verbatim
+from CLAUDE.md before it was compacted — the measurements, the incidents and the
+reasoning behind the one-line rules that remain there. Heading levels are demoted by one.
+
+#### Checkpoint marathons
+
+```
+!marathonPlan(6, 1000, 30)   # 6 checkpoints on a ring, <=1000 blocks of route, ring rotated 30 deg
+!marathonRoute("4412,4934 4362,5021 ...", 1000)   # explicit, surveyed checkpoints
+!marathonRun                 # run it, resuming wherever a previous run stopped
+!marathonStatus              # per-checkpoint ledger
+!marathonReset
+```
+
+**Prefer `!marathonRoute` once you have surveyed the ground.** A regular ring is convenient and
+often wrong: around (4312, 4934) on this world, *no* rotation of a hexagon at radius 100 or 120
+puts all six vertices on dry land - two separate lakes sit in the way. `ring2.mjs`-style
+surveying (see the RCON recipe below) reports which start angles are all-land, and when none
+are, hand-pick six land bearings and feed them in. Verify the **midpoints** too, not just the
+vertices: the first attempt had every checkpoint on land and a lake across leg 5-6.
+
+**One action owns the whole route.** That is the point: the "one leg at a time" discipline above
+is what a *person* has to do when driving `!travel` from chat, and it is exactly what the 97
+minute self-interrupting driver got wrong. `runMarathon` knows a leg is finished because it
+measures the bot's XZ distance to the checkpoint, not because a timer fired, and it writes
+`bots/<name>/marathon.json` after every checkpoint - so a crash, a restart or a mode interrupt
+resumes at checkpoint 4 instead of at the start.
+
+- **Arrival is judged on XZ only.** The checkpoint's Y is unknown when the route is drawn: the
+  chunk is not loaded, so there is no surface height to aim at. The bot records the Y it
+  actually arrived at.
+- `planLoop` solves the ring radius from the straight-line budget -
+  `total = R + (count-1) * 2R * sin(pi/count)` - and `!marathonPlan` **refuses** rather than
+  quietly overspending it.
+- `startAngleDeg` rotates the ring, because terrain is not isotropic. Around (4337, 4891) the
+  R=160 ring is land at every 30-degree bearing except 45/60/75 and 285; starting at 30 puts all
+  six vertices on dry ground. Survey before planning - see the RCON probe recipe below.
+- Nothing here teleports. `!serverTp` deletes its own arming marker precisely so a route cannot
+  be shortcut, and the marathon must never touch it.
+
+**`skills.travelToward(bot, x, z, opts)`** is the engine, and `travelDirection` is now a thin
+wrapper over it. It is the same tuned recovery ladder (swim the river, walk around the ridge,
+stair up the cliff, trench the dune, sidestep the build) with one thing generalised: the
+heading. Two headings, deliberately:
+
+- **steering** uses a true unit vector toward the target;
+- **digging** quantises it to the nearest of eight (`nearestCompass`), because every block-level
+  helper indexes blocks as `p + d*n` and a fractional `d` reads the wrong column.
+
+Progress along the leg is now a **signed** projection. The old form was `|dx|*|dx_moved| +
+|dz|*|dz_moved|`, which scored a step backwards exactly like a step forwards.
+
+Measured on this world, 2026-08-26, on ground that suits it: **48 blocks per navigator leg in
+12s**, and checkpoint 1 of a surveyed route reached in **34 seconds over 84 blocks with 0 blocks
+mined** - roughly 150 blocks/min, against the ~25 blocks/min this doc records for the old
+axis-locked travel. On bad ground the same code covered 3 blocks in 20 minutes; the difference
+is entirely whether the route puts the bot in water (see the wading section under Swimming).
+
+**Surveying a route before you draw it** (RCON, no bot needed):
+`forceload add <x> <z>` then `execute if block <x> <y> <z> air` -> "Test passed"/"Test failed".
+Scan the column **downward**; do not bisect. Columns are not monotonic here - caves and ravines
+put air under stone - and a bisection over [-64, 250] converges on a cave roof 50 blocks below
+the real surface. Use ONE persistent RCON connection: reconnecting per command stalls the
+server after ~13 rapid cycles, and `socket.setTimeout` does not fire on it.
+

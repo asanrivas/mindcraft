@@ -188,3 +188,53 @@ unmeasured until someone remembers. Open: run it as a gate on command-descriptio
 corrected this 2026-08-23 (the server IS 1.21.11; `onGround` is broken for other reasons).
 The gap plans' *constraints* are still right — build on primitives that work — but the
 stated reason is stale in that file and in several plan headers.
+
+---
+
+## Moved here from CLAUDE.md (2026-08-31 restructure)
+
+CLAUDE.md keeps the RULES; this file keeps the EVIDENCE. The text below is verbatim
+from CLAUDE.md before it was compacted — the measurements, the incidents and the
+reasoning behind the one-line rules that remain there. Heading levels are demoted by one.
+
+#### Writing a description the model will obey (2026-08-29, measured — docs/OBEDIENCE.md)
+
+`command_docs_mode: "compact"` keeps the first sentence (120ch) plus any follow-up sentence
+that starts imperatively (Use/Do NOT/Takes/Refused/Disabled/Pauses...). Prose sentences are
+dropped. Rules that came out of A/B-measuring gemini-flash and the local 9B:
+
+- **The param NAME is the only param documentation compact mode shows** (`name:type`; the
+  per-param descriptions are never rendered). `!branchMine(depth,...)` made the 9B pass a
+  distance where an absolute Y was wanted - out-of-domain calls, 5/5. Renamed to `y`; name
+  every new param so it is self-explanatory bare.
+- **Prohibitions go on the TEMPTING command, not the right one.** "Use !branchMine for ores"
+  written on !branchMine changed nothing; "Do NOT use for ores - use !branchMine" on
+  !collectBlocks flipped the 9B 5/5.
+- **Overlapping commands must cross-reference each other** (!scanArea<->!gridView,
+  !nearbyBlocks<->!surroundings, the chest list/find/named family). This is what made
+  selection *stable* across runs, not just more often right.
+- **Doc text does not deter a capable model** - flash took the !serverTp bait through every
+  wording. Real guards (the ALLOW_RESCUE_TP marker) protect; descriptions only inform.
+- `settings.hidden_actions` hides a command from the model while keeping it chat-callable
+  (measurement harnesses, and !goToSurface, which rides pathfinder with timeout -1).
+  `blocked_actions` deletes it for everyone.
+- Aliases must resolve to real, unblocked commands, and no destructive command may sit one
+  letter from a read-only one ('cf' used to be chestForget beside 'cfi' chestFind).
+  `tests/command_docs.test.mjs` enforces all of this.
+
+
+### The command skeleton (moved from CLAUDE.md's "Adding Commands")
+
+```javascript
+// In src/agent/commands/actions.js
+export const myCommand = {
+    name: "!myCommand",
+    description: "Description for LLM",
+    params: { "arg1": {type: "string", description: "..."} },
+    perform: async (agent, arg1) => { return "result"; }
+}
+// Register in index.js: actionsList = [..., myCommand]
+```
+
+Remember that in `compact` mode the per-param `description` is **never rendered** — only
+`name:type` — and the command `description` is truncated at `DESC_TOTAL_MAX` (210 chars).

@@ -4,8 +4,14 @@
 architecture, and the short version of every rule. **These docs are the long version** — why a
 thing is built the way it is, what was measured, and which bugs are still open.
 
-> `docs/` is in `.gitignore`, so nothing here is committed. Move a file out of `docs/` if it
-> needs to travel with the repo.
+> **`docs/` is TRACKED and committed.** (Verify: `git ls-files docs/`.) This file and `CLAUDE.md`
+> both used to claim the opposite, which told several sessions their documentation was disposable.
+> It travels with the repo — write it here and commit it.
+>
+> **The split, since the 2026-08-31 restructure:** `CLAUDE.md` is ~430 lines of RULES, each with a
+> pointer here. These docs hold the EVIDENCE — the measurements, the log excerpts, the incidents.
+> Every doc that gained a `## Moved here from CLAUDE.md` section on that date received the verbatim
+> prose that used to sit in the root file; nothing was deleted.
 
 ---
 
@@ -17,7 +23,10 @@ thing is built the way it is, what was measured, and which bugs are still open.
 | [CLIENT_REPLACEMENT.md](CLIENT_REPLACEMENT.md) | Replacing mineflayer itself: the `src/mc/` seam, the borrow-vs-build call per layer, the milestone ladder, and the corrected prismarine-chunk claim |
 | [SWIMMING.md](SWIMMING.md) | Everything wet: measured swim speeds, the three wet states, **climbing out onto a bank** (the reason the bot used to dig canals), SwimAssist, the `drowning` mode, and the still-open failure modes |
 | [MARATHON.md](MARATHON.md) | `travelToward`, checkpoint marathons, route surveying, and who owns a running action |
-| [WORLD_TOOLS.md](WORLD_TOOLS.md) | Seed lookup, `/locate biome`, operator teleport/gamemode/spawnpoint, block states, and placing blocks next to the bot |
+| [WORLD_TOOLS.md](WORLD_TOOLS.md) | Seed lookup, `/locate biome`, operator teleport/gamemode/spawnpoint, world-edit guards, block states, and placing blocks next to the bot |
+| [BLOCK_PLACEMENT.md](BLOCK_PLACEMENT.md) | Why `bot.placeBlock` is unusable for anything time-critical, and what `block_io.js` / `place_packet.js` do instead |
+| [CONTAINERS.md](CONTAINERS.md) | Chests: the owned container protocol, mineflayer's three defects, the double-chest rule, and the item-loss path |
+| [MODES.md](MODES.md) | The modes system, interrupts, action ownership, follow, tool selection, `night_safety`, the difficulty lie, and teleport detection |
 
 **Read together:** the water cost model lives in NAVIGATION_REBUILD, the physics that justifies
 it lives in SWIMMING, and the journeys that spend it live in MARATHON.
@@ -26,13 +35,15 @@ it lives in SWIMMING, and the journeys that spend it live in MARATHON.
 
 | Doc | What it covers |
 |---|---|
+| [MEMORY_AND_GOALS.md](MEMORY_AND_GOALS.md) | The memory store and paraphrase folding, the two goals and how each ends, the reconnect/stand-down policy, and steering |
 | [OBEDIENCE.md](OBEDIENCE.md) | Making the model pick the right command: the compact-docs renderer that deleted disambiguation, hidden_actions, alias contract, the `depth`→`y` rename, before/after measurements (flash + local 9B), the max_tokens "auto" bug, memory paraphrase-folding — and the open gaps at the bottom |
 | [LLM_FAILOVER.md](LLM_FAILOVER.md) | The backup brain, the circuit breaker, and why providers must throw rather than return a placeholder. Current chain (2026-08-29): llamacpp qwen3.5-9B on amyasan:8000 (direct, tunnel disabled) → gemini-2.5-flash; DigitalOcean removed (402 account-wide) |
 | [LETTA.md](LETTA.md) · [LETTA_CLIENT.md](LETTA_CLIENT.md) | Letta integration |
 | [MEM0_INTEGRATION.md](MEM0_INTEGRATION.md) · [MEM0_FINAL_STATUS.md](MEM0_FINAL_STATUS.md) · [MEM0_SUCCESS.md](MEM0_SUCCESS.md) | Mem0 cloud memory |
 
-Steering (persistent user-authored directives) is documented in `CLAUDE.md` — it is short
-enough not to need its own file.
+Steering (persistent user-authored directives) is documented in
+[MEMORY_AND_GOALS.md](MEMORY_AND_GOALS.md), alongside goals and the reconnect policy it interacts
+with. Capability gap analyses and their execution plans live in [gaps/](gaps/).
 
 ## Operations
 
@@ -40,6 +51,7 @@ enough not to need its own file.
 |---|---|
 | [CREATIVE_MODE.md](CREATIVE_MODE.md) | Native creative inventory, the web item picker, the `waitTimeout: 0` mineflayer bug, and how to check item ids against a newer server |
 | [TESTING.md](TESTING.md) | Unit suites, driving the live bot over the MindServer socket, and the procedural traps that produce wrong readings |
+| [OPERATIONS.md](OPERATIONS.md) | The duplicate-`main.js` crash loop, the bird-view timelapse recorder and its viewer-asset patching, web UI endpoints, common symptoms |
 | [SERVICE_MANAGEMENT.md](SERVICE_MANAGEMENT.md) | systemd service control |
 | [DIAGNOSTIC_COMMANDS.sh](DIAGNOSTIC_COMMANDS.sh) · [verify_build.py](verify_build.py) | Diagnostic helpers |
 | [regenerate_map.sh](regenerate_map.sh) · [scan_area.sh](scan_area.sh) | Map rendering and area scans |
@@ -86,5 +98,15 @@ swimming work.
    Look for the gap between the cases, not for the broken component.
 10. **State that belongs to someone else is not yours to clear.** A mode's clean completion
     wiped the resume of the action it had interrupted, so a follow *ended* instead of pausing.
-11. **`await` is not a yield.** A loop whose only awaits are microtasks starves the event loop
+11. **The dominant bug shape here: the code measures something true and concludes something
+    false.** An entity leaving view distance read as a kill; no mode activity read as the modes
+    being safe; a missing `SpawnX` key read as no spawn point; a prohibition dropped by a 210-char
+    render cap read as the model having been told. Measure the thing you are concluding about.
+12. **Establish feasibility BEFORE committing to a destructive step.** Three subsystems got this
+    wrong independently — `emergencyShelter`, `placeOne`, `decideFoodAction`.
+13. **Never retry a failure on a fixed beat.** `night_safety` learned it; `food_supply` re-earned
+    it 53 times. Back off, give up with a named reason, and reset on a change in the INPUTS.
+14. **A negative read is not evidence until a positive control returns something.**
+15. **Measure the ASSIST, not its PREMISE.** `apex 0.000` was a measurement of an assumption.
+16. **`await` is not a yield.** A loop whose only awaits are microtasks starves the event loop
     and the server drops the client — which looks exactly like the bot dying in-world.

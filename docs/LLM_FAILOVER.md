@@ -129,3 +129,80 @@ Generated response: Fun fact: In Minecraft, salmon can swim upstream...
 
 Recovery verified with real sockets: down → backup; restored but inside cooldown → still backup;
 after cooldown → primary.
+
+---
+
+## Moved here from CLAUDE.md (2026-08-31 restructure)
+
+CLAUDE.md keeps the RULES; this file keeps the EVIDENCE. The text below is verbatim
+from CLAUDE.md before it was compacted — the measurements, the incidents and the
+reasoning behind the one-line rules that remain there. Heading levels are demoted by one.
+
+### LLM Providers
+
+18+ providers auto-discovered. Config: `{"api": "foundry", "model": "claude-sonnet-4-5", "url": "..."}`
+Azure Foundry: URL ends with `/anthropic/`, key: `AZURE_FOUNDRY_API_KEY`
+
+**copilot-mem0** (`src/models/copilot_mem0.js`): GitHub Copilot + Claude + Mem0 cloud memory
+- Token priority: 1) `~/.openclaw/credentials/github-copilot.token.json`  2) exchange `GITHUB_TOKEN` PAT
+- Calls `https://api.githubcopilot.com/chat/completions` (OpenAI-compatible, vscode-chat integration)
+- Models: `claude-haiku-4.5`, `claude-sonnet-4.5`, `claude-opus-4.5/4.6`, `gpt-5`, `gpt-5-mini`, `gemini-3-flash-preview`
+- **Tiered routing**: set `"model": "tiered"` — haiku classifies complexity, routes to haiku/sonnet/opus
+  - `simple` → haiku  (greetings, status, follow/stop)
+  - `medium` → sonnet (crafting, mining, navigation, small builds)
+  - `hard`   → opus   (large builds >20 blocks, multi-step plans, complex strategies)
+  - Override via params: `tier_router`, `tier_simple`, `tier_medium`, `tier_hard`
+- Augments every request with Mem0 semantic memory; stores conversation + events (user + system pool)
+- Event hooks (`recordDeath`, `recordPlayerJoin`, `recordChestDeposit`) match `Mem0Local` interface
+- Profile: `profiles/copilot.json` | Keys needed: `MEM0_API_KEY` (+ `GITHUB_TOKEN` if openclaw token expired)
+
+#### Backup brain (failover when the local LLM is down)
+
+Andy's primary model is a local llama-server reached over an SSH tunnel from a Windows box.
+When that box sleeps or the tunnel drops, every request used to fail and Andy answered
+`"My brain disconnected, try again."` forever. It now fails over to a cloud model.
+
+```jsonc
+// andy.json
+"backup_model": { "api": "fireworks", "model": "deepseek-v4-flash-0731",
+                  "params": { "max_tokens": 1024, "reasoning_effort": "low" } },
+"backup_cooldown_secs": 60   // how long to stop dialling a primary that failed
+```
+
+`backup_model` takes one profile or an ordered list (tried left to right).
+Key: `FIREWORKS_API_KEY`. Measured latency: **~1.4s**.
+
+**`src/models/fallback.js` is the only place that decides "the model is down".** Providers
+just throw; `FallbackModel` classifies the error, routes, and guarantees `sendRequest` always
+resolves to a string - `promptCoding`/`promptMemSaving` in `prompter.js` have **no try/catch**,
+so a rejection there propagates into the agent loop.
+
+- A plain circuit breaker: an *availability* error (ECONNREFUSED, timeout, 5xx, socket hangup)
+  opens it, so the next 60s of turns skip the dead primary instead of paying a connect timeout
+  each turn. After the cooldown the primary is tried first again and recovery is automatic.
+- Other errors (a 400, an empty completion) also fail over but do **not** open the breaker -
+  the primary is still reachable, so keep using it.
+- If every backup fails, the primary is retried once as a last resort before giving up.
+
+Two provider changes this required: `llamacpp.js` and `fireworks.js` used to *swallow* errors
+and return the "brain disconnected" placeholder. A placeholder reads as **success** and stops
+the chain, so both now throw. `llamacpp.js` also gained a 120s timeout (`maxRetries: 0`) -
+without one, a half-open tunnel hangs forever and the backup is never reached.
+
+`!stats` grows a `- Brain: BACKUP (...)` line **only while failed over**, so the normal prompt
+costs nothing. Without it the only symptom of an outage is that Andy suddenly writes differently.
+
+Tests: `bun tests/fallback.test.mjs` (fakes, no network). Verified live against a genuinely
+dead local server, and recovery verified with real sockets: down -> backup, back up but inside
+cooldown -> still backup, after cooldown -> primary.
+
+**Current chain (2026-08-29, both bots):** primary `llamacpp/qwen3.5-9b-uncensored` direct at
+`http://amyasan:8000/v1` (tunnel disabled - `llama-tunnel.service` stopped; the server is a
+`LlamaServer` scheduled task on the Windows box, `Start-ScheduledTask` over ssh restarts it),
+backup `google/gemini-2.5-flash`. DigitalOcean is REMOVED: 402 on every model account-wide
+while /models still answers - billing, not tier-lock (tier locks are 403). Two bugs fixed so
+the local model can be primary at all: `applyContextBudget` must run BEFORE `new Prompter`
+(providers copy params at construction, so a later `"auto"`->number mutation never reaches
+them and llama-server 400s on the string), and it must resolve `max_tokens:"auto"` for the
+whole backup chain, not just `profile.model`.
+

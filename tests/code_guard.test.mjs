@@ -296,6 +296,60 @@ check('signature carries a readable tail', /error-boom/.test(failureSignature('x
     check('a passing signature gives no reason', shouldRetry(s, []).reason, null);
 }
 
+// ---------------------------------------------------------------------------
+// The REAL failure corpus, and what the dedupe deliberately does NOT collapse.
+//
+// Captured live from andy, 2026-08-31 00:35-00:38 UTC: seventeen generated-code
+// failures in a three-minute window, in two classes - invented mineflayer APIs, and
+// output that never parses. They differ only by an identifier, so it is a fair question
+// whether they should fold into one signature. MEASURED: they do not, and that is the
+// intended behaviour, locked here so nobody "fixes" it without reading this.
+//
+// Folding them would mean the second attempt of a DIFFERENT invented API stops the
+// loop. But `bot.setBlock` -> `bot.placeBlock` is exactly the correction we want the
+// model to make, and it arrives as a different-error retry. This repo's rule is that a
+// guard which blocks legitimate work is worse than the status quo, so the dedupe stays
+// exact: it only stops a failure that has literally already happened and therefore
+// cannot change.
+//
+// KNOWN LIMITATION, deliberately not fixed here: the history is per-generateCode call,
+// so a model that reaches for the same nonexistent API on the NEXT !newAction starts
+// with a clean slate. Cross-invocation memory is what `LearnedSkills.recordFailure`
+// exists for - it now has a caller, but nothing feeds it back into generation yet.
+{
+    const code = "await skills.placeBlock(bot, 'stone', 1, 2, 3);";
+    const invented = [
+        'TypeError: bot.setBlock is not a function',
+        'TypeError: bot.setBlockForced is not a function',
+        'TypeError: bot.setEntityPosition is not a function',
+    ];
+    const unparseable = [
+        "SyntaxError: Unexpected identifier 'skills'",
+        "SyntaxError: Unexpected identifier 'bot'",
+        "SyntaxError: Unexpected identifier 'setTimeout'",
+    ];
+    const sigs = [...invented, ...unparseable].map((e) => failureSignature(code, e));
+    check('six real distinct failures give six distinct signatures',
+        new Set(sigs).size, 6);
+
+    // Walking the real sequence: every step is a NEW failure, so every step retries.
+    const hist = [];
+    let stopped = false;
+    for (const sig of sigs) {
+        if (!shouldRetry(sig, hist).retry) stopped = true;
+        hist.push(sig);
+    }
+    check('a flailing sequence of DIFFERENT failures is never cut short', stopped, false);
+
+    // The control that makes the above safe: a genuine repeat still stops at once.
+    const repeat = failureSignature(code, invented[0]);
+    check('but repeating ONE of them still stops', shouldRetry(repeat, [repeat]).retry, false);
+
+    // Same error text, different code, must stay distinct - the model rewrote the body.
+    check('same error from different code stays distinct',
+        failureSignature('await skills.wait(bot, 10);', invented[0]) === repeat, false);
+}
+
 if (failures) {
     console.error(`\n${failures} check(s) FAILED`);
     process.exit(1);

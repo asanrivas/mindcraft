@@ -1,4 +1,5 @@
 import { inWater, isSubmerged, inLava, verticalIntent } from './swim.js';
+import { TELEPORT_MIN_BLOCKS, CORRECTION_MIN_BLOCKS } from './server_corrections.js';
 
 /**
  * Always-on swimming support, modelled on AutoJump.
@@ -29,8 +30,24 @@ const DEFAULTS = {
     requireSubmerged: true, // vanilla only sprint-swims in the swimming pose
     sinkAssist: 0.015,      // extra downward accel in 'sink' mode; sinking is otherwise 0.025 b/t
     band: 0.35,
-    rubberBandLimit: 3,     // forcedMove corrections within the window that kill the boost
+    rubberBandLimit: 3,     // real corrections within the window that stand the boost down
     rubberBandWindowMs: 10000,
+    // A CORRECTION IS A NUDGE, NOT A TELEPORT. This valve counted PACKETS, and an operator
+    // `/tp` emits one just like anti-cheat does - measured 2026-08-30 17:46:27, tripped two
+    // seconds after `[SwimAssist] enabled` by a test harness teleporting the bot into place,
+    // long before it touched water. Anti-cheat corrections are small; teleports are large, and
+    // `agent._wireTeleportDetection` already draws that line at 8 blocks. Count only what falls
+    // between the two.
+    // SHARED with teleport detection - see library/server_corrections.js. These were local 8 and
+    // 0.5 literals, agreeing with agent.js by coincidence rather than by construction; the drift
+    // would have reintroduced exactly the bug they were added to fix.
+    correctionMin: CORRECTION_MIN_BLOCKS,
+    correctionMax: TELEPORT_MIN_BLOCKS,
+    // STAND DOWN, DO NOT LATCH. `boostDisabled` used to hold for the whole SESSION. Four valve
+    // latches happened on 2026-08-30 alone (JumpAssist 13:57, 15:06, 16:57, 17:05; SwimAssist
+    // 17:05 and 17:46) - so in practice this is not "degrade gracefully", it is "silently lose
+    // the capability until someone restarts the process". Same cooldown JumpAssist now uses.
+    standDownMs: 60000,
 };
 
 export class SwimAssist {
@@ -43,7 +60,8 @@ export class SwimAssist {
         this.holdingJump = false;
         this.intent = 'hold';
         this.boosted = false;
-        this.boostDisabled = false;
+        this.boostDisabledUntil = 0;   // RECOVERS - see standDownMs
+        this._lastSeen = null;         // our own view of position, for the correction filter
         this.savedAccel = null;
         this.forcedMoves = [];
         this._onTick = () => this._tick();
@@ -93,21 +111,37 @@ export class SwimAssist {
         };
     }
 
+    /** True only while stood down. A getter, so every existing `boostDisabled` read still works. */
+    get boostDisabled() { return Date.now() < this.boostDisabledUntil; }
+
     _forcedMove() {
         // Only corrections that arrive WHILE we are boosting are evidence against the boost.
         // mineflayer emits forcedMove for every server position packet - login, teleports and
         // routine corrections all count - so an unconditional counter trips the valve before
         // the bot has been near water. Observed live: 4 "rubber-bands" during spawn.
-        if (!this.boosted) return;
+        if (!this.boosted || this.boostDisabled) return;
+        const p = this.bot.entity?.position;
+        if (!p) return;
+        const last = this._lastSeen;
+        this._lastSeen = p.clone?.() ?? null;
+        if (!last) return;
+        // Only a NUDGE counts. Below correctionMin the server agreed with us; at or above
+        // correctionMax it teleported us, which is not evidence about the boost either way.
+        const moved = p.distanceTo(last);
+        if (moved < this.opts.correctionMin || moved >= this.opts.correctionMax) return;
+
         const now = Date.now();
         this.forcedMoves = this.forcedMoves.filter(t => now - t < this.opts.rubberBandWindowMs);
         this.forcedMoves.push(now);
-        if (!this.boostDisabled && this.forcedMoves.length > this.opts.rubberBandLimit) {
-            // The server is correcting us. Degrade to plain swimming rather than get kicked.
-            this.boostDisabled = true;
+        if (this.forcedMoves.length > this.opts.rubberBandLimit) {
+            // The server is correcting us. Degrade to plain swimming rather than get kicked -
+            // but only for a while, so a passing rough patch does not cost the whole session.
+            this.boostDisabledUntil = Date.now() + this.opts.standDownMs;
+            this.forcedMoves = [];
             this._restoreAccel();
-            console.warn(`[SwimAssist] server rubber-banded ${this.forcedMoves.length} times in `
-                + `${this.opts.rubberBandWindowMs / 1000}s - sprint-swim boost disabled for this session.`);
+            console.warn(`[SwimAssist] server corrected us ${this.opts.rubberBandLimit + 1} times in `
+                + `${this.opts.rubberBandWindowMs / 1000}s - sprint-swim boost stood down for `
+                + `${Math.round(this.opts.standDownMs / 1000)}s, then it retries.`);
         }
     }
 
@@ -155,6 +189,9 @@ export class SwimAssist {
     _tick() {
         const bot = this.bot;
         if (!bot.entity) return;
+        // Resample the correction baseline every tick: compared against the PREVIOUS PACKET it
+        // would measure our own swimming instead of the server's disagreement.
+        this._lastSeen = bot.entity.position.clone?.() ?? this._lastSeen;
 
         if (!inWater(bot)) { this._restore(true); return; }
         // isInWater and isInLava share the same physics branch and can both be true at a

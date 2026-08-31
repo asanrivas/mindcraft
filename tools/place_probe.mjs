@@ -165,12 +165,52 @@ for (let i = 0; i < rounds; i++) {
 }
 const shippedMs = ((Date.now() - shippedT0) / Math.max(1, shipped.n)).toFixed(0);
 
+log('');
+log('--- POTTED PLANTS: place a flower_pot, then use the plant on it ---');
+// There is no `potted_cherry_sapling` item, so the builder places a pot and activates it with
+// the plant. Verify the two-step against the real server rather than trusting the item table.
+const { pottedPlantItem } = await import('../src/agent/library/blueprint_builder.js');
+let pot = { ok: 0, n: 0 };
+for (const want of ['potted_cherry_sapling', 'potted_azalea_bush', 'potted_azure_bluet']) {
+    const plant = pottedPlantItem(want);
+    const cell = new Vec3(px + 2, py, pz - 2 + pot.n);
+    const ref = bot.blockAt(cell.offset(0, -1, 0));
+    if (!ref || ref.boundingBox !== 'block') { log(`  ${want}: no reference block`); continue; }
+    pot.n++;
+    // Optionally recreate the SUPPORT the real blueprint puts under this pot. The live build
+    // stands its pots on `spruce_trapdoor[half=top]`, and a trapdoor is a very different
+    // reference face from the stone slab a naive probe would use.
+    const support = arg('support', null);
+    if (support) await rcon(`setblock ${cell.x} ${cell.y - 1} ${cell.z} ${support}`);
+    await rcon(`give ${username} flower_pot 1`);
+    await rcon(`give ${username} ${plant} 1`);
+    await new Promise((r) => setTimeout(r, 700));
+    await new Promise((r) => setTimeout(r, 300));
+    const ref2 = bot.blockAt(cell.offset(0, -1, 0));
+    log(`    support under pot: ${ref2?.name} (boundingBox=${ref2?.boundingBox})`);
+    const potItem = bot.inventory.items().find((i) => i.name === 'flower_pot');
+    if (!potItem) { log(`  ${want}: no flower_pot in inventory`); continue; }
+    await bot.equip(potItem, 'hand');
+    const placed = await blockIO.placeVerified(bot, ref2 ?? ref, new Vec3(0, 1, 0), { expectName: 'flower_pot' });
+    if (!placed.ok) { log(`  ${want}: pot did not land (${placed.why})`); continue; }
+    const plantItem = bot.inventory.items().find((i) => i.name === plant);
+    if (!plantItem) { log(`  ${want}: no ${plant} in inventory`); continue; }
+    await bot.equip(plantItem, 'hand');
+    try { await bot.activateBlock(bot.blockAt(cell)); } catch (e) { /* ask the world, not the throw */ }
+    let got = null;
+    const dl = Date.now() + 800;
+    while (Date.now() < dl) { got = bot.blockAt(cell)?.name; if (got === want) break; await new Promise((r) => setTimeout(r, 25)); }
+    if (got === want) pot.ok++;
+    log(`  ${want}: used ${plant} on the pot -> ${got} ${got === want ? 'OK' : 'MISMATCH'}`);
+}
+
 const avg = ackTimes.length ? (ackTimes.reduce((a, b) => a + b, 0) / ackTimes.length).toFixed(0) : 'n/a';
 log('');
 log(`VERDICT`);
 log(`  ours:       ${ours.ok}/${ours.n} landed, ${ours.acked}/${ours.n} acknowledged, avg ack ${avg}ms`);
 log(`  mineflayer: ${mf.ok}/${mf.n} landed, ${mf.threw}/${mf.n} THREW for a block that may have landed`);
 log(`  shipped:    ${shipped.ok}/${shipped.n} ok via block_io.placeVerified, ${shippedMs}ms/place incl. 250ms spacing`);
+log(`  potted:     ${pot.ok}/${pot.n} planted via flower_pot + activateBlock`);
 log(`  acks seen total: ${ackCount}   block_change packets seen: ${blockChanges}`);
 await rcon(`fill ${px - 3} ${py} ${pz - 3} ${px + 3} ${py + 3} ${pz + 3} air`);
 await rcon(`forceload remove ${px - 4} ${pz - 4} ${px + 4} ${pz + 4}`);

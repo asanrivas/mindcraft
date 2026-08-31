@@ -452,3 +452,44 @@ if (failures) {
     process.exit(1);
 }
 console.log('PASS: swim primitives correct');
+
+// --- SwimAssist's anti-cheat valve ------------------------------------------------------------
+// It counted PACKETS. An operator `/tp` emits `forcedMove` exactly like anti-cheat does, so a
+// test harness teleporting the bot into place tripped it two seconds after enable, before the
+// bot had touched water (measured 2026-08-30 17:46:27). And it LATCHED for the whole session:
+// six valve latches happened across the two assists on that one day.
+{
+    const { SwimAssist } = await import('../src/agent/library/swim_assist.js');
+    const fake = () => {
+        const EventEmitter = require('events');
+        const bot = new EventEmitter();
+        let px = 0;
+        bot.entity = {
+            position: {
+                get x() { return px; }, y: 64, z: 0,
+                clone() { const v = px; return { x: v, y: 64, z: 0, distanceTo: (o) => Math.abs(o.x - v) }; },
+                distanceTo(o) { return Math.abs(o.x - px); },
+            },
+            velocity: { x: 0, y: 0, z: 0 },
+        };
+        bot.shove = (d) => { px += d; };
+        return bot;
+    };
+    const c = (l, g, w) => { if (g !== w) { console.error(`FAIL ${l}: got ${g}, expected ${w}`); process.exitCode = 1; } };
+
+    const sa = new SwimAssist(fake());
+    sa.boosted = true;
+    // A re-sync that moves us nowhere is not the server disagreeing.
+    for (let i = 0; i < 6; i++) sa._forcedMove();
+    c('zero-displacement syncs do not trip it', sa.boostDisabled, false);
+    // A TELEPORT is not evidence about the boost either - this is the case that fired live.
+    for (let i = 0; i < 6; i++) { sa.bot.shove(200); sa._forcedMove(); }
+    c('teleports do not trip it', sa.boostDisabled, false);
+    // A genuine nudge does.
+    for (let i = 0; i < 4; i++) { sa.bot.shove(1.5); sa._forcedMove(); }
+    c('real corrections stand it down', sa.boostDisabled, true);
+    // AND IT COMES BACK. Latching cost the capability for the whole process lifetime.
+    sa.boostDisabledUntil = Date.now() - 1;
+    c('the stand-down expires', sa.boostDisabled, false);
+    console.log('SwimAssist valve: checks passed');
+}

@@ -80,3 +80,34 @@ check('NaN is not a teleport', teleportVerdict({ jumped: NaN, ...SETTLED }), 'be
 
 if (failures) { console.error(`\n${failures} check(s) FAILED`); process.exit(1); }
 console.log('PASS: teleport detection correct');
+
+// --- the correction/teleport line is SHARED, not duplicated -----------------------------------
+// `forcedMove` cannot tell an operator /tp from an anti-cheat nudge; only distance can. Four
+// subsystems have needed that line and each drew it privately, so the agreement between
+// teleport detection and SwimAssist's boost valve was a coincidence. It stopped being one when
+// both started importing `library/server_corrections.js` - this asserts nobody re-localises it,
+// because the symptom of drift is the 2026-08-30 17:46:27 bug returning with no code change at
+// the site of the failure: a harness teleport counted as anti-cheat and latching the valve.
+{
+    const fs = await import('fs');
+    const { TELEPORT_MIN_BLOCKS, CORRECTION_MIN_BLOCKS } =
+        await import('../src/agent/library/server_corrections.js');
+    const { SwimAssist } = await import('../src/agent/library/swim_assist.js');
+    const c = (l, g, w) => { if (g !== w) { console.error(`FAIL ${l}: got ${g}, expected ${w}`); process.exitCode = 1; } };
+
+    // The valve's upper edge IS the teleport threshold - one value, reached two ways.
+    const sa = new SwimAssist({ entity: null, on() {}, removeListener() {} });
+    c('SwimAssist takes its upper edge from the shared constant', sa.opts.correctionMax, TELEPORT_MIN_BLOCKS);
+    c('...and its lower edge too', sa.opts.correctionMin, CORRECTION_MIN_BLOCKS);
+
+    // And neither site may quietly go back to its own literal.
+    const agentSrc = fs.readFileSync('src/agent/agent.js', 'utf8');
+    c('agent.js does not redefine the threshold locally',
+      /const\s+TELEPORT_MIN_BLOCKS\s*=/.test(agentSrc), false);
+    c('agent.js imports it instead',
+      /import\s*\{[^}]*TELEPORT_MIN_BLOCKS[^}]*\}\s*from\s*'\.\/library\/server_corrections\.js'/.test(agentSrc), true);
+    const swimSrc = fs.readFileSync('src/agent/library/swim_assist.js', 'utf8');
+    c('swim_assist.js does not hardcode the band',
+      /correctionMax:\s*\d/.test(swimSrc) || /correctionMin:\s*\d/.test(swimSrc), false);
+    console.log('correction/teleport constant: shared, checks passed');
+}

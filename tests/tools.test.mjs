@@ -109,3 +109,23 @@ if (failures) {
     process.exit(1);
 }
 console.log(`PASS: ${total}/${total} cases correct`);
+
+// --- isCanopy ---------------------------------------------------------------------------------
+// A leaf canopy is a ceiling for COLLISION but not for "am I under something". minecraft-data
+// gives oak_leaves boundingBox 'block', so a naive overhead probe reads a bot standing under a
+// tree as roofed - and climbToSurface would tower up through the canopy from open ground.
+{
+    const { isCanopy } = await import('../src/agent/library/tools.js');
+    const c = (l, g, w) => { if (g !== w) { console.error(`FAIL ${l}: got ${g}`); process.exitCode = 1; } };
+    c('oak leaves are canopy', isCanopy('oak_leaves'), true);
+    c('cherry leaves are canopy', isCanopy('cherry_leaves'), true);
+    c('flowering azalea leaves are canopy', isCanopy('flowering_azalea_leaves'), true);
+    // Glass is a REAL roof - a greenhouse should not read as open sky.
+    c('glass is not canopy', isCanopy('glass'), false);
+    c('logs are not canopy', isCanopy('oak_log'), false);
+    // Suffix, never includes: leaf_litter is ground cover. This file's own isFallingBlockName
+    // exists because "sandstone".includes("sand") fired self_preservation every tick in a desert.
+    c('leaf litter is not canopy', isCanopy('leaf_litter'), false);
+    c('non-strings are not canopy', isCanopy(undefined), false);
+    console.log('isCanopy: checks passed');
+}

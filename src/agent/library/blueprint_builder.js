@@ -3,6 +3,7 @@ import * as mc from '../../utils/mcdata.js';
 import * as nav from './nav.js';
 import { pillarUp } from './skills.js';
 import * as blockIO from './block_io.js';
+import * as buildGuard from './build_guard.js';
 import fs from 'fs';
 
 /**
@@ -46,7 +47,39 @@ const NATURAL_TERRAIN = new Set(['grass_block', 'dirt', 'coarse_dirt', 'rooted_d
     'sandstone', 'clay', 'moss_block', 'mud', 'short_grass', 'grass', 'tall_grass', 'fern',
     'large_fern', 'dead_bush', 'snow', 'poppy', 'dandelion', 'cornflower', 'oxeye_daisy', 'azure_bluet']);
 
+/**
+ * A potted plant is TWO operations, not one - there is no `potted_cherry_sapling` item.
+ *
+ * Every `potted_*` block is placed by putting down a `flower_pot` and then USING the plant on
+ * it; the pot's block state changes and the plant item is consumed. Checked against
+ * minecraft-data 1.21.11: all 37 `potted_*` blocks exist, and **not one of them is also an
+ * item**, so this is not an edge case - the whole class was unbuildable.
+ *
+ * The symptom was not a clean "no such item" either. `mc.makeItem('potted_cherry_sapling')`
+ * yields something prismarine-item cannot serialise, and the failure surfaced from deep inside
+ * the equip as `undefined is not an object (evaluating 'item.components.length')`, which reads
+ * like a mineflayer bug rather than a blueprint the builder cannot express.
+ *
+ * Two names do not survive the mechanical strip - the block says "bush" and the item does not:
+ *   potted_azalea_bush           -> azalea
+ *   potted_flowering_azalea_bush -> flowering_azalea
+ * Every other one is the bare name. Pure and exported so the mapping is checked against real
+ * item data in tests rather than trusted.
+ *
+ * @param {string} blockName e.g. "potted_cherry_sapling"
+ * @returns {string|null} the item to use on the pot, or null if this is not a potted block
+ */
+export function pottedPlantItem(blockName) {
+    if (typeof blockName !== 'string' || !blockName.startsWith('potted_')) return null;
+    const bare = blockName.slice('potted_'.length);
+    if (!bare) return null;
+    const RENAMED = { azalea_bush: 'azalea', flowering_azalea_bush: 'flowering_azalea' };
+    return RENAMED[bare] ?? bare;
+}
+
 function itemNameFor(blockName) {
+    // The pot goes down first; pottedPlantItem() supplies what is then used on it.
+    if (blockName.startsWith('potted_')) return 'flower_pot';
     return blockName
         .replace(/_wall_hanging_sign$/, '_hanging_sign')
         .replace(/_wall_sign$/, '_sign')
@@ -57,6 +90,38 @@ function itemNameFor(blockName) {
         .replace(/_wall_fan$/, '_fan')
         .replace(/_wall_head$/, '_head')
         .replace(/_wall_skull$/, '_skull');
+}
+
+
+/**
+ * Put a plant into a flower pot that is already in the world.
+ *
+ * `activateBlock` is a right-click with the held item, which is exactly how a player does it -
+ * there is no place packet that can express "potted cherry sapling" in one go. Verified by
+ * reading the block back, like everything else here: the activate can be accepted and still
+ * leave an empty pot (wrong item, pot already occupied), and an empty pot passes any check that
+ * only asks "is something there".
+ *
+ * @returns {Promise<{ok: boolean, why: string}>}
+ */
+async function plantIntoPot(bot, P, plantItem, wantName) {
+    const already = bot.blockAt(P);
+    if (already?.name === wantName) return { ok: true, why: 'already planted' };
+    if (!(await equip(bot, plantItem))) return { ok: false, why: `no item ${plantItem}` };
+    const pot = bot.blockAt(P);
+    if (!pot || pot.name !== 'flower_pot') return { ok: false, why: `no pot at ${P} (${pot?.name})` };
+    try {
+        await bot.activateBlock(pot);
+    } catch (e) {
+        // Same rule as placement: the call may throw after the server accepted it, so ask the
+        // world below rather than believing the message.
+    }
+    const deadline = Date.now() + 500;
+    while (Date.now() < deadline) {
+        if (bot.blockAt(P)?.name === wantName) return { ok: true, why: 'planted' };
+        await new Promise(r => setTimeout(r, 25));
+    }
+    return { ok: false, why: `pot would not take ${plantItem}` };
 }
 
 // Should this placement entry be skipped because a sibling entry places it implicitly?
@@ -106,6 +171,11 @@ function isSolidRef(block) {
 // 4700-4731: bob reached x=4761 and the placement rate fell from 8.6 to 2.5 blocks/min, because
 // every subsequent cell then failed `out of reach (no walkable route)` from sixty blocks away.
 const SITE_LEASH = 24;
+
+// How many faces to try before accepting the server's refusal. Three, not all six: each attempt
+// costs a placement round trip plus the rate limiter's gap, and the measured wins come from the
+// first alternate - a cell no face can fill is usually genuinely unfillable.
+const MAX_FACE_TRIES = 3;
 
 // Is the bot so far outside the site that the next leg is hopeless? `box` is the blueprint's
 // world-space XZ bounds. Pure so the arithmetic is testable without a bot.
@@ -255,31 +325,48 @@ async function equip(bot, itemName) {
 }
 
 // Choose (referenceBlock, faceVector, faceName, halfOpt) for a placement.
-function chooseFace(bot, P, p) {
+/**
+ * Every face we could click to fill this cell, best first.
+ *
+ * This used to return only the best one, and `placeOne` gave up if the server refused it. That
+ * throws away the thing a player does without thinking: if the block will not go on from here,
+ * try another side. It matters because "refused by server" is now the DOMINANT failure in a
+ * blueprint run, and at least one whole class of it is a wrong face rather than an impossible
+ * placement - measured 2026-08-30 with `tools/place_probe.mjs --support spruce_trapdoor[half=top]`:
+ * a flower_pot clicked onto the trapdoor's face is refused 3/3 (acked in 19-57ms, so the server
+ * definitely decided), while the same pot on stone plants 3/3. The blueprint stands three of its
+ * pots on exactly that trapdoor.
+ *
+ * Order is unchanged - the first candidate is what the old function returned - so a placement
+ * that worked before still goes on the same way, first try.
+ */
+function chooseFaces(bot, P, p) {
     const props = p.properties || {};
+    const out = [];
+    const add = (c) => { if (c && !out.some(o => o.faceName === c.faceName)) out.push(c); };
 
     if (WALL_ATTACHED.test(p.name) && props.face !== 'floor' && props.face !== 'ceiling') {
         const f = props.facing;
         if (f && FACE[f]) {
             const ref = bot.blockAt(P.minus(FACE[f]));
-            if (isSolidRef(ref)) return { ref, faceVec: FACE[f], faceName: f, half: null };
+            if (isSolidRef(ref)) add({ ref, faceVec: FACE[f], faceName: f, half: null });
         }
     }
     if (props.face === 'floor') {
         const ref = bot.blockAt(P.offset(0, -1, 0));
-        if (isSolidRef(ref)) return { ref, faceVec: FACE.up, faceName: 'up', half: null };
+        if (isSolidRef(ref)) add({ ref, faceVec: FACE.up, faceName: 'up', half: null });
     }
     if (props.face === 'ceiling' || props.hanging === 'true') {
         const ref = bot.blockAt(P.offset(0, 1, 0));
-        if (isSolidRef(ref)) return { ref, faceVec: FACE.down, faceName: 'down', half: null };
+        if (isSolidRef(ref)) add({ ref, faceVec: FACE.down, faceName: 'down', half: null });
     }
 
     // trapdoors: prefer side-attach to the support behind (deterministic facing)
     if (p.name.endsWith('_trapdoor') && props.facing) {
         const ref = bot.blockAt(P.minus(FACE[props.facing]));
         if (isSolidRef(ref)) {
-            return { ref, faceVec: FACE[props.facing], faceName: props.facing,
-                     half: props.half === 'top' ? 'top' : 'bottom' };
+            add({ ref, faceVec: FACE[props.facing], faceName: props.facing,
+                  half: props.half === 'top' ? 'top' : 'bottom' });
         }
     }
 
@@ -288,7 +375,7 @@ function chooseFace(bot, P, p) {
         const axisFaces = { x: ['east', 'west'], y: ['up', 'down'], z: ['south', 'north'] }[props.axis] || [];
         for (const fname of axisFaces) {
             const ref = bot.blockAt(P.minus(FACE[fname]));
-            if (isSolidRef(ref)) return { ref, faceVec: FACE[fname], faceName: fname, half: null };
+            if (isSolidRef(ref)) add({ ref, faceVec: FACE[fname], faceName: fname, half: null });
         }
     }
 
@@ -302,10 +389,10 @@ function chooseFace(bot, P, p) {
             let half = null;
             if (SIDE_FACES.includes(fname) && (props.half || props.type === 'top' || props.type === 'bottom'))
                 half = wantTop ? 'top' : 'bottom';
-            return { ref, faceVec: FACE[fname], faceName: fname, half };
+            add({ ref, faceVec: FACE[fname], faceName: fname, half });
         }
     }
-    return null;
+    return out;
 }
 
 async function placeOne(bot, P, p, ctx = null) {
@@ -328,7 +415,8 @@ async function placeOne(bot, P, p, ctx = null) {
         }
     }
 
-    const choice = chooseFace(bot, P, p);
+    const choices = chooseFaces(bot, P, p);
+    const choice = choices[0];
     if (!choice) {
         const nb = (dx, dy, dz) => { const b = bot.blockAt(P.offset(dx, dy, dz)); return b ? `${b.name}/${b.boundingBox}` : 'NULL'; };
         return { ok: false, why: `no solid neighbor (self=${bot.blockAt(P)?.name} below=${nb(0,-1,0)} above=${nb(0,1,0)} n=${nb(0,0,-1)} s=${nb(0,0,1)} w=${nb(-1,0,0)} e=${nb(1,0,0)})` };
@@ -370,11 +458,28 @@ async function placeOne(bot, P, p, ctx = null) {
         // It paces itself (MIN_PLACE_GAP_MS), so the 250ms sleep that used to sit here is gone.
         // expectName, not the default "something solid appeared": half this blueprint is
         // trapdoors, fences and signs, whose boundingBox is never 'block'.
-        const opts = { swingArm: 'right' };
-        if (choice.half) opts.half = choice.half;
-        const r = await blockIO.placeVerified(bot, choice.ref, choice.faceVec,
-            { placeOpts: opts, expectName: p.name });
-        if (!r.ok) throw new Error(r.why);
+        // opts are rebuilt per candidate face below, since `half` is face-specific.
+        // For a potted plant the block that lands here is an EMPTY flower_pot; the plant goes in
+        // afterwards. Expecting p.name would fail a placement that was perfectly correct.
+        const plant = pottedPlantItem(p.name);
+        const wantName = plant ? 'flower_pot' : p.name;
+        // Try the alternate faces on a REFUSAL only. A refusal is the server saying "not from
+        // there", which another side may well answer; a missing ack means the round trip itself
+        // failed, and hammering more faces at a server that is not replying only makes it worse.
+        let r = null;
+        for (const c of choices.slice(0, MAX_FACE_TRIES)) {
+            const o = { swingArm: 'right' };
+            if (c.half) o.half = c.half;
+            r = await blockIO.placeVerified(bot, c.ref, c.faceVec, { placeOpts: o, expectName: wantName });
+            if (r.ok || !/refused by server/.test(r.why)) break;
+        }
+        if (!r || !r.ok) throw new Error(r ? r.why : 'no face to place from');
+        if (plant) {
+            const potted = await plantIntoPot(bot, P, plant, p.name);
+            // An empty pot where a planted one was wanted is a real mismatch, so say which half
+            // failed - "no item azalea" and "the pot would not take it" need different fixes.
+            if (!potted.ok) return { ok: false, why: potted.why };
+        }
     } catch (e) {
         // The API can throw after a SUCCESSFUL placement, so re-read before believing it - but
         // POLL, do not sample once. `_placeBlockWithOptions` ends in mineflayer's blockUpdate
@@ -505,13 +610,52 @@ export async function buildBlueprint(agent, filePath, origin) {
                      centreX: Math.round((minX + maxX) / 2), centreZ: Math.round((minZ + maxZ) / 2) };
         })(),
     };
-    // dirt for scaffolding, in a non-hand slot so equips of build blocks don't evict it
+    // Consumables the build needs but the blueprint never names, parked where equips of build
+    // blocks cannot evict them. `equip()` rotates hotbar slots 36-43, so 44 is the one spare
+    // hotbar slot; 9 is a plain main-inventory slot (0-8 are crafting/armour, 36-44 the hotbar,
+    // 45 the off-hand), which nothing in this builder touches.
+    //
+    // dirt      - the scaffold pillar `scaffoldTo` climbs and `pillarDown` removes.
+    // scaffolding - stocked automatically so it is on hand without a /give, but NOT wired into
+    //   the pillar, and deliberately absent from skills.STACKABLE so pillarUp cannot reach for
+    //   it. MEASURED on this server (tools/scaffold_probe.mjs), because it is the obvious
+    //   upgrade and it does not work here:
+    //     tower 1/6 | climb 1.00 | chain-break YES | reach 1
+    //   One block places fine on any solid support, and breaking the bottom of a column clears
+    //   the whole thing in a single dig - which is exactly what pillarDown's per-block loop
+    //   wants. But STACKING is refused: clicking a scaffolding block while holding scaffolding
+    //   is rejected by the server (ack in 16-59ms, so it is a decision and not a timeout),
+    //   identically through our own packet path AND mineflayer's, so it is a server rule and
+    //   not our code. /setblock holds the same stack happily, so the position is legal - it is
+    //   the PLACEMENT that is refused, because scaffolding is self-replaceable and the click
+    //   resolves onto the block you aimed at rather than the cell beside it.
+    //   Building a real tower therefore needs the vanilla technique - rise inside the column
+    //   placing into your OWN cell - which is precisely what `bodyClearsCell` and `stepOff`
+    //   exist to prevent for solid blocks. Until that technique exists, dirt stays the pillar.
     try { await bot.creative.setInventorySlot(44, mc.makeItem('dirt', 64)); } catch (e) { /* pillarUp will report */ }
+    try {
+        await bot.creative.setInventorySlot(9, mc.makeItem('scaffolding', 64));
+        console.log('[builder] stocked 64 scaffolding (slot 9)');
+    } catch (e) { console.log(`[builder] could not stock scaffolding: ${e.message}`); }
 
     let placed = 0, skipped = 0;
     const failures = [];
     const started = Date.now();
     try {
+        // Tell the NAVIGATOR the build exists. scaffoldTo already consults ctx.occupied, but the
+        // stall ladder inside nav.js does not - so without this the bot bridges dirt into the
+        // floor it is laying and mines its own walls to walk through them. See build_guard.js.
+        //
+        // INSIDE the try, and it must stay there. The guard is module-level state and the
+        // `finally` below is the only thing that stands it down; registered above the try, an
+        // await that never settles (an interrupt, a wedged packet) leaks a guard that prices
+        // real terrain at buildDigCost for the rest of the process - the same shape as
+        // SwimAssist leaking liquidAcceleration and AutoJump's leaked `active` flag.
+        const guarded = buildGuard.protectBuild(all.map(q => ({
+            x: origin.x + q.x, y: origin.y + q.y, z: origin.z + q.z,
+        })));
+        console.log(`[builder] protecting ${guarded} cells from the navigator's dig/bridge recovery`);
+
         // walk to the site first so chunks stream in, then WAIT for them - a blockAt
         // against a not-yet-received column reads null
         await nav.navigateTo(bot, { x: origin.x + 16, y: origin.y, z: origin.z + 16 },
@@ -626,6 +770,10 @@ export async function buildBlueprint(agent, filePath, origin) {
             if (++retried % 10 === 0) writeStatus(agent, { phase: 'retry', done: retried, total: retry.length });
         }
     } finally {
+        // A guard that outlives its build would make every later journey route around a
+        // structure nobody is working on any more - and the escape valve would never fire,
+        // because the bot is not enclosed, it is just walking past.
+        buildGuard.clearProtectedBuild();
         try { bot.modes.unPauseAll(); } catch (e) { /* best effort */ }
         // NOTE: no stopFlying here - we never startFlying now, and calling stopFlying
         // without a prior startFlying sets bot.physics.gravity to null (creative.js

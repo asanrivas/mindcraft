@@ -116,7 +116,18 @@ check('lava outranks the fall check',
 // --- the anti-cheat valve --------------------------------------------------------------------------
 function fakeBot() {
     const bot = new EventEmitter();
-    bot.entity = { position: { floored: () => ({ offset: () => ({}) }) }, velocity: { x: 0, y: 0, z: 0 } };
+    // The valve now compares positions, so the fake needs a real one it can move.
+    let px = 0;
+    bot.entity = {
+        position: {
+            get x() { return px; }, y: 64, z: 0,
+            floored: () => ({ offset: () => ({}) }),
+            clone() { const v = px; return { x: v, y: 64, z: 0, distanceTo: (o) => Math.abs(o.x - v) }; },
+            distanceTo(o) { return Math.abs(o.x - px); },
+        },
+        velocity: { x: 0, y: 0, z: 0 },
+    };
+    bot.__shove = (d) => { px += d; };   // pretend the server moved us
     bot.blockAt = () => ({ boundingBox: 'block' });
     bot.controlState = {};
     bot.setControlState = (k, v) => { bot.controlState[k] = v; };
@@ -131,28 +142,51 @@ function fakeBot() {
     check('corrections while NOT airborne do not disable jumping', ja.disabled, false);
 
     ja.active = true;
-    for (let i = 0; i < 4; i++) ja._forcedMove();
-    check('four corrections mid-flight disable it', ja.disabled, true);
+    // A CORRECTION THAT DOES NOT MOVE US IS NOT EVIDENCE. This server sends position packets
+    // constantly; counting them is how the valve latched on a bot that was jumping perfectly
+    // well (found live: `jump: REFUSED (jumping disabled (server corrections))` while following).
+    for (let i = 0; i < 6; i++) ja._forcedMove();
+    check('corrections that do not move us are ignored', ja.disabled, false);
+
+    const bot = ja.bot;
+    // NOR IS OUR OWN FLIGHT. The baseline is resampled every physics tick, so the distance the
+    // valve sees is at most one tick of our own motion (0.42 impulse + 0.32 axial ~ 0.53) plus
+    // whatever the server added. A tick of honest jumping must not read as a correction.
+    for (let i = 0; i < 6; i++) { bot.__shove(0.6); ja._forcedMove(); }
+    check('one tick of our own flight is not a correction', ja.disabled, false);
+
+    for (let i = 0; i < 4; i++) { bot.__shove(2); ja._forcedMove(); }
+    check('four REAL corrections mid-flight stand it down', ja.disabled, true);
     check('...and end the flight', ja.active, false);
+
+    // AND IT COMES BACK. This used to latch for the whole session, which is not "degrade to
+    // bridging" - the teardown measured the climb gym at 1/4 without JumpAssist against 4/4
+    // with it, so a latched valve silently cripples the bot until someone restarts it.
+    ja.disabledUntil = Date.now() - 1;
+    check('the stand-down expires and jumping returns', ja.disabled, false);
 }
 {
     const ja = new JumpAssist(fakeBot());
     ja.active = true;
     // Three inside the window is under the limit; the window must really slide.
-    for (let i = 0; i < 3; i++) ja._forcedMove();
+    for (let i = 0; i < 3; i++) { ja.bot.__shove(2); ja._forcedMove(); }
     check('three is under the limit', ja.disabled, false);
     ja.forcedMoves = ja.forcedMoves.map(() => Date.now() - 20000);   // age them out
-    for (let i = 0; i < 3; i++) ja._forcedMove();
+    for (let i = 0; i < 3; i++) { ja.bot.__shove(2); ja._forcedMove(); }
     check('three more after the window has passed is still under the limit', ja.disabled, false);
 }
 {
-    // A dead mechanism must latch too: a bot that cannot leave the ground should stop trying and
-    // bridge, rather than burning anti-cheat exposure on take-offs that do nothing.
+    // A dead mechanism stands down too: a bot that cannot leave the ground should stop trying
+    // and bridge, rather than burning anti-cheat exposure on take-offs that do nothing. It also
+    // RECOVERS - "cannot leave the ground" is usually about where the bot is standing, not about
+    // the mechanism, and that changes the moment it walks somewhere else.
     const ja = new JumpAssist(fakeBot());
     ja.noteOutcome(false); ja.noteOutcome(false);
     check('two failed take-offs is not yet fatal', ja.disabled, false);
     ja.noteOutcome(false);
-    check('three failed take-offs disables jumping', ja.disabled, true);
+    check('three failed take-offs stands jumping down', ja.disabled, true);
+    ja.disabledUntil = Date.now() - 1;
+    check('...and that stand-down expires too', ja.disabled, false);
     const ja2 = new JumpAssist(fakeBot());
     ja2.noteOutcome(false); ja2.noteOutcome(false); ja2.noteOutcome(true); ja2.noteOutcome(false);
     check('a success resets the failure count', ja2.disabled, false);

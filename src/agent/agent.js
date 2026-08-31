@@ -33,13 +33,13 @@ import { IdleBehavior } from './idle_behavior.js';
 /**
  * How far the server must move the bot in ONE position packet to count as a teleport.
  *
- * This is the load-bearing constant of teleport detection, not a tuning knob. `forcedMove`
- * fires on every server position packet - login, respawn, and the routine anti-cheat
- * corrections this server sends constantly - and only distance separates a correction from a
- * teleport. 8 blocks is far above any correction observed here and far below any deliberate
- * teleport (the smallest real one in the logs is a `/tp andy asanrivas` across a valley).
+ * SHARED, not local. The same line separates a correction from a teleport for SwimAssist's boost
+ * valve, and when these were two independent 8s the agreement was a coincidence: retuning one
+ * would have silently reverted the other to counting teleports as anti-cheat corrections, with
+ * no code change at the site of the failure. See `library/server_corrections.js` for the full
+ * reasoning and for why the other assists' thresholds are deliberately NOT shared.
  */
-const TELEPORT_MIN_BLOCKS = 8;
+import { TELEPORT_MIN_BLOCKS } from './library/server_corrections.js';
 /** Login sends a position packet before the bot has done anything. Ignore that one. */
 const TELEPORT_SPAWN_GRACE_MS = 5000;
 /** Being moved several times in a row is ONE event to the model, not five. */

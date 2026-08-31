@@ -38,9 +38,28 @@ const DEFAULTS = {
     impulse: 0.42,            // the engine's own figure (prismarine-physics index.js:725)
     airSpeed: 0.32,           // vanilla sprint-jump take-off. Never raise this.
     windowMs: 1800,           // hard cap on one flight
-    rubberBandLimit: 3,       // forcedMove corrections within the window that kill jumping
+    rubberBandLimit: 3,       // real corrections within the window that stand jumping down
     rubberBandWindowMs: 10000,
-    mechanismFailures: 3,     // liftoffs that produced no rise before we stop trying entirely
+    mechanismFailures: 3,     // liftoffs that produced no rise before we stand down
+    // A CORRECTION ONLY COUNTS IF THE SERVER ACTUALLY MOVED US. `forcedMove` fires on every
+    // server position packet and this server sends them constantly, so counting packets means
+    // counting routine syncs. Same trap SwimAssist's valve documents, and the one GroundTruth
+    // was retuned for on 2026-08-30.
+    //
+    // The comparison is against the position ONE PHYSICS TICK ago, the way
+    // `agent._wireTeleportDetection` does it - not against the previous packet. Sampling per
+    // packet measures how far the bot flew between two syncs, which mid-jump is most of a
+    // gap-crossing, so our own flight would have kept tripping the very valve this filters.
+    // The threshold has to clear one tick of our OWN motion: the jump impulse is 0.42 and the
+    // axial top-up 0.32, so a tick of honest flight is ~0.53 blocks. Hence 1.0, not 0.5.
+    disagreeBlocks: 1.0,
+    // STAND DOWN, DO NOT LATCH. This used to disable jumping for the whole SESSION. The teardown
+    // (see CLAUDE.md) measured the climb gym at 1/4 without JumpAssist against 4/4 with it, so a
+    // latched valve does not "degrade to bridging" - it cripples the bot until someone restarts
+    // it, silently, hours later. Found live: andy tunnelling with
+    // `jump: REFUSED (jumping disabled (server corrections))` while following a player.
+    // A cooldown is the right shape and the codebase already uses it for the LLM circuit breaker.
+    standDownMs: 60000,
 };
 
 export class JumpAssist {
@@ -56,7 +75,7 @@ export class JumpAssist {
          */
         this.active = false;
         this.activeUntil = 0;
-        this.disabled = false;    // latched for the session: valve tripped, or mechanism dead
+        this.disabledUntil = 0;   // valve tripped or mechanism dead - RECOVERS, see standDownMs
         this.jumps = 0;
         this.failures = 0;
         this.forcedMoves = [];
@@ -64,6 +83,20 @@ export class JumpAssist {
         this._onTick = () => this._tick();
         this._onForcedMove = () => this._forcedMove();
         this._onReset = () => this.end();
+    }
+
+    /** True only while standing down. A getter so every existing `disabled` read still works. */
+    get disabled() { return Date.now() < this.disabledUntil; }
+
+    /** Stand jumping down for a while, and say when it will be back. */
+    _standDown(reason) {
+        if (this.disabled) return;
+        this.disabledUntil = Date.now() + this.opts.standDownMs;
+        this.failures = 0;
+        this.forcedMoves = [];
+        this.end();
+        console.warn(`[JumpAssist] ${reason} - jumping stood down for `
+            + `${Math.round(this.opts.standDownMs / 1000)}s, then it retries.`);
     }
 
     enable() {
@@ -147,6 +180,7 @@ export class JumpAssist {
             if (!this.grounded()) return;          // wait for a tick where the assertion is true
             this.pendingTakeoff = false;
             this.jumps++;
+            this._lastSeen = e.position.clone();   // baseline for the rubber-band comparison
             // Assert the truth the flag got wrong, for this tick only. `apply()` will overwrite
             // it back to false immediately after the simulation runs.
             e.onGround = true;
@@ -175,15 +209,18 @@ export class JumpAssist {
                 e.velocity.z += need * h.dz;
             }
         }
+
+        // The rubber-band baseline, resampled every tick. See `disagreeBlocks`: compared against
+        // the previous PACKET this measures our own flight, which is exactly what the filter is
+        // supposed to exclude.
+        this._lastSeen = e.position.clone?.() ?? null;
     }
 
     /** Did the last flight actually leave the ground? Used to latch a dead mechanism. */
     noteOutcome(rose) {
         if (rose) { this.failures = 0; return; }
-        if (++this.failures >= this.opts.mechanismFailures && !this.disabled) {
-            this.disabled = true;
-            console.warn(`[JumpAssist] ${this.failures} take-offs produced no rise - `
-                + `jumping disabled for this session; navigation will bridge instead.`);
+        if (++this.failures >= this.opts.mechanismFailures) {
+            this._standDown(`${this.failures} take-offs produced no rise`);
         }
     }
 
@@ -192,16 +229,20 @@ export class JumpAssist {
         // mineflayer emits forcedMove for every server position packet - login, teleports and
         // routine corrections all count - so an unconditional counter trips the valve before the
         // bot has jumped at all. SwimAssist observed 4 "rubber-bands" during spawn.
-        if (!this.active) return;
+        if (!this.active || this.disabled) return;
+        // Did the server actually MOVE us? A routine sync leaves us where we were and says
+        // nothing about the jump. Compare against where our own physics thinks we are.
+        const p = this.bot.entity?.position;
+        if (!p || !this._lastSeen) { this._lastSeen = p?.clone?.() ?? null; return; }
+        const moved = p.distanceTo(this._lastSeen);
+        this._lastSeen = p.clone();
+        if (moved < this.opts.disagreeBlocks) return;
+
         const now = Date.now();
         this.forcedMoves = this.forcedMoves.filter(t => now - t < this.opts.rubberBandWindowMs);
         this.forcedMoves.push(now);
-        if (!this.disabled && this.forcedMoves.length > this.opts.rubberBandLimit) {
-            // The server is correcting us mid-flight. Degrade to bridging rather than get kicked.
-            this.disabled = true;
-            this.end();
-            console.warn(`[JumpAssist] server rubber-banded ${this.forcedMoves.length} times in `
-                + `${this.opts.rubberBandWindowMs / 1000}s - jumping disabled for this session.`);
+        if (this.forcedMoves.length > this.opts.rubberBandLimit) {
+            this._standDown(`server moved us ${this.forcedMoves.length} times mid-flight`);
         }
     }
 }

@@ -1,7 +1,7 @@
 import * as mc from "../../utils/mcdata.js";
 import * as world from "./world.js";
 import pf from 'mineflayer-pathfinder';
-import { digWithTool, equipBestTool, isFallingBlockName, isTreeTrunk, isWaterName } from './tools.js';
+import { digWithTool, equipBestTool, isCanopy, isFallingBlockName, isTreeTrunk, isWaterName } from './tools.js';
 import * as tools from './tools.js';
 import * as swim from './swim.js';
 import * as chest from './chest.js';
@@ -4502,6 +4502,7 @@ export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
     // it had already arrived all printed the identical "Climbed N blocks" line. The null-surface
     // bug above sat behind that for as long as it did because of this.
     let stopped = 'step budget spent';
+    let towered = 0;         // total height gained by towering, across ALL rungs (TOWER_BUDGET)
 
     for (let i = 0; i < maxSteps; i++) {
         if (bot.interrupt_code) { stopped = 'interrupted'; break; }
@@ -4521,12 +4522,27 @@ export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
                 ?? nav.surfaceY(bot, p.x, p.z - 1, 140, p.y + 1);
         }
         if (goalY === null) {
-            // Every column around us is mined out too, so there is no surface to aim at - but
-            // that is not a reason to stand still at the bottom of the hole. Rise a bounded
-            // amount and let the next iteration re-read the world from higher up.
-            stopped = 'no surface in any neighbouring column';
-            const lifted = await climbShaftUp(bot, null, 4);
+            // A NULL SURFACE READING MEANS TWO OPPOSITE THINGS, and they need opposite actions.
+            //
+            // In a hole the bot has mined out, no cell above has anything solid under it, so the
+            // scan finds nothing - we are BELOW the surface and rising is right. Standing in open
+            // sky on top of our own pillar reads EXACTLY the same, and there rising is a
+            // disaster: each 4-block tower succeeds, the loop goes round, and it towers again.
+            // Measured live, `climbOut: +54.0 to y=118.0` - a 54-block cobblestone spike into the
+            // air, from a bot that was already standing on open ground. That regression is the
+            // whole reason this branch is written out at length.
+            //
+            // The ceiling tells them apart. Something solid overhead means we are under
+            // something and have somewhere to get out to; open sky means we are already out.
+            const roofed = ceilingAbove((dy) => bot.blockAt(p.offset(0, dy, 0))) !== null;
+            const sv = surfaceUnknownVerdict({ roofed, towered, budget: TOWER_BUDGET });
+            if (!sv.tower) { stopped = sv.reason; break; }
+            stopped = sv.reason;
+            // THE ALLOWANCE, not a fixed 4. The budget has to be a hard cap, not a line the last
+            // rung is free to step over - a pillar cannot be un-built.
+            const lifted = await climbShaftUp(bot, null, Math.min(4, sv.allowance));
             if (lifted < 0.5) break;
+            towered += lifted;
             continue;
         }
         // `surfaceY` already returns the STANDABLE cell - the one whose feet are on top of the
@@ -4555,8 +4571,15 @@ export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
             dir++;
             if (++stalls < dirs.length) return false;
             stalls = 0;
-            const lifted = await climbShaftUp(bot, goalY, 8);
+            // ONE LEDGER ACROSS EVERY TOWER RUNG - the LOOP is what ran away, four blocks at a
+            // time, and it does not care which rung supplied them. `roofed: true` because this
+            // rung already has a goalY it can SEE: the open-sky question does not arise here,
+            // only the ledger does.
+            const sv = surfaceUnknownVerdict({ roofed: true, towered, budget: TOWER_BUDGET });
+            if (!sv.tower) { stopped = sv.reason; return true; }
+            const lifted = await climbShaftUp(bot, goalY, Math.min(8, sv.allowance));
             if (lifted < 0.5) { stopped = `${reason} and cannot tower`; return true; }
+            towered += lifted;
             return false;
         };
 
@@ -5396,6 +5419,130 @@ export async function buildFootingBelow(bot, maxPlaces = 3) {
     return placed;
 }
 
+/** The engine's own jump impulse. `swim.climbBank` uses the same figure for the same reason. */
+export const WET_LIFT_IMPULSE = 0.42;
+
+/**
+ * Should we (re)apply the lift impulse this tick, while wet?
+ *
+ * Pure, because the two ways of getting this wrong are opposite and both were live bugs. In
+ * water prismarine-physics runs `if (isInWater) vel.y += 0.04` BEFORE it checks `onGround`
+ * (index.js:723), so the asserted take-off is a no-op and the bot rises 0.04 - measured. One
+ * hand-supplied 0.42 took that to 0.42 and no further, because water drag bleeds it away in a
+ * few ticks. Rising a whole block while wet is therefore a DUTY CYCLE, not a single push.
+ *
+ * The guards are what keep it at vanilla parity: only while BELOW the clearance we need, and
+ * only when not already rising - so it tops the bot up rather than compounding into a speed the
+ * server would refuse. Same discipline as SwimAssist's boost.
+ */
+export function wetLiftVerdict(s) {
+    if (!s || !s.inWater) return false;              // on land the engine's own jump works
+    // LAVA SHARES THE WATER BRANCH. prismarine-physics computes `isInLava` independently
+    // (index.js:713) and then handles both fluids in one branch (:472, :723), so both flags can
+    // be true at a boundary. Every other wet entry point refuses there - SwimAssist `_tick`
+    // restores and returns, `climbBank` breaks its loop - and this was the only one that did
+    // not. An upward shove in lava is not itself lethal; being the one routine in the codebase
+    // that keeps driving while burning is.
+    if (s.inLava) return false;
+    if (!(s.rise < (s.clearance ?? 1.0))) return false;   // already clear; stop pushing
+    // A CADENCE, NOT A CONTINUOUS ASSERTION - and this is the guard that keeps the duty cycle
+    // inside vanilla parity, because `velY <= 0.05` on its own does not.
+    //
+    // When collision resolution zeroes vel.y every tick the velocity gate is satisfied EVERY
+    // tick, so a 10ms sampler re-arms at up to 100Hz and asserts an impulse the bot is not
+    // getting. That state is not hypothetical; it is in the logs, at the very spot this change
+    // was measured (2026-08-30 17:16:35, andy, wading at 4752.5/62.0/4614.3):
+    //
+    //   climbBank: t=0.0s vel=(0.000, 0.420, 0.000) pos=(4752.50, 62.00, 4614.30)
+    //   climbBank: t=1.0s vel=(0.000, 0.000, 0.000) pos=(4752.50, 62.00, 4614.30)
+    //   climbBank: t=2.0s vel=(0.000, 0.420, 0.000) pos=(4752.50, 62.00, 4614.30)
+    //
+    // Two seconds, the impulse applied twice, and the position identical to the last decimal.
+    // `climbBank` survives that state at 2.9Hz because it carries a 350ms gate; ungated, the
+    // same state is a sustained 100Hz. Both anti-cheat valves on this server have already
+    // tripped for real - `[SwimAssist] server rubber-banded 4 times in 10s` and the same for
+    // JumpAssist, 2026-08-30 17:05:29-34 - so "the server does not mind" is not available as an
+    // assumption. Match the cadence of the routine that is already live-verified.
+    if ((s.sinceLastMs ?? Infinity) < (s.minGapMs ?? 350)) return false;
+    return (s.velY ?? 0) <= (s.risingVelY ?? 0.05);  // already on the way up: leave it alone
+}
+
+/**
+ * Total height `climbToSurface` may gain by TOWERING, across every rung, in one call.
+ *
+ * Measured runaways before any budget existed: `climbOut: +54.0 to y=118.0`, and `climbOut:
+ * +27.0 to y=104.0` again from the other rung once only the first was bounded. 24 bounds both
+ * and still covers the case the rung exists for - `travelDirection` calls `climbOut` when the
+ * bot is >20 blocks below the surface, so a legitimate tower out of an open chamber fits.
+ */
+export const TOWER_BUDGET = 24;
+
+/**
+ * How far above the feet is the nearest ceiling? `null` means open sky.
+ *
+ * This is the observation `surfaceUnknownVerdict` decides on, split out so the SCAN is testable
+ * too and not just the branch it feeds. dy starts at 2 because dy=1 is the bot's own head, and
+ * stops at `maxDy` because this runs on every iteration of the climb loop.
+ *
+ * KNOWN AND DELIBERATE, verified against minecraft-data 1.21.11: leaves, glass, tinted glass and
+ * ice all report `boundingBox === 'block'`, so a canopy or a greenhouse reads as ROOFED. That is
+ * the safe way to be wrong. A false "roofed" costs a bounded tower and the next iteration re-reads
+ * the world from higher up; a false "open sky" strands the bot underground behind a message that
+ * says it succeeded, which is the failure nobody investigates. An unloaded or missing column
+ * reads as open sky for the same reason `openObstruction` fails open - point missing data at the
+ * cheap mistake, not the expensive one.
+ *
+ * @param {(dy:number)=>(string|null|undefined)} boundingBoxAt boundingBox dy blocks above the feet
+ * @returns {number|null} dy of the lowest ceiling, or null for open sky
+ */
+export function ceilingAbove(blockAt, opts = {}) {
+    const minDy = opts.minDy ?? 2;
+    const maxDy = opts.maxDy ?? 40;
+    for (let dy = minDy; dy <= maxDy; dy++) {
+        // Accepts a block-ish object OR a bare boundingBox string, so an existing caller that
+        // only has the box keeps working - but one that can supply the NAME gets the canopy test.
+        const b = blockAt(dy);
+        const box = typeof b === 'string' ? b : b?.boundingBox;
+        if (box !== 'block') continue;
+        // LEAVES ARE NOT A CEILING. minecraft-data gives oak_leaves boundingBox 'block'
+        // (verified, 1.21.11), so a bot standing under a tree on OPEN GROUND reads as roofed -
+        // and the null-surface branch then towers up through the canopy from ground it was
+        // already standing on. That is the 54-block-spike false positive wearing a different
+        // hat. Glass deliberately still counts: a greenhouse roof is a real roof.
+        const name = typeof b === 'string' ? null : b?.name;
+        if (name && isCanopy(name)) continue;
+        return dy;
+    }
+    return null;
+}
+
+/**
+ * `surfaceY` came back null for our column AND every neighbour. Rise, or stop?
+ *
+ * Pure, because null means two OPPOSITE things and picking wrong is destructive in one
+ * direction. In a hole the bot has mined out, no cell above has anything solid under it, so the
+ * scan finds nothing and rising is right. Standing in open sky on top of our own pillar reads
+ * exactly the same - and there, rising builds a spike: measured `climbOut: +54.0 to y=118.0`,
+ * four blocks at a time, from a bot already on open ground.
+ *
+ * A ceiling tells them apart. The budget is the second guard, because a pillar cannot be
+ * un-built and bounding each tower CALL did not bound the LOOP that kept making them.
+ *
+ * IT RETURNS THE ALLOWANCE, NOT JUST A YES. A rung capped at 8 with 3 left in the ledger spends
+ * 8, so a pre-spend `>=` test still overshoots by a whole rung - a third of the budget, and the
+ * two call sites disagreed about even that (`>` after spending on one, `>=` before on the other).
+ * `climbShaftUp`'s last argument is a MAXIMUM, so handing it the allowance is what turns the
+ * budget from a threshold into a hard cap.
+ */
+export function surfaceUnknownVerdict(s) {
+    const no = (reason) => ({ tower: false, allowance: 0, reason });
+    if (!s) return no('no state');
+    if (!s.roofed) return no('open sky above me - already at the surface');
+    const allowance = (s.budget ?? TOWER_BUDGET) - (s.towered ?? 0);
+    if (allowance < 1) return no(`tower budget spent (+${Math.round(s.towered ?? 0)})`);
+    return { tower: true, allowance, reason: 'no surface reading in any neighbouring column' };
+}
+
 export async function pillarUp(bot, blocks = 1) {
     const { Vec3 } = await import('vec3');
     const stackable = STACKABLE;
@@ -5443,6 +5590,45 @@ export async function pillarUp(bot, blocks = 1) {
         // the jump mechanism - a ceiling, a full inventory, a placement the server refused.
         // Only `jumpAcross`, which probes the terrain first, has earned the right to that verdict.
         const assisted = bot.jumpAssist?.begin(0, 0) === true;
+        // IN WATER THE ENGINE'S JUMP BRANCH IS HIJACKED, so the asserted take-off is a no-op.
+        // prismarine-physics checks `if (isInWater || isInLava) vel.y += 0.04` BEFORE it checks
+        // `onGround` (index.js:723) - the branch that is dead on land is the live one here - so
+        // asserting the ground flag buys nothing and the bot gets the swim nudge instead.
+        // Measured live, wading against a 0.50-block bank: `apex 0.04, assisted=true`, over and
+        // over, while climbBank was jammed and every other rung stood down for it.
+        //
+        // Supply the impulse directly, exactly as `swim.climbBank` does for this same reason -
+        // and by the same means: `+=`, on a 350ms cadence, refusing lava.
+        //
+        // ADD, DO NOT ASSIGN, *HERE*. The two rules in CLAUDE.md are not in conflict; they
+        // describe different velocity regimes. `scratchpad/sim/RESULTS.md` measures the land
+        // case - "apex 0.87, not 1.25, because mechanism B used `vel.y += 0.42` from a velocity
+        // the engine had already made NEGATIVE" - where gravity has taken vel.y to about -0.08
+        // before the take-off tick, so `+=` really does cost a third. In water it never fires
+        // from there: the gate is `velY <= 0.05` and the measured unaided sink rate is -0.025
+        // b/t, so the two forms differ by at most 0.025, six per cent of the impulse.
+        //
+        // What the assignment DOES change is the one case that matters to a move check. Firing
+        // from a fast fall, `= 0.42` is a delta-v of nearly a block per tick, where `+= 0.42` is
+        // always exactly one engine impulse whatever it starts from. The server sees the delta,
+        // not the endpoint, so `+=` is the only form that literally cannot exceed vanilla
+        // parity - and it is the form `climbBank` has already been live-verified with.
+        //
+        // Canonical `swim.inWater`/`swim.inLava`, not the raw entity flags: both fall back to a
+        // block scan of the feet and head cells, which is what every other consumer reads.
+        let lastLift = 0;
+        const wetLift = () => {
+            const v = bot.entity.velocity;
+            if (!v) return;
+            if (!wetLiftVerdict({
+                inWater: swim.inWater(bot), inLava: swim.inLava(bot),
+                rise: bot.entity.position.y - baseY, velY: v.y,
+                sinceLastMs: Date.now() - lastLift,
+            })) return;
+            lastLift = Date.now();
+            v.y += WET_LIFT_IMPULSE;
+        };
+        wetLift();
         let apex = 0, placeErr = null;
         try {
             await bot.look(bot.entity.yaw, Math.PI / 2, true);   // face straight down
@@ -5458,12 +5644,38 @@ export async function pillarUp(bot, blocks = 1) {
             // the cell it is filling, snaps the look instead of turning smoothly, never awaits
             // mineflayer's unsatisfiable ack, and retries inside the flight. See block_io.js -
             // all three of those are separate mineflayer defects that only fail in combination.
+            // SUSTAIN THE IMPULSE IN WATER, do not just kick once. One 0.42 assignment took the
+            // measured apex from 0.04 to 0.42 - real, and still not a full block, because water
+            // drag bleeds it away within a few ticks. Rising a whole block while wet is a DUTY
+            // CYCLE, which is exactly what `swim.climbBank` and SwimAssist's buoyancy already
+            // are; a single push is the land model applied where it does not hold.
+            //
+            // Only while below the clearance and only when not already rising, so this cannot
+            // compound into a speed the server would refuse.
             const apexWatch = setInterval(() => {
                 apex = Math.max(apex, bot.entity.position.y - baseY);
+                wetLift();
             }, 10);
             let res;
             try {
-                res = await blockIO.placeUnderfoot(bot, below, { windowMs: 900 });
+                // A LONGER WINDOW MUST NOT BUY A LONGER BURST. `placeUnderfoot` passes
+                // `pace: false` on the stated premise that the window is shorter than the
+                // interaction rate limit - and what it really relies on is that `bodyClearsCell`
+                // is only true for the ~2 ticks a LAND apex lasts. In water that premise is
+                // gone: the measured unaided sink is 0.025 b/t, so once the body is clear it
+                // stays clear and every remaining attempt fires back to back.
+                //
+                // The logs say the burst is already real on land, where the clearance window is
+                // supposed to be narrow: of 114 recorded pillar failures with attempts, 46 fired
+                // six or more placement packets, 22 of them the full eight, acked at 33-41ms
+                // each - eight interactions inside about 350ms against a documented
+                // `MIN_PLACE_GAP_MS` of 250, and 90 lines of `refused by server`. Widening the
+                // window to 2500ms is right (the wet rise is slow and 900ms genuinely is not
+                // enough), but it must come with a tighter retry cap, or the extra time is spent
+                // re-sending a placement the server has already refused.
+                res = await blockIO.placeUnderfoot(bot, below, swim.inWater(bot)
+                    ? { windowMs: 2500, maxAttempts: 3 }
+                    : { windowMs: 900 });
             } finally {
                 clearInterval(apexWatch);
             }

@@ -154,3 +154,20 @@ export function isBubbleColumn(name) {
 // owns the whole problem rather than wrapping one symptom of it - the ack wait, the smooth look,
 // the hitbox clearance and the interaction rate limit are four separate defects and a wrapper
 // could only ever address the first.
+
+
+/**
+ * Is this a leaf canopy? A CEILING for collision, but not for "am I under something".
+ *
+ * `boundingBox === 'block'` is true for `oak_leaves` (verified against minecraft-data 1.21.11),
+ * so a bot standing under a tree on open ground reads as roofed by any naive overhead probe -
+ * and `climbToSurface` would then tower up through the canopy from ground it was already
+ * standing on. Glass deliberately does NOT count as canopy: a greenhouse roof is a real roof.
+ *
+ * Suffix match, not `includes`: "leaf_litter" is ground cover, not a canopy, and this file's
+ * own `isFallingBlockName` exists because `"sandstone".includes("sand")` once made
+ * self_preservation fire every tick in a desert.
+ */
+export function isCanopy(name) {
+    return typeof name === 'string' && name.endsWith('_leaves');
+}

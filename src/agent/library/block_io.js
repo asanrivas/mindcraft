@@ -127,6 +127,8 @@ export async function snapLook(bot, point) {
  * @param {string}  [opts.expectName] the exact block expected at dest; use for anything whose
  *                                    boundingBox is not 'block' (signs, trapdoors, fences...)
  * @param {number}  [opts.ackMs]   how long to wait for the server's sequence ack
+ * @param {number}  [opts.graceMs] how long to let the block appear AFTER the ack before
+ *                                 calling it a refusal (the ack does not barrier the block)
  * @param {object} [opts.placeOpts] extra options forwarded to _genericPlace
  * @returns {Promise<{ok: boolean, why: string}>}
  */
@@ -190,8 +192,23 @@ export async function placeVerified(bot, refBlock, faceVector, opts = {}) {
         // never appeared). So it is a timing signal; the world below is the truth.
         const ack = await awaitPlaceAck(bot, seq, opts.ackMs ?? 1000);
         if (landed()) return { ok: true, why: ack.acked ? `placed, ack ${ack.ms}ms` : 'placed, no ack' };
-        // Acked and still not there means refused, and no amount of further waiting changes it.
-        if (ack.acked) return { ok: false, why: `refused by server (ack ${ack.ms}ms)` };
+        // THE ACK IS NOT A BARRIER FOR THE BLOCK. It says the server has processed our sequence;
+        // it does not say the resulting block_change has been applied to OUR world copy yet.
+        // Sampling `landed()` once at ack time therefore reports a perfectly good placement as a
+        // refusal whenever the two arrive in that order - caught 2026-08-31 placing scaffolding:
+        //   clicking scaffolding top face: FAIL(refused by server (ack 19ms))
+        //   after : scaffolding            <- it was there all along
+        // So give the world a short grace window before calling it a refusal. This is bounded
+        // and small: the ack has already told us the round trip is done, so we are waiting on
+        // local application, not on the network.
+        if (ack.acked) {
+            const graceUntil = Date.now() + (opts.graceMs ?? 200);
+            while (Date.now() < graceUntil) {
+                if (landed()) return { ok: true, why: `placed, ack ${ack.ms}ms (late)` };
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            return { ok: false, why: `refused by server (ack ${ack.ms}ms)` };
+        }
         // No ack: the packet or its reply was lost. Fall back to watching the world, which is
         // what we had before this path existed.
         const deadline = Date.now() + verifyMs;

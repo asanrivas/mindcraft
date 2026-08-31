@@ -8,7 +8,7 @@
  *   2. A primary that fails at the socket is skipped for `cooldown_ms` instead of being
  *      re-dialled every turn, and is re-tried once the cooldown expires.
  */
-import { FallbackModel, isAvailabilityError, backoffFor } from '../src/models/fallback.js';
+import { FallbackModel, isAvailabilityError, backoffFor, failoverAlertDue } from '../src/models/fallback.js';
 
 let failures = 0;
 const check = (name, cond) => {
@@ -176,6 +176,58 @@ check('backoff f=0 is zero', backoffFor(0, 60000, 900000) === 0);
     const fb = new FallbackModel(fake('local', connErr()), [fake('cloud', 'ok')], { cooldown_ms: 50 });
     await fb.sendRequest([], '');
     check('no healthCheck: no probe timer', fb._probeTimer === null);
+    fb.stop();
+}
+
+// --- failoverAlertDue: sustained-failover escalation (docs/gaps/operational.exec.md item 5) ---
+// A single blip must not alert; only a SUSTAINED outage should, and only every `repeatMs`
+// after that - not once per request, which on a busy bot is indistinguishable from spam.
+{
+    const openShort = { open: true, downMinutes: 1 };      // 1 min < default 10 min threshold
+    const openLong = { open: true, downMinutes: 15 };       // past the threshold
+    const closed = { open: false, downMinutes: 0 };
+    const now = 1_000_000_000_000;
+
+    check('not due: breaker closed', failoverAlertDue(closed, null, now) === false);
+    check('not due: below the sustained threshold', failoverAlertDue(openShort, null, now) === false);
+    check('due once at threshold, never alerted before', failoverAlertDue(openLong, null, now) === true);
+    check('not due again immediately after alerting', failoverAlertDue(openLong, now, now + 1000) === false);
+    check('not due before repeatMs elapses', failoverAlertDue(openLong, now, now + 30 * 60_000) === false);
+    check('due again once repeatMs elapses', failoverAlertDue(openLong, now, now + 60 * 60_000) === true);
+    // Custom thresholds are respected, not hardcoded.
+    check('custom afterMs respected (below it)', failoverAlertDue(openShort, null, now, { afterMs: 5 * 60_000 }) === false);
+    check('custom afterMs respected (at it)', failoverAlertDue({ open: true, downMinutes: 5 }, null, now, { afterMs: 5 * 60_000 }) === true);
+    check('custom repeatMs respected', failoverAlertDue(openLong, now, now + 10 * 60_000, { repeatMs: 5 * 60_000 }) === true);
+}
+
+// --- FallbackModel wires failoverAlertDue in: a live, sustained outage logs the escalation,
+// and a fresh trip (well under the threshold) does not spam it on every single request. -------
+{
+    const primary = fake('local', connErr());
+    const backup = fake('cloud', 'from cloud');
+    const fb = new FallbackModel(primary, [backup], { cooldown_ms: 10_000 });
+    await fb.sendRequest([], '');
+    check('lastAlertAt unset for a fresh, short trip', fb.lastAlertAt === null);
+    // Force the outage to look sustained without waiting 10 real minutes.
+    fb.downSince = Date.now() - 11 * 60_000;
+    await fb.sendRequest([], '');
+    check('lastAlertAt set once the outage looks sustained', fb.lastAlertAt !== null);
+    const first = fb.lastAlertAt;
+    await fb.sendRequest([], '');
+    check('does not re-alert on the very next request', fb.lastAlertAt === first);
+    fb.stop();
+}
+{
+    // _reset() (recovery) forgets the alert state too, so a later, unrelated outage can alert
+    // again from a clean slate rather than being silently rate-limited by a stale timestamp.
+    const primary = fake('local', n => (n === 1 ? connErr() : 'from local'));
+    const fb = new FallbackModel(primary, [fake('cloud', 'from cloud')], { cooldown_ms: 0 });
+    fb.lastAlertAt = Date.now();
+    await fb.sendRequest([], ''); // fails once, on backup
+    fb.downSince = Date.now() - 11 * 60_000; // pretend it had been sustained
+    fb.lastAlertAt = Date.now() - 11 * 60_000;
+    await fb.sendRequest([], ''); // recovers - primary answers this time
+    check('recovery clears lastAlertAt', fb.lastAlertAt === null);
     fb.stop();
 }
 

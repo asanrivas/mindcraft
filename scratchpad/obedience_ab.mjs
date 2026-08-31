@@ -2,9 +2,16 @@
 // against the expected command. Run from repo root: bun scratchpad/obedience_ab.mjs
 // Drives the LOCAL model with andy.json's own params; also prints the OLD-renderer docs
 // score for comparison. Baselines 2026-08-29: OLD 5-6/8, NEW 7-8/8 (docs/OBEDIENCE.md §5).
+//
+// Also writes scratchpad/obedience.last.json = {docsHash, score, date} for the NEW-docs run,
+// so tests/obedience_contract.test.mjs can tell a MEASURED regression (score < 7 against the
+// exact docs it just hashed) from an UNMEASURED change (docs edited since the last time this
+// harness ran) without needing a model itself. See tools/obedience_lib.mjs for the verdict.
+import { writeFileSync } from 'node:fs';
 process.chdir('/home/asanrivas/mindcraft');
 import real from '../settings.js';
 import { setSettings } from '../src/agent/settings.js';
+import { hashDocs } from '../tools/obedience_lib.mjs';
 setSettings(real);
 const m = await import('../src/agent/commands/index.js');
 m.blacklistCommands(real.blocked_actions);
@@ -46,6 +53,7 @@ const sys = (docs) => `You are Andy, a Minecraft bot. Choose the single best com
 Reply with ONLY the command call, nothing else. If no command fits, reply NONE.
 ${docs}`;
 
+let newScore = null;
 for (const [label, docs] of [['OLD', OLD], ['NEW', NEW]]) {
   console.log(`\n===== ${label} (${docs.length} chars) =====`);
   let hits = 0;
@@ -59,4 +67,11 @@ for (const [label, docs] of [['OLD', OLD], ['NEW', NEW]]) {
     console.log(`  ${ok ? 'ok  ' : 'MISS'} ${req.slice(0,45).padEnd(46)} -> ${out.slice(0,50)}`);
   }
   console.log(`  ${label}: ${hits}/${CASES.length}`);
+  if (label === 'NEW') newScore = hits;
 }
+
+// Per-machine, gitignored (scratchpad/*.json) - not a checked-in baseline, just "what did the
+// docs look like, and how did they score" the last time someone with a live amyasan ran this.
+const record = { docsHash: hashDocs(NEW), score: newScore, date: new Date().toISOString() };
+writeFileSync('scratchpad/obedience.last.json', JSON.stringify(record, null, 2) + '\n');
+console.log(`\nWrote scratchpad/obedience.last.json: score=${newScore}/${CASES.length} docsHash=${record.docsHash.slice(0,12)}...`);

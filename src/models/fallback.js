@@ -52,6 +52,36 @@ export function backoffFor(failures, base, max) {
     return Math.min(exp, max);
 }
 
+/**
+ * Is a "we have been on the backup brain for a while" alert due right now?
+ *
+ * Every existing signal is passive: one warn on the FIRST trip, a `- Brain: BACKUP` line in
+ * `!stats` that only someone who asks sees, and a recovery log. None of them escalate a
+ * SUSTAINED outage - the exact shape of the 16-hour, 178-trip outage this file's header
+ * documents. This is the pure decision behind the escalation; see FallbackModel._maybeAlert
+ * for where it is called (piggybacked on the existing health-probe timer and on every
+ * backup-served request, so an idle bot still alerts and no new timer is needed).
+ *
+ * A single blip must NOT alert - the breaker trips and recovers via the probe or the next
+ * request routinely, and that is the system working, not a page-worthy event. Sustained is
+ * the signal: down for at least `afterMs`, and re-announced at most every `repeatMs` after
+ * that (not once per request - that would be indistinguishable from spam within a minute).
+ *
+ * @param {{open: boolean, downMinutes: number}} status  FallbackModel#status
+ * @param {number|null} lastAlertAt   epoch ms of the last alert, or null if never alerted
+ * @param {number} now                epoch ms "now" (injectable for tests)
+ * @param {{afterMs?: number, repeatMs?: number}} [opts]
+ * @returns {boolean}
+ */
+export function failoverAlertDue(status, lastAlertAt, now, opts = {}) {
+    const afterMs = opts.afterMs ?? 10 * 60_000;
+    const repeatMs = opts.repeatMs ?? 60 * 60_000;
+    if (!status || !status.open) return false;
+    if ((status.downMinutes || 0) * 60_000 < afterMs) return false;
+    if (lastAlertAt === null || lastAlertAt === undefined) return true;
+    return (now - lastAlertAt) >= repeatMs;
+}
+
 export class FallbackModel {
     /**
      * @param {object} primary        model instance with sendRequest()
@@ -76,6 +106,7 @@ export class FallbackModel {
         this.down_until = 0;
         this.on_backup = false;             // last request was served by a backup
         this.model_name = primary.model_name; // which model actually served it
+        this.lastAlertAt = null;            // epoch ms of the last sustained-failover alert
     }
 
     _primaryDown() {
@@ -109,7 +140,23 @@ export class FallbackModel {
         this.downSince = null;
         this.down_until = 0;
         this.on_backup = false;
+        this.lastAlertAt = null;
         this._stopProbe();
+    }
+
+    /**
+     * Escalate a SUSTAINED failover with a single, distinct, greppable log line - at most once
+     * per `repeatMs` (see failoverAlertDue). Called from two places on purpose: after a backup
+     * serves a request (so a busy bot alerts even if nobody ever asks `!stats`), and from the
+     * background health probe (so an IDLE bot - nobody playing, nothing dispatching - still
+     * alerts; that idle case is exactly when "nobody notices for 16 hours" happens).
+     */
+    _maybeAlert() {
+        if (!failoverAlertDue(this.status, this.lastAlertAt, Date.now())) return;
+        this.lastAlertAt = Date.now();
+        const mins = this.status.downMinutes.toFixed(1);
+        console.warn(`[fallback] SUSTAINED FAILOVER: ${this.label} on ${this.model_name} for `
+            + `${mins} min (${this.trips} trips) - check the LlamaServer task on amyasan`);
     }
 
     /**
@@ -126,7 +173,8 @@ export class FallbackModel {
             try {
                 const ok = await this.primary.healthCheck();
                 if (ok) this._reset();
-            } catch { /* still down; keep waiting */ }
+                else this._maybeAlert();
+            } catch { this._maybeAlert(); /* still down; keep waiting */ }
         }, this.probe_ms);
         // Never hold the process open just to poll a dead model.
         if (typeof this._probeTimer.unref === 'function') this._probeTimer.unref();
@@ -172,6 +220,7 @@ export class FallbackModel {
                     this._reset();
                 } else {
                     this.on_backup = true;
+                    this._maybeAlert();
                 }
                 return res;
             } catch (err) {

@@ -7,6 +7,7 @@ import * as world from './library/world.js';
 import { Vec3 } from 'vec3';
 import {ESLint} from "eslint";
 import { LearnedSkills } from './library/learned_skills.js';
+import { validateGeneratedCode, failureSignature, shouldRetry } from './library/code_guard.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -74,6 +75,11 @@ export class Coder {
 
         let code = null;
         let no_code_failures = 0;
+        // Failure memory: "have I already failed this exact way." Without this, nothing stops
+        // attempt 4 from being byte-identical to attempt 2's crash - docs/gaps/playbooks.exec.md
+        // task 2. Coordinates/ids are folded out by failureSignature, so the same crash at a
+        // different position still counts as a repeat.
+        let priorSignatures = [];
         for (let i=0; i<MAX_ATTEMPTS; i++) {
             if (this.agent.bot.interrupt_code)
                 return null;
@@ -103,7 +109,7 @@ export class Coder {
                 no_code_failures++;
                 continue;
             }
-            code = res.substring(res.indexOf('```')+3, res.lastIndexOf('```'));
+            code = this._sanitizeCode(res.substring(res.indexOf('```')+3, res.lastIndexOf('```')));
             const result = await this._stageCode(code);
             const executionModule = result.func;
             const lintResult = await this._lintCode(result.src_lint_copy);
@@ -116,6 +122,27 @@ export class Coder {
             if (!executionModule) {
                 console.warn("Failed to stage code, something is wrong.");
                 return 'Failed to stage code, something is wrong.';
+            }
+
+            // Static guard, before this code ever runs (docs/gaps/playbooks.exec.md task 2):
+            // generated code receives the FULL bot object, so an unbounded loop, a raw chat
+            // command or a listener registration reaches straight past world_guard and the
+            // ALLOW_RESCUE_TP marker. validateGeneratedCode names the rule, the line, the
+            // mechanism and the working alternative - feed that back exactly like a lint error
+            // so the model can correct itself, rather than silently dropping the code.
+            //
+            // FAIL OPEN: `parsed:false` (no parser, or a shape the wrapper can't parse) still
+            // reports `ok:true` - see code_guard.js's header note. Do not turn that into a
+            // refusal here; a guard that blocks legitimate code it merely couldn't read is worse
+            // than the status quo, same rule as `openObstruction()`.
+            const guardResult = validateGeneratedCode(code);
+            if (!guardResult.ok) {
+                console.warn('Code guard refused:\n' + guardResult.reason);
+                messages.push({
+                    role: 'system',
+                    content: `Error: ${guardResult.reason}\nPlease try again.`
+                });
+                continue;
             }
 
             try {
@@ -144,6 +171,25 @@ export class Coder {
                 console.warn('trying again...');
 
                 const code_output = this.agent.actions.getBotOutputSummary();
+
+                // Same failure memory as above, now consulted: fold out coordinates/ids and
+                // check whether this exact crash already happened. A NEW failure always retries
+                // (fail open); a repeat ends the loop instead of burning the remaining attempts
+                // regenerating the same dead end. This is recordFailure's first caller - it had
+                // zero callers before this wiring.
+                const sig = failureSignature(code, e.toString());
+                const retryVerdict = shouldRetry(sig, priorSignatures);
+                priorSignatures.push(sig);
+                try {
+                    const intent = this._describeIntent(agent_history);
+                    if (intent) this.learned.recordFailure(this.learned._makeKey(intent));
+                } catch (recordErr) {
+                    console.warn('[Coder] Could not record learned-skill failure:', recordErr.message);
+                }
+                if (!retryVerdict.retry) {
+                    console.warn('Code generation stopped early: ' + retryVerdict.reason);
+                    return `Code generation failed: ${retryVerdict.reason}`;
+                }
 
                 messages.push({
                     role: 'assistant',

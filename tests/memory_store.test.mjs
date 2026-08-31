@@ -7,7 +7,7 @@
  * ("travel west to red bed at -2572,63,5269"), and the overwrite reloaded on every restart.
  * That must now be structurally impossible, not merely discouraged.
  */
-import { MemoryStore, ORIGIN, KIND, recordId, normalizeKey, normalizeValue } from '../src/agent/memory_store.js';
+import { MemoryStore, ORIGIN, KIND, recordId, normalizeKey, normalizeValue, isTransientPlaceKey } from '../src/agent/memory_store.js';
 
 let failures = 0;
 const check = (label, got, want) => {
@@ -253,10 +253,14 @@ Travel west to red bed at -2572,63,5269.
 - Parched: hostile skeleton, killed me once.`;
 
     // allowGoal: this is the one-time MIGRATION path, where the blob is the previous state.
+    // "Current: 3249,62,4896" is the exact pollution pattern item 2 exists to kill, so it is
+    // now filtered rather than imported - dropping the count from 5 to 4.
     const n = s.importLegacyBlob(legacy, { allowGoal: true });
-    check('imports every fact', n, 5);
+    check('imports every DURABLE fact (Current is transient, filtered)', n, 4);
     check('goal imported', /red bed/.test(s.goal()), true);
     check('locations parsed into keys', s.get(KIND.LOCATION, 'Red bed')?.value, '-2572,63,5269');
+    check('"Current" is NOT stored as a location', s.get(KIND.LOCATION, 'Current'), null);
+    check('the skip is counted', s.skippedPlaces, 1);
     check('players parsed', /skeleton/.test(s.get(KIND.PLAYER, 'Parched').value), true);
     check('lessons kept', s.list(KIND.LESSON).length, 1);
 
@@ -270,6 +274,91 @@ Travel west to red bed at -2572,63,5269.
     check('empty legacy blob imports nothing', mk().importLegacyBlob(''), 0);
     check('null legacy blob is survivable', mk().importLegacyBlob(null), 0);
     check('unknown headings become notes', mk().importLegacyBlob('## Weird\n- a: b') > 0, true);
+}
+
+// --- ITEM 2: transient episode state minted as a Location --------------------------------------
+// andy.json's saving_memory prompt writes Locations as `[name@X:n,Y:n,Z:n]`. importLegacyBlob's
+// non-prose parser splits on the FIRST colon, which lands right after the literal "X" label -
+// so every location under that template keys as `<name>@X`, genuine places included
+// ("desert village@X", "iron_ore@X") right alongside the bot's own live navigation bookkeeping
+// ("current@X", "hold_spot@X", "nav_failures@X"). isTransientPlaceKey is the predicate that
+// tells the two apart. Cases below are pulled from the REAL journals
+// (bots/{andy,bob}/memory_store.json.journal.jsonl, read-only, 2026-08-31) - both the ones the
+// plan names explicitly and extra ones this corpus turned up, in both directions.
+{
+    // MUST be filtered - the plan's own required list.
+    const mustFilter = ['current@X', 'Current', 'nav_failures@X', 'hold_spot@X', 'drop_zone@X',
+        'previous_drop_zone@X', 'Target dry spot', 'Follow target'];
+    for (const key of mustFilter) {
+        check(`isTransientPlaceKey filters ${JSON.stringify(key)} (plan-required)`, isTransientPlaceKey(key), true);
+    }
+
+    // MUST NOT be filtered - the plan's own required list. This is the tested surface that
+    // answers the denylist worry: a false positive here is a worse bug than the one being fixed.
+    const mustKeep = ['Base', 'Shaft', '5 chests', 'Desert bed (respawn)', 'DANGER',
+        'AVOID water cavity', 'Veins from shaft', 'Nearby red_bed', 'ice_spikes', 'desert village@X'];
+    for (const key of mustKeep) {
+        check(`isTransientPlaceKey keeps ${JSON.stringify(key)} (plan-required)`, isTransientPlaceKey(key), false);
+    }
+
+    // Extra corpus evidence, filter side - real repeated keys the required list didn't name.
+    // bob's nav-bookkeeping family (all wear the same "@X" template artifact as the kept ones):
+    const corpusFilter = [
+        'target@X', 'nav_target@X', 'dig_zone@X', 'target_cluster@X',
+        'target_cluster_diamond@X', 'nav_target_chest3@X', 'drop_zone_recent@X', 'current_loop@X',
+        'current_pos@X',
+        // andy's own restatements of the same episode state, in the wild:
+        'Follow target (user-set)', 'Previous teleport start', 'Previous teleport origin',
+        'Recent teleport origin', 'Current pos', 'Last pos', 'Last known pos',
+        'Current (after disconnect)', 'Status', '**Previous**', 'Target',
+    ];
+    for (const key of corpusFilter) {
+        check(`isTransientPlaceKey filters corpus key ${JSON.stringify(key)}`, isTransientPlaceKey(key), true);
+    }
+
+    // Extra corpus evidence, keep side - genuine places the bots actually saved, including ones
+    // that could plausibly be over-matched by a broader rule than the one implemented:
+    //   - ore CLUSTERS (not a "target" pointed at one) are places, not nav state;
+    //   - "village_dig"/"safe_hold"/"last_safe"/"recovery_point" contain words this predicate
+    //     matches ONLY as a prefix ("hold spot", not "safe hold"), so they must survive;
+    //   - hazard call-outs are warnings ABOUT a place, not the bot's own position.
+    const corpusKeep = [
+        'Base site', 'Forest target', 'Red bed', 'Coal ore', 'Copper ore', 'Veins', 'Doorway',
+        'Torches inside', 'Stone ledge', 'Base/Shaft', 'chest@4882,64,4455', 'EMERGENCY',
+        'iron_ore@X', 'chest@X', 'diamond_cluster@X', 'coal_cluster@X', 'diamond_ore@X',
+        'red_bed@X', 'village_dig@X', 'safe_hold@X', 'last_safe@X', 'recovery_point@X',
+        'bedrock_breach@X', 'bedrock_breach_area@X', 'build_corner@X', 'hut_floor@X',
+        'immediate_surroundings@X', 'chest3_full@X', 'beds', 'water@X',
+    ];
+    for (const key of corpusKeep) {
+        check(`isTransientPlaceKey keeps corpus key ${JSON.stringify(key)}`, isTransientPlaceKey(key), false);
+    }
+
+    check('empty/undefined key does not throw and is kept', isTransientPlaceKey(''), false);
+    check('non-string key does not throw', isTransientPlaceKey(undefined), false);
+}
+{
+    // The filter is applied ONLY to Locations inside importLegacyBlob - a Lesson or Note that
+    // happens to contain the word "current" is prose, keyed by content hash, and untouched.
+    const s = mk();
+    const summary = `## Locations
+- Base: 3391,62,4890
+- current@X:4721,Y:67,Z:4627
+- hold_spot@X:3371,Y:62,Z:4845
+- desert village@X:4744,Y:75,Z:4733
+
+## Lessons
+- My current strategy is to mine at the base.`;
+
+    const n = s.importLegacyBlob(summary);
+    check('only the two genuine places import', n, 3); // Base, desert village@X, + the lesson
+    check('Base kept', s.get(KIND.LOCATION, 'Base')?.value, '3391,62,4890');
+    check('desert village@X kept', s.get(KIND.LOCATION, 'desert village@X') !== null, true);
+    check('current@X filtered out', s.get(KIND.LOCATION, 'current@X'), null);
+    check('hold_spot@X filtered out', s.get(KIND.LOCATION, 'hold_spot@X'), null);
+    check('two locations filtered, counted', s.skippedPlaces, 2);
+    check('a lesson containing "current" is untouched', s.list(KIND.LESSON).length, 1);
+    check('locations store holds exactly the two genuine places', s.list(KIND.LOCATION).length, 2);
 }
 
 

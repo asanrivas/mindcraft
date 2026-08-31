@@ -172,6 +172,65 @@ export function normalizeValue(value) {
         .trim();
 }
 
+/**
+ * Transient episode state minted as a Location.
+ *
+ * THE BUG. `andy.json`'s `saving_memory` prompt tells the summariser to write Locations as
+ * `[name@X:n,Y:n,Z:n]`. `importLegacyBlob`'s non-prose parser splits a line on its FIRST colon -
+ * which lands right after the literal "X" label, not after a real value - so EVERY location
+ * written under that template keys as `<name>@X`, genuine places included:
+ * `desert village@X`, `iron_ore@X`, `chest@X` are all real places wearing the same artifact
+ * that `current@X`, `hold_spot@X` and `nav_failures@X` wear. So "@X" cannot be the signal - it
+ * is universal noise from the template, and stripping it is normalisation, not detection.
+ *
+ * THE SIGNAL is the semantic name underneath: is this word naming a PLACE, or is it naming a
+ * piece of the bot's OWN in-flight navigation bookkeeping (where it is right now, what it is
+ * currently steering toward, where it last failed, where it was before a teleport)? That
+ * bookkeeping is re-derived every summarisation for as long as the episode lasts - andy
+ * rewrote `Current` 187 times in one journal - and `$STATS` already carries the live position,
+ * so nothing durable is lost by refusing it a Location slot.
+ *
+ * Evidence (real journals, `bots/{andy,bob}/memory_store.json.journal.jsonl`, 2026-08-31):
+ * bob wrote `current@X` x65, `hold_spot@X` x66, `target@X` x32, `nav_target@X` x26,
+ * `nav_failures@X` x25, `drop_zone@X` x24, `dig_zone@X` x15, `target_cluster@X` x34,
+ * `previous_drop_zone@X` x13 - against `desert village@X` x81, `iron_ore@X` x21, `chest@X`
+ * x20, `diamond_cluster@X`, `coal_cluster@X`, all genuine and NOT filtered. andy wrote
+ * `Current` x187 (its single most-rewritten key), `Target dry spot` x57, `Follow target` x11,
+ * `Previous teleport start/origin` x8, `Status` x3 - against `Base` x137, `Desert bed
+ * (respawn)` x84, `DANGER` x68, `Shaft` x59, `Coal ore`/`Copper ore`, `Doorway`, `Torches
+ * inside`, all genuine.
+ *
+ * A deliberately NARROW, evidence-derived pattern set - the plan this exists for is explicit
+ * that an over-broad denylist silently eating real places is the worse bug. Not filtered
+ * (left as places, on purpose): hazard call-outs (`DANGER`, `EMERGENCY` - a warning about a
+ * place is still about a place), the ore cluster itself (`diamond_cluster`, `coal_cluster` -
+ * only a *targeted* cluster is transient), and anything not matching a pattern below, on the
+ * theory that a false KEEP costs one wasted slot and a false DROP costs a place.
+ *
+ * @param {string} key  the raw key as `importLegacyBlob` parsed it (before `@X` is meaningful)
+ * @returns {boolean}
+ */
+const TRANSIENT_PLACE_PATTERNS = [
+    /^(current|position|pos|status|previous)$/, // bare episode-state words: "Current", "pos", "Status", "**Previous**"
+    /^current(\s|$)/,                            // "Current", "Current pos", "Current (after disconnect)", "current_loop"
+    /(^|\s)pos(ition)?$/,                        // "Last pos", "Last known pos", "Current pos"
+    /^nav\s(target|failures?)/,                  // "nav_target", "nav_failures", "nav_target_chest3"
+    /^(previous|recent)\steleport/,               // "Previous teleport start/origin", "Recent teleport origin"
+    /^follow\s?target/,                          // "Follow target", "Follow target (user-set)"
+    /^target(\s|$)/,                             // "target", "Target dry spot", "target_cluster*"
+    /^(previous\s)?(drop|dig)\s?zone/,           // "drop_zone", "dig_zone", "previous_drop_zone", "drop_zone_recent"
+    /^hold\s?spot/,                              // "hold_spot"
+];
+
+export function isTransientPlaceKey(key) {
+    let s = String(key ?? '').toLowerCase().trim();
+    if (!s) return false;
+    s = s.replace(/[*`]/g, '').trim();          // markdown emphasis: "**Previous**" -> "previous"
+    s = s.replace(/@x$/, '');                    // the template artifact only, never a real "@<coords>" suffix
+    s = s.replace(/[_-]+/g, ' ').replace(/\s+/g, ' ').trim();
+    return TRANSIENT_PLACE_PATTERNS.some(re => re.test(s));
+}
+
 export class MemoryStore {
     /**
      * @param {object} [opts]
@@ -386,6 +445,7 @@ export class MemoryStore {
         if (typeof text !== 'string' || !text.trim()) return 0;
         let imported = 0;
         this.skippedGoals = 0;
+        this.skippedPlaces = 0;
         const sections = text.split(/^##\s+/m).filter(s => s.trim());
         const byHeading = Object.fromEntries(Object.entries(HEADINGS).map(([k, v]) => [v.toLowerCase(), k]));
 
@@ -421,8 +481,20 @@ export class MemoryStore {
                     // "Parched:: Parched:" came from a value that just restates its own key.
                     if (normalizeValue(value) === normalizeKey(key)) value = clean;
                 }
+                if (kind === KIND.LOCATION && isTransientPlaceKey(key)) {
+                    this.skippedPlaces++;
+                    continue;
+                }
                 if (this.put({ kind, key, value, origin: ORIGIN.AGENT }).ok) imported++;
             }
+        }
+        // Never silent - see `skippedGoals` above and CLAUDE.md's "an override is never
+        // silent". Logged here, not in history.js, because this filter is entirely internal
+        // to importLegacyBlob and its evidence.
+        if (this.skippedPlaces > 0) {
+            console.log(`[MemoryStore] dropped ${this.skippedPlaces} transient location row(s) `
+                + `the summariser tried to store as places (current position / nav targets / `
+                + `teleport bookkeeping - already live in STATS, not a durable place).`);
         }
         return imported;
     }

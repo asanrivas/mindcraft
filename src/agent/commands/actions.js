@@ -881,14 +881,16 @@ export const actionsList = [
             'item_name': { type: 'ItemName', description: 'The name of the input item to smelt.' },
             'num': { type: 'int', description: 'The number of times to smelt the item.', domain: [1, Number.MAX_SAFE_INTEGER] }
         },
+        // NO RESTART. This used to `cleanKill('Safely restarting to update inventory.')` on
+        // success, which is why smelting anything killed the agent process. It was a workaround
+        // for a real bug that is now fixed at the source: `bot.inventory` is frozen while a
+        // window is open and is only refreshed by `closeWindow -> copyInventory`, and the old
+        // furnace path could leave the window open (mineflayer's furnace helpers have no
+        // deadline), so the bag really did stay stale. `furnace_io.withFurnace` closes in a
+        // `finally` on every path, so the inventory is current the moment this returns.
         perform: runAsAction(async (agent, item_name, num) => {
-            let success = await skills.smeltItem(agent.bot, item_name, num);
-            if (success) {
-                setTimeout(() => {
-                    agent.cleanKill('Safely restarting to update inventory.');
-                }, 500);
-            }
-        })
+            await skills.smeltItem(agent.bot, item_name, num);
+        }, false, 10)   // 10 min ceiling - the default -1 pins currentActionLabel forever
     },
     {
         name: '!clearFurnace',

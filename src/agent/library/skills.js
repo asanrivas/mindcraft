@@ -14,6 +14,7 @@ import * as farming from './farming.js';
 import * as build_guard from './build_guard.js';
 import * as progression from './progression.js';
 import * as mining from './mining.js';
+import * as furnaceIO from './furnace_io.js';
 
 const blockPlaceDelay = settings.block_place_delay == null ? 0 : settings.block_place_delay;
 const useDelay = blockPlaceDelay > 0;
@@ -301,18 +302,24 @@ export async function wait(bot, milliseconds) {
     return true;
 }
 
+/**
+ * Smelt `num` of `itemName` in the nearest furnace, and report what actually came out.
+ *
+ * The furnace work is `furnace_io.js`, for exactly the reasons `chest.js` does not use
+ * mineflayer's chest API: `bot.openFurnace` awaits `windowOpen` with no deadline (an infinite
+ * hang pins `currentActionLabel` forever, after which NO action in the agent can start again),
+ * `putInput`/`putFuel` are the cursor-based `bot.transfer` that strands items for the server to
+ * drop, and `bot.inventory` is frozen for the whole time the window is open - so the old
+ * version's `total += smelted_item.count` counted what it ASKED for, which is the same honesty
+ * bug as "Successfully took 64 diamond" having taken none.
+ *
+ * `mc.isSmeltable` substring-matches 'raw'/'log', which is right for GENERAL smelting (logs make
+ * charcoal, raw ores smelt) and wrong for food - `cookFood` therefore comes in through
+ * `farming.cookPlan`'s exact whitelist instead, and never through this gate.
+ *
+ * @returns {Promise<boolean>} true only when the full `num` came out, measured.
+ */
 export async function smeltItem(bot, itemName, num=1) {
-    /**
-     * Puts 1 coal in furnace and smelts the given item name, waits until the furnace runs out of fuel or input items.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {string} itemName, the item name to smelt. Ores must contain "raw" like raw_iron.
-     * @param {number} num, the number of items to smelt. Defaults to 1.
-     * @returns {Promise<boolean>} true if the item was smelted, false otherwise. Fail
-     * @example
-     * await skills.smeltItem(bot, "raw_iron");
-     * await skills.smeltItem(bot, "beef");
-     **/
-
     if (!mc.isSmeltable(itemName)) {
         log(bot, `Cannot smelt ${itemName}. Hint: make sure you are smelting the 'raw' item.`);
         return false;
@@ -336,101 +343,97 @@ export async function smeltItem(bot, itemName, num=1) {
         log(bot, `There is no furnace nearby and you have no furnace.`)
         return false;
     }
-    if (bot.entity.position.distanceTo(furnaceBlock.position) > 4) {
-        await goToNearestBlock(bot, 'furnace', 4, furnaceRange);
+
+    // Pick the furnace back up whatever happens - including the throw and the early refusals.
+    // The old code repeated this line at each of five exits and missed the rest.
+    const cleanup = async () => { if (placedFurnace) await collectBlock(bot, 'furnace', 1); };
+
+    // MEASURE the approach; never assume it. `goToNearestBlock` drives whatever it drives and
+    // returns nothing useful, and reaching for a furnace out of range fails silently - which
+    // reads as "the furnace is broken". Same rule chest.js had to learn.
+    const walked = await chest.approachContainer(bot, furnaceBlock.position,
+        { fallback: (b, x, y, z, d) => goToPosition(b, x, y, z, d) });
+    if (!walked.ok) {
+        log(bot, `I could not get to the furnace - stopped ${walked.distance.toFixed(1)} blocks away.`);
+        await cleanup();
+        return false;
     }
+
     bot.modes.pause('unstuck');
-    await bot.lookAt(furnaceBlock.position);
 
-    console.log('smelting...');
-    const furnace = await bot.openFurnace(furnaceBlock);
-    // check if the furnace is already smelting something
-    let input_item = furnace.inputItem();
-    if (input_item && input_item.type !== mc.getItemId(itemName) && input_item.count > 0) {
-        // TODO: check if furnace is currently burning fuel. furnace.fuel is always null, I think there is a bug.
-        // This only checks if the furnace has an input item, but it may not be smelting it and should be cleared.
-        log(bot, `The furnace is currently smelting ${mc.getItemName(input_item.type)}.`);
-        if (placedFurnace)
-            await collectBlock(bot, 'furnace', 1);
+    const run = await furnaceIO.withFurnace(bot, furnaceBlock, async (ctx) => {
+        // Everything below reads the OPEN WINDOW. `bot.inventory` is frozen from here until the
+        // close, so any count taken from it would be a pre-transfer number.
+        const occupant = ctx.input();
+        const fuelInSlot = ctx.fuel();
+        const fuelPick = fuelInSlot ? null : furnaceIO.pickFuel(ctx.win);
+
+        const v = furnaceIO.smeltVerdict({
+            itemName, want: num,
+            held: ctx.bagCount(itemName),
+            occupantName: occupant?.name ?? null,
+            occupantCount: occupant?.count ?? 0,
+            hasFuelInSlot: !!fuelInSlot,
+            fuelAvailable: !!fuelPick,
+        });
+        if (!v.ok) return { collected: 0, outputName: null, reason: v.reason, occupantName: occupant?.name ?? null };
+
+        if (!fuelInSlot) {
+            const fp = furnaceIO.fuelPlan({
+                smelts: num, perUnit: mc.getFuelSmeltOutput(fuelPick.name), have: fuelPick.count,
+            });
+            if (!fp.enough)
+                return { collected: 0, outputName: null, reason: fp.reason, shortfall: fp.shortfall, fuelName: fuelPick.name };
+            const put = await ctx.put(fuelPick.name, fp.units, furnaceIO.FUEL_SLOT);
+            if (put.moved <= 0) return { collected: 0, outputName: null, reason: 'fuel_refused', fuelName: fuelPick.name };
+            log(bot, `Using ${put.moved} ${fuelPick.name} as fuel.`);
+        }
+
+        // A furnace input slot holds ONE STACK. Asking for 200 in one insert is what mineflayer
+        // answered by throwing partway through with items on the cursor.
+        let collected = 0, outputName = null, reason = 'ok';
+        for (const batch of furnaceIO.batchSizes(num)) {
+            if (bot.interrupt_code) { reason = 'interrupted'; break; }
+            const put = await ctx.put(itemName, batch, furnaceIO.INPUT_SLOT);
+            if (put.moved <= 0) { reason = collected > 0 ? 'stalled' : 'input_refused'; break; }
+            const got = await furnaceIO.collectOutput(bot, ctx.win, { want: put.moved });
+            collected += got.collected;
+            outputName = got.outputName ?? outputName;
+            if (got.reason !== 'done') { reason = got.reason; break; }
+        }
+
+        // Recover whatever is left in the three slots - including our own unsmelted input and
+        // unburnt fuel. Leaving them behind is how a furnace slowly eats an inventory.
+        const leftovers = await ctx.drain();
+        return { collected, outputName, reason, leftovers };
+    });
+
+    bot.modes.unpause('unstuck');
+
+    if (!run.ok) {
+        log(bot, furnaceIO.explainSmelt(run.reason, { itemName, want: num })
+            + (run.detail ? ` (${run.detail})` : ''));
+        await cleanup();
         return false;
     }
-    // check if the bot has enough items to smelt
-    let inv_counts = world.getInventoryCounts(bot);
-    if (!inv_counts[itemName] || inv_counts[itemName] < num) {
-        log(bot, `You do not have enough ${itemName} to smelt.`);
-        if (placedFurnace)
-            await collectBlock(bot, 'furnace', 1);
+
+    const { collected, outputName, reason } = run.value;
+    await cleanup();
+
+    if (collected === 0) {
+        log(bot, furnaceIO.explainSmelt(reason, {
+            itemName, want: num,
+            occupantName: run.value.occupantName,
+            shortfall: run.value.shortfall,
+        }));
         return false;
     }
-
-    // fuel the furnace
-    if (!furnace.fuelItem()) {
-        let fuel = mc.getSmeltingFuel(bot);
-        if (!fuel) {
-            log(bot, `You have no fuel to smelt ${itemName}, you need coal, charcoal, or wood.`);
-            if (placedFurnace)
-                await collectBlock(bot, 'furnace', 1);
-            return false;
-        }
-        log(bot, `Using ${fuel.name} as fuel.`);
-
-        const put_fuel = Math.ceil(num / mc.getFuelSmeltOutput(fuel.name));
-
-        if (fuel.count < put_fuel) {
-            log(bot, `You don't have enough ${fuel.name} to smelt ${num} ${itemName}; you need ${put_fuel}.`);
-            if (placedFurnace)
-                await collectBlock(bot, 'furnace', 1);
-            return false;
-        }
-        await furnace.putFuel(fuel.type, null, put_fuel);
-        log(bot, `Added ${put_fuel} ${mc.getItemName(fuel.type)} to furnace fuel.`);
-        console.log(`Added ${put_fuel} ${mc.getItemName(fuel.type)} to furnace fuel.`)
-    }
-    // put the items in the furnace
-    await furnace.putInput(mc.getItemId(itemName), null, num);
-    // wait for the items to smelt
-    let total = 0;
-    let smelted_item = null;
-    await new Promise(resolve => setTimeout(resolve, 200));
-    let last_collected = Date.now();
-    while (total < num) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        if (furnace.outputItem()) {
-            smelted_item = await furnace.takeOutput();
-            if (smelted_item) {
-                total += smelted_item.count;
-                last_collected = Date.now();
-            }
-        }
-        if (Date.now() - last_collected > 11000) {
-            break; // if nothing has been collected in 11 seconds, stop
-        }
-        if (bot.interrupt_code) {
-            break;
-        }
-    }
-    // take all remaining in input/fuel slots
-    if (furnace.inputItem()) {
-        await furnace.takeInput();
-    }
-    if (furnace.fuelItem()) {
-        await furnace.takeFuel();
-    }
-
-    await bot.closeWindow(furnace);
-
-    if (placedFurnace) {
-        await collectBlock(bot, 'furnace', 1);
-    }
-    if (total === 0) {
-        log(bot, `Failed to smelt ${itemName}.`);
+    if (collected < num) {
+        log(bot, `Only smelted ${collected} of ${num} ${itemName}`
+            + (outputName ? ` (got ${outputName})` : '') + ` - ${reason}.`);
         return false;
     }
-    if (total < num) {
-        log(bot, `Only smelted ${total} ${mc.getItemName(smelted_item.type)}.`);
-        return false;
-    }
-    log(bot, `Successfully smelted ${itemName}, got ${total} ${mc.getItemName(smelted_item.type)}.`);
+    log(bot, `Successfully smelted ${num} ${itemName}, got ${collected} ${outputName ?? 'items'}.`);
     return true;
 }
 
@@ -438,7 +441,7 @@ export async function clearNearestFurnace(bot) {
     /**
      * Clears the nearest furnace of all items.
      * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @returns {Promise<boolean>} true if the furnace was cleared, false otherwise.
+     * @returns {Promise<boolean>} true if anything was taken out, false otherwise.
      * @example
      * await skills.clearNearestFurnace(bot);
      **/
@@ -447,30 +450,28 @@ export async function clearNearestFurnace(bot) {
         log(bot, `No furnace nearby to clear.`);
         return false;
     }
-    if (bot.entity.position.distanceTo(furnaceBlock.position) > 4) {
-        await goToNearestBlock(bot, 'furnace', 4, 32);
+    const walked = await chest.approachContainer(bot, furnaceBlock.position,
+        { fallback: (b, x, y, z, d) => goToPosition(b, x, y, z, d) });
+    if (!walked.ok) {
+        log(bot, `I could not get to the furnace - stopped ${walked.distance.toFixed(1)} blocks away.`);
+        return false;
     }
 
-    console.log('clearing furnace...');
-    const furnace = await bot.openFurnace(furnaceBlock);
-    console.log('opened furnace...')
-    // take the items out of the furnace
-    let smelted_item, intput_item, fuel_item;
-    if (furnace.outputItem())
-        smelted_item = await furnace.takeOutput();
-    if (furnace.inputItem())
-        intput_item = await furnace.takeInput();
-    if (furnace.fuelItem())
-        fuel_item = await furnace.takeFuel();
-    console.log(smelted_item, intput_item, fuel_item)
-    let smelted_name = smelted_item ? `${smelted_item.count} ${smelted_item.name}` : `0 smelted items`;
-    let input_name = intput_item ? `${intput_item.count} ${intput_item.name}` : `0 input items`;
-    let fuel_name = fuel_item ? `${fuel_item.count} ${fuel_item.name}` : `0 fuel items`;
-    log(bot, `Cleared furnace, received ${smelted_name}, ${input_name}, and ${fuel_name}.`);
+    const run = await furnaceIO.withFurnace(bot, furnaceBlock, (ctx) => ctx.drain());
+    if (!run.ok) {
+        log(bot, furnaceIO.explainSmelt(run.reason, {}) + (run.detail ? ` (${run.detail})` : ''));
+        return false;
+    }
+    // MEASURED, from the bag, through the window - not the three item objects the old code got
+    // back from `takeOutput`/`takeInput`/`takeFuel` and printed without checking.
+    const took = run.value;
+    if (took.length === 0) {
+        log(bot, `The furnace was already empty.`);
+        return false;
+    }
+    log(bot, `Cleared furnace, received ${took.map(t => `${t.count} ${t.name}`).join(', ')}.`);
     return true;
-
 }
-
 
 export async function attackNearest(bot, mobType, kill=true) {
     /**
@@ -478,7 +479,11 @@ export async function attackNearest(bot, mobType, kill=true) {
      * @param {MinecraftBot} bot, reference to the minecraft bot.
      * @param {string} mobType, the type of mob to attack.
      * @param {boolean} kill, whether or not to continue attacking until the mob is dead. Defaults to true.
-     * @returns {Promise<boolean>} true if the mob was attacked, false if the mob type was not found.
+     * @returns {Promise<boolean>} **true only when the kill is CONFIRMED.** A mob that fled, a
+     *   deadline that expired and a mob type that was never there all return false - see
+     *   `attackEntity` for why "it left the radius" is not a kill. Kept a boolean on purpose:
+     *   `npc/item_goal.js:164` does `if (!res) break;` to stop hunting, and every object is
+     *   truthy, so returning the rich verdict here would silently disable that stop.
      * @example
      * await skills.attackNearest(bot, "zombie", true);
      **/
@@ -489,7 +494,7 @@ export async function attackNearest(bot, mobType, kill=true) {
     // ON during the fight: the bot should still come up for air mid-hunt.
     const mob = world.getNearbyEntities(bot, 24).find(entity => entity.name === mobType);
     if (mob) {
-        return await attackEntity(bot, mob, kill);
+        return (await attackEntity(bot, mob, kill)).killed;
     }
     log(bot, 'Could not find any '+mobType+' to attack.');
     return false;
@@ -563,15 +568,63 @@ export async function shootBow(bot, mobType, weapon = 'auto', maxShots = 12) {
         + `${fired} shot(s) in ${((Date.now() - t0) / 1000).toFixed(1)}s, arrows ${before}->${after}.`;
 }
 
-export async function attackEntity(bot, entity, kill=true) {
-    /**
-     * Attack mob of the given type.
-     * @param {MinecraftBot} bot, reference to the minecraft bot.
-     * @param {Entity} entity, the entity to attack.
-     * @returns {Promise<boolean>} true if the entity was attacked, false if interrupted
-     * @example
-     * await skills.attackEntity(bot, entity);
-     **/
+/**
+ * What the attack loop should conclude THIS iteration. Pure, so every branch is testable
+ * without a server - the interesting states (a cow that fled over a hill, a skeleton that
+ * despawned, a kill landing on the same tick as an interrupt) are ones a live run only reaches
+ * by accident.
+ *
+ * **Distance is not an input, in either direction.** The bug this replaces was
+ * `while (world.getNearbyEntities(bot, 24).includes(entity))` followed by an unconditional
+ * `log("Successfully killed")`: an animal that simply RAN AWAY was reported as food obtained,
+ * and a bot that believes it ate cannot fix being hungry. `present` is used here only to stop
+ * chasing a target we can no longer see - never to conclude that it died.
+ *
+ * Death is `farming.killConfirmed`, which deliberately refuses `entity.isValid === false`:
+ * mineflayer clears that flag in its `entity_destroy` handler, and the server sends
+ * `entity_destroy` for a view-distance exit exactly as it does for a death, so `isValid` is the
+ * same bug in a different costume.
+ *
+ * Confirmation is checked BEFORE the interrupt and the deadline: a mob that died on the same
+ * tick a mode fired is dead, and reporting it as interrupted would send the bot back for it.
+ *
+ * @param {{entity:object|null, deathSeen:boolean, interrupted:boolean, present:boolean, timedOut:boolean}} s
+ * @returns {'killed'|'interrupted'|'fled'|'timeout'|'fighting'}
+ */
+export function attackOutcome(s = {}) {
+    if (farming.killConfirmed(s.entity ?? null, { deathSeen: s.deathSeen === true })) return 'killed';
+    if (s.interrupted) return 'interrupted';
+    if (s.present === false) return 'fled';
+    if (s.timedOut) return 'timeout';
+    return 'fighting';
+}
+
+/** One line a person (or the model) can act on, per outcome. */
+export function attackReport(outcome, name, seconds) {
+    switch (outcome) {
+        case 'killed':      return `Successfully killed ${name}.`;
+        case 'fled':        return `${name} left the area - NOT killed. It fled; nothing was dropped.`;
+        case 'timeout':     return `Gave up on ${name} after ${seconds}s - it is not confirmed dead.`;
+        case 'interrupted': return `Attack on ${name} interrupted - not confirmed dead.`;
+        default:            return `Still fighting ${name}.`;
+    }
+}
+
+/**
+ * Attack an entity, and say honestly what happened.
+ *
+ * @returns {Promise<{killed:boolean, outcome:'killed'|'fled'|'timeout'|'interrupted'|'attacked',
+ *                    reason:string, seconds:number}>}
+ *
+ * The old contract was `Promise<boolean>` where `true` meant "the entity is no longer within 24
+ * blocks", which is true of every animal that outran us. `!attack`, `defendSelf` and
+ * `mode:hunting` all inherited it. The callers that consume a value keep a boolean:
+ * `attackNearest` returns `.killed`, so `npc/item_goal.js`'s `if (!res) break;` now stops on a
+ * flight instead of counting it as dinner.
+ */
+export async function attackEntity(bot, entity, kill=true, opts={}) {
+    const { deadlineMs = 60000, pollMs = 1000, radius = 24 } = opts;
+    const name = entity?.name ?? 'entity';
 
     let pos = entity.position;
     await equipHighestAttack(bot)
@@ -583,20 +636,47 @@ export async function attackEntity(bot, entity, kill=true) {
         }
         console.log('attacking mob...')
         await bot.attack(entity);
+        // A single swing is not a kill and never claimed to be one; say so in the type rather
+        // than returning undefined, so a caller cannot read the absence of `false` as success.
+        return { killed: false, outcome: 'attacked', reason: 'one swing, kill not requested', seconds: 0 };
     }
-    else {
+
+    // POSITIVE EVIDENCE ONLY. `entityDead` is entity_status 3, which the server sends for a
+    // death and only within view; the same pattern `shootBow` and `huntNearby` already use.
+    const targetId = entity.id;
+    let deathSeen = false;
+    const onDead = (e) => { if (e && e.id === targetId) deathSeen = true; };
+    bot.on('entityDead', onDead);
+
+    const t0 = Date.now();
+    let outcome = 'timeout';
+    try {
         bot.pvp.attack(entity);
-        while (world.getNearbyEntities(bot, 24).includes(entity)) {
-            await new Promise(resolve => setTimeout(resolve, 1000));
-            if (bot.interrupt_code) {
-                bot.pvp.stop();
-                return false;
-            }
+        while (true) {
+            const live = (targetId != null ? bot.entities?.[targetId] : null) ?? null;
+            outcome = attackOutcome({
+                entity: live ?? entity,   // the same object mineflayer mutates; health is real evidence
+                deathSeen,
+                interrupted: !!bot.interrupt_code,
+                // Absence from the radius ends the CHASE. It never ends it as a kill: that is
+                // decided above, by evidence, and only by evidence.
+                present: world.getNearbyEntities(bot, radius).some(e => e.id === targetId),
+                timedOut: Date.now() - t0 >= deadlineMs,
+            });
+            if (outcome !== 'fighting') break;
+            await new Promise(resolve => setTimeout(resolve, pollMs));
         }
-        log(bot, `Successfully killed ${entity.name}.`);
-        await pickupNearbyItems(bot);
-        return true;
+    } finally {
+        bot.removeListener('entityDead', onDead);
+        bot.pvp.stop();
     }
+
+    const seconds = ((Date.now() - t0) / 1000).toFixed(1);
+    // Every exit names itself. A silent refusal - or a silent flight - is indistinguishable
+    // from the branch never running, which is exactly how this bug survived.
+    log(bot, attackReport(outcome, name, seconds));
+    if (outcome === 'killed') await pickupNearbyItems(bot);
+    return { killed: outcome === 'killed', outcome, reason: outcome, seconds: Number(seconds) };
 }
 
 export async function defendSelf(bot, range=9) {
@@ -4486,10 +4566,148 @@ export async function clearFallingBlocksAbove(bot, maxBlocks = 8) {
     return removed;
 }
 
+/**
+ * Dimension names that have a BEDROCK ROOF instead of a sky. Exact membership, never a
+ * substring - `"the_nether"` and `"nether"` are the two spellings mineflayer can produce
+ * (it strips the `minecraft:` namespace), and nothing else may match.
+ */
+const ROOFED_DIMENSIONS = new Set(['the_nether', 'nether']);
+
+/**
+ * The dimension, or null when this client could not parse one.
+ *
+ * `bot.game.difficulty` is a documented lie on this server (see CLAUDE.md and
+ * `src/agent/difficulty.js`), so `bot.game.dimension` gets the same suspicion: it is read
+ * defensively, an unparseable value becomes `null` rather than a string nobody checked, and
+ * NOTHING here trusts it on its own - see `skyScanVerdict`.
+ */
+export function dimensionOf(bot) {
+    const d = bot?.game?.dimension;
+    if (typeof d !== 'string' || d.length === 0) return null;
+    return d.replace('minecraft:', '');
+}
+
+/**
+ * Is there bedrock overhead? Returns the Y of the lowest bedrock above the bot, or null.
+ *
+ * This is the check that makes the dimension gate FAIL SAFE. A dimension field we cannot parse
+ * - or, exactly as with `difficulty`, one that is confidently wrong - must not be the only
+ * thing standing between the bot and a fifteen-minute attempt to mine through the nether roof.
+ * The world itself answers the question, and in the overworld it costs nothing: bedrock is only
+ * ever BELOW, so the scan runs to the top of the range and finds nothing.
+ */
+export function bedrockCeiling(bot, maxUp = 140) {
+    const p = bot.entity.position.floored();
+    for (let dy = 1; dy <= maxUp; dy++) {
+        const b = bot.blockAt(p.offset(0, dy, 0));
+        if (b && b.name === 'bedrock') return p.y + dy;
+    }
+    return null;
+}
+
+/**
+ * May "climb toward the surface" mean anything here?
+ *
+ * `climbToSurface` and `travelToward` both ask `nav.surfaceY(..., 140, ...)` for the sky. In
+ * the nether that scan returns the BEDROCK ROOF - a perfectly ordinary standable-looking answer
+ * - so the bot cuts upward toward it forever, and bedrock cannot be broken. Reachable today
+ * with one operator teleport.
+ *
+ * Two independent tests, and the ORDER is the fail-safe:
+ *
+ *  1. A dimension we know is roofed refuses by name, so the message says "nether" rather than
+ *     something about block reads.
+ *  2. Bedrock overhead refuses REGARDLESS of what the dimension field says. That is the part
+ *     that survives the field being unset, mis-parsed, or - as `difficulty` genuinely was on
+ *     this server - overwritten with the wrong value by a listener we do not control.
+ *
+ * Unknown dimension with clear sky above is ALLOWED, deliberately. Refusing there would disable
+ * overland travel for every bot whose login packet we failed to read, which is the overwhelming
+ * common case; and the physical test above already covers the case that actually hurts.
+ *
+ * @returns {{ok:boolean, reason:string}}
+ */
+export function skyScanVerdict({ dimension = null, bedrockAbove = null } = {}) {
+    if (dimension != null && ROOFED_DIMENSIONS.has(dimension))
+        return { ok: false, reason: 'the nether has a bedrock roof, not a sky - there is no surface to climb to' };
+    if (bedrockAbove != null)
+        return { ok: false, reason: `there is bedrock overhead (y=${bedrockAbove}) - that is a roof, not a surface` };
+    return { ok: true, reason: dimension ?? 'open sky' };
+}
+
+/** `skyScanVerdict` against the live world. One block-column scan; nothing is cached. */
+export function canClimbToSky(bot) {
+    return skyScanVerdict({ dimension: dimensionOf(bot), bedrockAbove: bedrockCeiling(bot) });
+}
+
+/**
+ * "May I break or fill this cell?" for the two climbing primitives that touch the world.
+ *
+ * `build_guard` covers the PLANNER (`buildDigCost` prices a protected cell far above `digCost`),
+ * `nav.digAhead` and `nav.bridgeAhead`. It did not cover `climbShaftUp`, which breaks the block
+ * above its head and places one under its feet, nor `climbLedgeByPlacing`, which pillars - so
+ * both could still tunnel through a finished wall or leave a cobblestone spike standing in a
+ * room the blueprint owns. Same litter, different rung of the same recovery ladder.
+ *
+ * THREE LAYERS, WEAKEST FIRST - and layer 3 is what makes this safe to turn on:
+ *   1. the planner prices the build (already, in nav.js);
+ *   2. these primitives REFUSE a protected cell - climb somewhere else, do not demolish;
+ *   3. **they RELENT when the build has the bot trapped.** A bot that will not break its own
+ *      walls stays inside them until the watchdog kills it, which is strictly worse than a hole
+ *      the builder's verification pass repairs.
+ *
+ * `trappedByBuild` is the measurement, NOT `enclosed`. `enclosed` asks whether any of the eight
+ * neighbours is standable, which is true of any bot standing in a room - it can walk around
+ * inside its own tomb - so a valve gated on it can only fire in a literal one-cell pocket, which
+ * is precisely the state a finished building never produces. That mistake made the guard's
+ * relent decorative once already (33 `digAhead: 0:build` against 1192 `pinned: nothing worked`).
+ * `enclosed` is kept as the degenerate case and goes first because it is the cheap one.
+ *
+ * Computed LAZILY and at most once per gate, exactly as `nav.digAhead` does it: the flood fill
+ * is not free, and the overwhelming majority of climbs never touch a protected cell at all.
+ *
+ * @param {string} label prefix for the log line - a refusal that does not name itself is
+ *   indistinguishable from the branch never running, and BREACHING silently is how the original
+ *   bug hid for as long as it did.
+ * @param {() => boolean} [isTrapped] injected for the tests; live callers use the real measure.
+ * @returns {(x:number,y:number,z:number) => boolean} true when the cell may be touched.
+ */
+export function buildGate(bot, label, isTrapped = null) {
+    let trapped = null;
+    const measure = isTrapped ?? (() => nav.enclosed(bot) || nav.trappedByBuild(bot));
+    return (x, y, z) => {
+        // A plain Set lookup, inert when no build is registered - so this is a complete no-op
+        // (and touches neither the bot nor the world) on every ordinary climb.
+        if (!build_guard.isProtecting() || !build_guard.isProtected(x, y, z)) return true;
+        trapped ??= measure();
+        const v = build_guard.protectVerdict({ protectedCell: true, enclosed: trapped });
+        const who = bot?.username ?? '?';
+        if (!v.allow) {
+            console.log(`[${who}] ${label}: refusing (${x}, ${y}, ${z}) - that cell belongs to the build`);
+            return false;
+        }
+        console.log(`[${who}] ${label}: ${v.why} - breaching the build at (${x}, ${y}, ${z})`);
+        return true;
+    };
+}
+
 export async function climbToSurface(bot, maxSteps = 150, opts = {}) {
     const { preferDir = null, targetY = null } = opts;
     const nav = await import('./nav.js');
     const startY = bot.entity.position.y;
+
+    // NAME THE REFUSAL. In the nether the sky scan returns the bedrock roof, and this routine
+    // would then stair and tower toward a block that cannot be broken until its whole step
+    // budget was gone. Skipped when the caller supplied its own `targetY` - a relative climb
+    // (`nav.climbAhead` asks for "two blocks up") is a local move, not a trip to the surface,
+    // and refusing it would break climbing a ledge in the nether for no reason.
+    if (targetY === null) {
+        const sky = canClimbToSky(bot);
+        if (!sky.ok) {
+            log(bot, `Not climbing to the surface: ${sky.reason}.`);
+            return 0;
+        }
+    }
     // Cutting stairs in the direction we actually want to travel turns the climb into progress
     // rather than a detour; the other headings stay as fallbacks for when it dead-ends.
     const base = [[1, 0], [0, 1], [-1, 0], [0, -1]];
@@ -4700,7 +4918,16 @@ export async function travelToward(bot, targetX, targetZ, opts = {}) {
     // Surface travel only. If a previous leg ended in a cave, climb out before going further -
     // otherwise every route the planner can see from down there is also underground.
     const navMod = await import('./nav.js');
-    let preferY = navMod.surfaceY(bot, startPos.x, startPos.z, 140, Math.floor(startPos.y) + 1);
+    // WHETHER "THE SURFACE" EXISTS AT ALL. `surfaceY` returns the bedrock roof in the nether,
+    // which reads as an ordinary surface 60 blocks up and sends `climbToSurface` mining into
+    // bedrock for its whole budget. Decided ONCE here, and named once, rather than at each of
+    // the three sites below - a per-stall log line would flood a journey that stalls often.
+    // `climbToSurface` carries the same gate independently, so a portal entered mid-journey is
+    // still covered.
+    const sky = canClimbToSky(bot);
+    if (!sky.ok) log(bot, `No surface to climb to here: ${sky.reason}. Travelling at this level.`);
+
+    let preferY = sky.ok ? navMod.surfaceY(bot, startPos.x, startPos.z, 140, Math.floor(startPos.y) + 1) : null;
     if (preferY !== null && preferY - startPos.y > 20) {
         log(bot, `Underground (${Math.round(preferY - startPos.y)} blocks below the surface); climbing out first.`);
         await climbToSurface(bot);
@@ -4844,8 +5071,10 @@ export async function travelToward(bot, targetX, targetZ, opts = {}) {
             // can see is also underground, so it kept boring west in the dark. Climb out and
             // resume on the surface instead.
             const hereNow = bot.entity.position;
-            const surfNow = nav.surfaceY(bot, Math.floor(hereNow.x), Math.floor(hereNow.z),
-                                         140, Math.floor(hereNow.y) + 1);
+            const surfNow = sky.ok
+                ? nav.surfaceY(bot, Math.floor(hereNow.x), Math.floor(hereNow.z),
+                               140, Math.floor(hereNow.y) + 1)
+                : null;   // roofed dimension: the scan would return the bedrock ceiling
             // 20, not 8: cutting through a ridge legitimately puts the bot "below the surface"
             // for a while, and a tighter threshold made this fight the tunnel it needed to dig.
             if (surfNow !== null && surfNow - hereNow.y > 20) {
@@ -4992,8 +5221,13 @@ export async function travelToward(bot, targetX, targetZ, opts = {}) {
             // worth it when the top is close enough to stair up to.
             if (ahead.kind === 'wall') {
                 const here2 = bot.entity.position;
-                const topY = nav.surfaceY(bot, Math.floor(here2.x) + dx * 4,
-                                          Math.floor(here2.z) + dz * 4, 140, Math.floor(here2.y));
+                // Same gate: under a bedrock roof "the top of the cliff" is the roof, and a
+                // rise of 2-14 to it is entirely plausible - so this branch would stair the bot
+                // up into bedrock rather than dig through the wall in front of it.
+                const topY = sky.ok
+                    ? nav.surfaceY(bot, Math.floor(here2.x) + dx * 4,
+                                   Math.floor(here2.z) + dz * 4, 140, Math.floor(here2.y))
+                    : null;
                 const rise = topY === null ? null : topY - here2.y;
                 if (rise !== null && rise >= 2 && rise <= 14) {
                     // Build first, dig second. Placing blocks leaves the terrain intact; cutting
@@ -5334,6 +5568,18 @@ export async function climbLedgeByPlacing(bot, dx, dz, rise) {
     const startY = bot.entity.position.y;
     if (!hasBuildingBlocks(bot)) return 0;
 
+    // Never pillar THROUGH the build. `pillarUp` fills one cell per iteration and has no gate of
+    // its own (its other callers are the night-shelter paths, where the cells are the shelter's
+    // own and a guard would be wrong), so the column is checked here, whole, before each round -
+    // a tower half-built into a wall is worse than one never started.
+    const mayTouch = buildGate(bot, 'ledgeClimb');
+    const columnClear = (remaining) => {
+        const f = bot.entity.position.floored();
+        for (let dy = 0; dy < remaining; dy++)
+            if (!mayTouch(f.x, f.y + dy, f.z)) return false;
+        return true;
+    };
+
     // Pillar in rounds rather than one shot: a single pass regularly gained less than asked
     // (jump height is inconsistent on this server), which left the bot stranded partway up a
     // wall it then could not step over.
@@ -5341,7 +5587,12 @@ export async function climbLedgeByPlacing(bot, dx, dz, rise) {
     for (let round = 0; round < 4; round++) {
         if (bot.entity.position.y - startY >= want - 0.1) break;
         const before = bot.entity.position.y;
-        await pillarUp(bot, want - Math.round(bot.entity.position.y - startY));
+        const remaining = want - Math.round(bot.entity.position.y - startY);
+        if (!columnClear(remaining)) {
+            log(bot, `Not pillaring here - the column belongs to the build. Going round instead.`);
+            break;
+        }
+        await pillarUp(bot, remaining);
         if (bot.entity.position.y - before < 0.5) break;   // made no headway this round
     }
 
@@ -5794,10 +6045,18 @@ export async function climbShaftUp(bot, targetY = null, maxSteps = 64) {
     }
 
     let dug = 0, placed = 0, stop = 'reached target';
+    // One gate for the whole tower: it memoises the expensive "am I trapped by the build"
+    // measurement, and a tower is many iterations through the same few cells.
+    const mayTouch = buildGate(bot, 'shaftUp');
     for (let i = 0; i < maxSteps; i++) {
         if (bot.interrupt_code) { stop = 'interrupted'; break; }
         const p = bot.entity.position.floored();
         if (target !== null && p.y >= target) break;
+
+        // The cell the pillar block goes into is the one the bot is standing in. Checked before
+        // the ceiling dig, because refusing here means the rung cannot happen at all and there
+        // is no point breaking a roof we will not climb through.
+        if (!mayTouch(p.x, p.y, p.z)) { stop = 'the cell under my feet belongs to the build'; break; }
 
         const ceilPos = p.offset(0, 2, 0);
         const below = bot.blockAt(p.offset(0, -1, 0));
@@ -5809,6 +6068,10 @@ export async function climbShaftUp(bot, targetY = null, maxSteps = 64) {
         if (!v.ok) { stop = v.reason; break; }
 
         if (v.dig) {
+            if (!mayTouch(ceilPos.x, ceilPos.y, ceilPos.z)) {
+                stop = 'the block above me belongs to the build';
+                break;
+            }
             // A falling column has to be cleared until it STAYS clear. Reading the cell once
             // catches it in the moment between the block being broken and the sand above
             // landing in its place, and the bot then pillars into a cell that refills onto its

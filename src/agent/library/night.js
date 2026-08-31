@@ -104,3 +104,50 @@ export function decideNightAction({ timeOfDay, thundering = false, inWater = fal
     if (bedInInv && canSleepAt(timeOfDay, thundering)) return 'place_bed';
     return 'shelter';
 }
+
+/**
+ * Should the bot get into a bed to complete a night-skip vote a HUMAN has already started?
+ *
+ * This is a different question from `decideNightAction`, and it has to be, because vanilla
+ * skips the night only when EVERY player is in bed - and this bot counts as a player. Every
+ * stand-down that correctly stops the bot SHELTERING (Peaceful, already under a roof, already
+ * deep underground, gave up for tonight) wrongly stops it VOTING: an awake bot silently holds
+ * a person's night hostage, and the person has no way to see why.
+ *
+ * So the refusals here are only the ones that are PHYSICAL - cases where getting into a bed
+ * either cannot work or costs something the vote is not worth:
+ *
+ *  - `userActionRunning` -> 'defer', NOT 'join'. A mode may interrupt a person's action when
+ *    the bot's life is at stake (drowning, self_defense); a sleep vote is a courtesy, and
+ *    cancelling the marathon a person explicitly asked for in order to be polite about their
+ *    bedtime is the exact damage `isUserOwned` exists to prevent. The vote is not lost: a
+ *    sleeping human stays in bed, so the next tick after the action finishes still joins.
+ *  - Hostile mobs are deliberately NOT an input. `goToBed` already classifies the server's
+ *    'monsters nearby' refusal by name, and the caller's cooldown stops it retrying in a loop;
+ *    adding a second, weaker copy of that test here would only make the bot refuse a sleep the
+ *    server would have allowed.
+ *
+ * @param {object}  o
+ * @param {boolean} o.anyHumanSleeping  a real person (never another agent) is in bed
+ * @param {number}  o.timeOfDay
+ * @param {boolean} [o.thundering]
+ * @param {boolean} [o.isSleeping]      the bot is already in bed - the vote is already cast
+ * @param {string}  [o.dimension]
+ * @param {boolean} [o.inWater]
+ * @param {boolean} [o.hasBed]          a bed within reach, or one in the bag to place
+ * @param {boolean} [o.userActionRunning] a user-authored action is executing right now
+ * @returns {'join'|'defer'|'no'}
+ */
+export function sleepVoteVerdict({ anyHumanSleeping, timeOfDay, thundering = false,
+                                   isSleeping = false, dimension = 'overworld',
+                                   inWater = false, hasBed = false,
+                                   userActionRunning = false }) {
+    if (isSleeping) return 'no';                          // already voting
+    if (!anyHumanSleeping) return 'no';                   // nobody to join
+    if (dimension !== 'overworld') return 'no';           // beds explode
+    if (inWater) return 'no';                             // drowning mode's territory
+    if (!canSleepAt(timeOfDay, thundering)) return 'no';  // the server would reject the sleep
+    if (!hasBed) return 'no';                             // nothing to vote WITH
+    if (userActionRunning) return 'defer';                // a person's own work outranks this
+    return 'join';
+}

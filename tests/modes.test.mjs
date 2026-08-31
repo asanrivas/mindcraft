@@ -204,5 +204,90 @@ check('mode completion logs are attributed to an agent',
         /can_interrupt = agent\.isIdle\(\) \|\| is_very_close/.test(collecting), false);
 }
 
+// --- joining a human's night-skip vote must sit ABOVE every stand-down -------------------------
+// The bug this guards: `humanAwakeOnline` correctly ignores a SLEEPING person, but `isPeaceful`,
+// the >8-deep check, `hasRoofOverhead` and `gaveUp` all return before `nightRoutine` - so on this
+// Peaceful server, or standing inside the shared base, the bot never gets into a bed. Vanilla
+// skips the night only when EVERY player sleeps, so the awake bot silently held the person's
+// night hostage, with nothing in chat to say why. Voting is a different goal from sheltering.
+{
+    check('night_safety joins a human sleep vote', /anyHumanSleeping\(bot\)/.test(night), true);
+    // The placement IS the fix. Each of these guards is correct for sheltering and wrong for
+    // voting, so the vote has to be decided before any of them can return.
+    for (const guard of ['isPeaceful(', 'humanAwakeOnline(bot)', 'hasRoofOverhead(bot)',
+                         'if (this.gaveUp) return;'])
+        check(`the vote is decided before ${guard}`,
+            night.indexOf('anyHumanSleeping(bot)') < night.indexOf(guard), true);
+    // ...but still after the dawn dig-out: a bot sealed in last night is let out before it is
+    // asked to walk to a bed.
+    check('the vote comes after the dig-out',
+        night.indexOf('digOut') < night.indexOf('anyHumanSleeping(bot)'), true);
+    // The decision is the pure, unit-tested verdict, not a second copy of it inline.
+    check('the vote decision is not re-derived inline',
+        /night\.sleepVoteVerdict\(/.test(night), true);
+    // A courtesy must not cancel what a person explicitly asked for. Modes are exempt from the
+    // ownership rule so DROWNING and SELF_DEFENSE can save the bot's life; a sleep vote is not
+    // that, and killing a user's marathon to be polite about their bedtime is damage this repo
+    // has already paid for. The verdict takes the ownership state as an input and answers
+    // 'defer'; nothing is lost, because a sleeping human stays in bed.
+    check('a user-owned action defers the vote rather than being cancelled',
+        /userActionRunning: agent\.actions\.isUserOwned\(\)/.test(night), true);
+    // A refused vote must fall THROUGH to the ordinary chain, never return: returning would
+    // disable every stand-down below whenever anybody was in bed.
+    check('a refused vote does not swallow the rest of the chain',
+        /\/\/ 'defer' or 'no': fall THROUGH/.test(night), true);
+    // Same rule as the shelter backoff: a failed join must not fire every tick.
+    check('a failed join has a cooldown', /cooldownUntil = Date\.now\(\) \+ 30000/.test(night), true);
+    // Other agents are not people. Two bots each getting into bed because the other did is a
+    // mirror, not a vote - and it is the same mistake humanAwakeOnline already guards against.
+    const sleeping = SRC.slice(SRC.indexOf('function anyHumanSleeping'),
+                               SRC.indexOf('const modes_list = ['));
+    check('anyHumanSleeping excludes other agents', /isOtherAgent\(name\)/.test(sleeping), true);
+    check('...and excludes the bot itself', /name === bot\.username/.test(sleeping), true);
+    check('...and reports SLEEPING, not awake (it is not a copy-paste of humanAwakeOnline)',
+        /isSleeping\) return true;/.test(sleeping), true);
+}
+
+// --- §8b backfill: the mode's slot and its interrupt fences ------------------------------------
+// The old plan asked for these and they were never written. modes.test.mjs sliced
+// night_safety -> hunting, which only IMPLICITLY pinned "before hunting" and asserted nothing
+// about what the mode refuses to interrupt.
+{
+    // Order: everything above night_safety keeps running while it is active (a creeper at the
+    // bedside still triggers self_defense); everything below goes quiet, which is the point -
+    // chasing a pig at dusk is how you meet a skeleton.
+    const iSelfDefense = SRC.indexOf('name: "self_defense"');
+    const iNight = SRC.indexOf('name: "night_safety"');
+    const iHunting = SRC.indexOf('name: "hunting"');
+    check('self_defense comes before night_safety', iSelfDefense > 0 && iSelfDefense < iNight, true);
+    check('night_safety comes before hunting', iNight < iHunting, true);
+    // The livelock fence. !surface vs mode:drowning traded interrupts while the bot drowned once
+    // already; night_safety must not do the same to the commands doing its own job, nor to the
+    // survival modes above it.
+    const exclude = (night.match(/excludeFromInterrupt:\s*\[([\s\S]*?)\]/) || [])[1] || '';
+    for (const e of ['mode:drowning', 'mode:self_preservation', 'mode:self_defense',
+                     'action:goToBed', 'action:shelter', 'action:surface'])
+        check(`night_safety excludes ${e}`, exclude.includes(`"${e}"`), true);
+}
+
+// --- the command side of the same fence --------------------------------------------------------
+// The fence has two sides and only the mode's side was asserted anywhere. Without the command
+// guard, !goToBed and the mode fight over the same bed.
+{
+    const actionsSrc = fs.readFileSync(new URL('../src/agent/commands/actions.js', import.meta.url), 'utf8');
+    const slice = (name) => {
+        const i = actionsSrc.indexOf(`name: '${name}'`);
+        return i < 0 ? '' : actionsSrc.slice(i, actionsSrc.indexOf('name: \'!', i + 10));
+    };
+    for (const cmd of ['!goToBed', '!shelter']) {
+        const body = slice(cmd);
+        check(`${cmd} exists`, body.length > 0, true);
+        check(`${cmd} stands down while night_safety owns the job`,
+            /isActive\('night_safety'\)/.test(body), true);
+        // The -1 default pins currentActionLabel forever; both must carry a numeric ceiling.
+        check(`${cmd} passes a runAsAction timeout`, /\}, false, \d+\)/.test(body), true);
+    }
+}
+
 if (failures) { console.error(`\n${failures} failure(s)`); process.exit(1); }
 console.log('modes: all checks passed');

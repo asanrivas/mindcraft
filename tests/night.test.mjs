@@ -6,7 +6,7 @@
  * night - it had no concept of dusk at all.
  */
 import { isNight, canSleepAt, isDuskApproaching, isBedName, bedInInventory,
-         pickShelterSpot, decideNightAction, DUSK, MOBS_SPAWN, DAWN }
+         pickShelterSpot, decideNightAction, sleepVoteVerdict, DUSK, MOBS_SPAWN, DAWN }
     from '../src/agent/library/night.js';
 
 let failures = 0;
@@ -95,6 +95,52 @@ const flat = (x, y, z) => (y >= 64 ? 'air' : 'dirt');
     const spot = pickShelterSpot(patchy, { x: 0, y: 64, z: 0 }, 2);
     check('steps aside from a bad cell', spot !== null && !(spot.x === 0 && spot.z === 0), true);
 }
+
+// --- joining a HUMAN's night-skip vote -----------------------------------------------------------
+// A different question from decideNightAction, and the refusals matter far more than the one
+// success: this branch sits ABOVE every stand-down in night_safety (Peaceful, roof, depth,
+// gaveUp), so anything it wrongly says 'join' to interrupts the bot at dusk on a world where
+// nothing can hurt it - the exact Peaceful-tax incident, re-introduced through a new door.
+const vote = { anyHumanSleeping: true, timeOfDay: 13000, thundering: false, isSleeping: false,
+               dimension: 'overworld', inWater: false, hasBed: true, userActionRunning: false };
+
+// THE CONTROL: with nobody in bed there is no vote to join, so the branch must not exist at all.
+check('no human sleeping -> no', sleepVoteVerdict({ ...vote, anyHumanSleeping: false }), 'no');
+check('default (nothing supplied) -> no', sleepVoteVerdict({ timeOfDay: 13000 }), 'no');
+// Already in bed: the vote is cast. Firing again would fight the bot's own sleep.
+check('already sleeping -> no', sleepVoteVerdict({ ...vote, isSleeping: true }), 'no');
+// A bed outranks a vote: it detonates in the nether/end, whoever is asleep back home.
+check('nether -> no', sleepVoteVerdict({ ...vote, dimension: 'the_nether' }), 'no');
+check('end -> no', sleepVoteVerdict({ ...vote, dimension: 'the_end' }), 'no');
+// Water is the drowning mode's territory; SwimAssist owns the jump key while wet.
+check('in water -> no', sleepVoteVerdict({ ...vote, inWater: true }), 'no');
+// Daytime: the server rejects the sleep, so an attempt only burns an interrupt.
+check('noon -> no', sleepVoteVerdict({ ...vote, timeOfDay: 6000 }), 'no');
+// Boundary. DUSK is the first tick a bed accepts you in clear weather.
+check('just before DUSK -> no', sleepVoteVerdict({ ...vote, timeOfDay: DUSK - 1 }), 'no');
+check('12100 (dusk approaching, bed still refuses) -> no',
+      sleepVoteVerdict({ ...vote, timeOfDay: 12100 }), 'no');
+check('DUSK exactly -> join', sleepVoteVerdict({ ...vote, timeOfDay: DUSK }), 'join');
+check('DAWN -> no', sleepVoteVerdict({ ...vote, timeOfDay: DAWN }), 'no');
+// Nothing to vote WITH.
+check('no bed anywhere -> no', sleepVoteVerdict({ ...vote, hasBed: false }), 'no');
+// A person's own work outranks a courtesy. Modes may interrupt a user action to save the bot's
+// life; joining a sleep vote is not that, and cancelling a marathon 12s after it started is a
+// failure this repo has already paid for once. The vote is not lost - a sleeping human stays in
+// bed, so the tick after the action ends still joins.
+check('mid user-owned action -> defer',
+      sleepVoteVerdict({ ...vote, userActionRunning: true }), 'defer');
+check('...and defer is not join', sleepVoteVerdict({ ...vote, userActionRunning: true }) === 'join', false);
+// ...but a physical refusal still outranks the deferral: never report "later" for a thing that
+// can never happen.
+check('nether while a user action runs is still a flat no',
+      sleepVoteVerdict({ ...vote, userActionRunning: true, dimension: 'the_nether' }), 'no');
+
+// The successes.
+check('human in bed at night with a bed -> join', sleepVoteVerdict({ ...vote }), 'join');
+// Thunderstorm sleep is legal at any hour, and is exactly when a person wants the skip.
+check('thunder at noon -> join',
+      sleepVoteVerdict({ ...vote, timeOfDay: 6000, thundering: true }), 'join');
 
 if (failures) {
     console.error(`\n${failures} check(s) FAILED`);

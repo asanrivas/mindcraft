@@ -66,6 +66,24 @@ function humanAwakeOnline(bot) {
     return false;
 }
 
+/**
+ * Is a real person currently IN BED? The mirror of `humanAwakeOnline`, and needed for the
+ * opposite reason: vanilla skips the night only when every player sleeps, and this bot counts
+ * as a player, so an awake bot silently holds a person's night hostage.
+ *
+ * Other agents are excluded for the same reason they are there: a bot is not a person, and two
+ * bots each getting into bed because the other did is not a vote, it is a mirror.
+ */
+function anyHumanSleeping(bot) {
+    const players = bot.players ?? {};
+    for (const [name, p] of Object.entries(players)) {
+        if (name === bot.username) continue;
+        if (convoManager.isOtherAgent(name)) continue;   // another bot, not a person
+        if (p?.entity?.isSleeping || p?.entity?.metadata?.isSleeping) return true;
+    }
+    return false;
+}
+
 const modes_list = [
     {
         // First on purpose: nothing else matters if the bot drowns, and drowning is the one
@@ -454,6 +472,51 @@ const modes_list = [
                 return;
             }
             if (!night.isDuskApproaching(t) && !(bot.thunderState > 0)) return;
+
+            // A HUMAN IS IN BED: join the vote.
+            //
+            // Vanilla skips the night only when EVERY player is asleep, and this bot counts as
+            // a player - so an awake bot silently prevents a person from skipping the night,
+            // with nothing in chat to say why. Voting is a different goal from sheltering:
+            // it is worth doing on Peaceful, under a roof, deep underground, and after the
+            // shelter attempts have given up for the night. Every stand-down below correctly
+            // blocks SHELTERING and would wrongly block VOTING, which is the whole reason this
+            // block sits above all of them - and below the dawn dig-out, so a bot sealed in
+            // last night is let out before it is asked to walk anywhere.
+            if (anyHumanSleeping(bot)) {
+                const bedNearby = bot.findBlocks({
+                    matching: (b) => night.isBedName(b.name), maxDistance: 48, count: 1,
+                }).length > 0;
+                const bedItem = night.bedInInventory(bot.inventory.items());
+                const verdict = night.sleepVoteVerdict({
+                    anyHumanSleeping: true, timeOfDay: t, thundering: bot.thunderState > 0,
+                    isSleeping: bot.isSleeping, dimension: bot.game.dimension,
+                    inWater: swim.inWater(bot),
+                    hasBed: bedNearby || !!bedItem,
+                    // A courtesy must not cancel what a person explicitly asked for. Modes are
+                    // exempt from the ownership rule so that DROWNING and SELF_DEFENSE can save
+                    // the bot's life; a sleep vote is not that, and killing a user's marathon
+                    // to be polite about their bedtime is damage this repo has already paid for
+                    // once. Nothing is lost by waiting: a sleeping human stays in bed, so the
+                    // first tick after their action finishes joins the vote anyway.
+                    userActionRunning: agent.actions.isUserOwned(),
+                });
+                if (verdict === 'join') {
+                    // A failed join must not become a metronome - same rule as the shelter
+                    // backoff below. Worst case for a bed-less bot beside a sleeping human is
+                    // one interrupted action per 30s, and only inside the vote window.
+                    this.cooldownUntil = Date.now() + 30000;
+                    execute(this, agent, async () => {
+                        if (!bedNearby && bedItem) await skills.placeNearby(bot, bedItem.name);
+                        const r = await skills.goToBed(bot);
+                        say(agent, r.slept ? `Joining the sleep vote.`
+                                           : `Could not join the sleep: ${r.reason}.`);
+                    }, 3);   // 3 minutes, never -1
+                    return;
+                }
+                // 'defer' or 'no': fall THROUGH to the ordinary chain. Returning here would
+                // silently disable every stand-down below whenever anyone was in bed.
+            }
 
             // Nothing hostile spawns on Peaceful, so a night shelter costs a whole night and
             // buys exactly nothing. This mode interrupts every action in the agent, so on a

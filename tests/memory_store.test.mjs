@@ -7,7 +7,8 @@
  * ("travel west to red bed at -2572,63,5269"), and the overwrite reloaded on every restart.
  * That must now be structurally impossible, not merely discouraged.
  */
-import { MemoryStore, ORIGIN, KIND, recordId, normalizeKey, normalizeValue, isTransientPlaceKey } from '../src/agent/memory_store.js';
+import { MemoryStore, ORIGIN, KIND, recordId, normalizeKey, normalizeValue, isTransientPlaceKey,
+         isTransientPlaceValue, hasAbsoluteCoords, probationSlots, proseTokens } from '../src/agent/memory_store.js';
 
 let failures = 0;
 const check = (label, got, want) => {
@@ -16,7 +17,10 @@ const check = (label, got, want) => {
 
 // Injectable clock: monotonic and deterministic, so ordering assertions never flake.
 let clock = 1000;
-const mk = (opts = {}) => new MemoryStore({ now: () => ++clock, ...opts });
+// The log is injected too, for the same reason: a discard must be announced (see `_discard`), and
+// collecting it here lets the tests ASSERT on what was said instead of scrolling past it.
+let logged = [];
+const mk = (opts = {}) => new MemoryStore({ now: () => ++clock, log: m => logged.push(m), ...opts });
 
 // --- THE REGRESSION -----------------------------------------------------------------------------
 {
@@ -481,6 +485,350 @@ Mine minerals below the base at 3391,62,4890 and deposit them in the 5 chests
     check('the migration calls importLegacyBlob at all', migrateCall !== null, true);
     check('the migration DOES allow goals', /allowGoal:\s*true/.test(migrateCall ?? ''), true);
 }
+
+
+// --- ITEM 1: THE STORE SATURATED AND FROZE ------------------------------------------------------
+// Eviction ranked by `revision` - how often a fact has been independently re-learned - which was
+// the right fix for a bot narrating its stuck loop into memory. But revision is a lifetime total
+// that never decays, so once every incumbent sits at 29-187 (measured on andy: 40 of 40 rows,
+// EVERY kind exactly at cap) a new fact arrives at revision 1, sorts to the front of the victim
+// list, and is deleted on the same call that created it. The bot could no longer learn anything it
+// had not already learned many times, and nothing anywhere said so.
+{
+    // A store saturated exactly the way the live one is: every location slot full, every
+    // incumbent enormously reinforced.
+    const s = mk();
+    for (let i = 0; i < 12; i++) {
+        s.records.set(recordId(KIND.LOCATION, `old${i}`), {
+            id: recordId(KIND.LOCATION, `old${i}`), kind: KIND.LOCATION, key: `old${i}`,
+            value: `${3300 + i},62,${4800 + i}`, origin: ORIGIN.AGENT,
+            created: 1, updated: 100 + i, revision: 30 + i * 5,
+        });
+    }
+    logged = [];
+    const r = s.put({ kind: KIND.LOCATION, key: 'Village well', value: '5120,71,4402', origin: ORIGIN.AGENT });
+
+    check('a new fact into a saturated store is accepted', r.ok, true);
+    check('...and it is STILL THERE afterwards', s.get(KIND.LOCATION, 'Village well')?.value, '5120,71,4402');
+    check('...the section is still at its cap', s.list(KIND.LOCATION).length, 12);
+    // The victim is the stalest incumbent, not the newest arrival.
+    check('...the stalest incumbent made way', s.get(KIND.LOCATION, 'old0'), null);
+    check('...the freshest incumbent did not', s.get(KIND.LOCATION, 'old11') !== null, true);
+
+    // A silent discard is indistinguishable from never having been offered the fact - which is
+    // exactly how this bug stayed invisible for days.
+    check('the discard is announced', logged.some(l => /evicted location "old0"/.test(l)), true);
+    check('...with the revision it had', logged.some(l => /revision 30/.test(l)), true);
+    check('...and the reason', logged.some(l => /least recently reinforced/.test(l)), true);
+    check('...and journalled, so it is answerable later', s.pending.some(e => e.op === 'evict' && e.id === 'location:old0'), true);
+    check('...and readable in-process', s.evicted.some(e => e.key === 'old0'), true);
+}
+{
+    // The point of admitting it is that it can then be REINFORCED. A brand-new fact that keeps
+    // being restated must climb out of probation and become as durable as anything else - if it
+    // cannot, the ratchet is merely delayed by one call.
+    const s = mk();
+    for (let i = 0; i < 12; i++) {
+        s.records.set(recordId(KIND.LOCATION, `old${i}`), {
+            id: recordId(KIND.LOCATION, `old${i}`), kind: KIND.LOCATION, key: `old${i}`,
+            value: `${3300 + i},62,${4800 + i}`, origin: ORIGIN.AGENT,
+            created: 1, updated: 100 + i, revision: 40, });
+    }
+    // Three summarisations, each restating the new place along with everything else. This is the
+    // live path: history.js hands the model's markdown to importLegacyBlob.
+    for (let round = 0; round < 3; round++) {
+        s.importLegacyBlob('## Locations\n'
+            + s.list(KIND.LOCATION).map(r => `- ${r.key}: ${r.value}`).join('\n')
+            + '\n- Village well: 5120,71,4402');
+    }
+    check('a restated new fact accumulates reinforcement', s.get(KIND.LOCATION, 'Village well')?.revision >= 3, true);
+
+    // Ordinary operation - another summarisation, another new place - no longer touches it: it is
+    // out of probation, so a fresh arrival displaces a stale incumbent instead.
+    s.importLegacyBlob('## Locations\n'
+        + s.list(KIND.LOCATION).map(r => `- ${r.key}: ${r.value}`).join('\n')
+        + '\n- Ridge camp: 5300,90,4100');
+    check('...and an ordinary new arrival no longer displaces it', s.get(KIND.LOCATION, 'Village well') !== null, true);
+
+    // It climbs clear of probation on its own.
+    for (let round = 0; round < 8; round++) {
+        s.importLegacyBlob('## Locations\n'
+            + s.list(KIND.LOCATION).map(r => `- ${r.key}: ${r.value}`).join('\n'));
+    }
+    check('...and climbs out of probation entirely', s.get(KIND.LOCATION, 'Village well')?.revision >= 8, true);
+
+    // AND THIS IS HOW IT BECOMES DURABLE. It will not out-reinforce an incumbent at 50 by
+    // counting - both gain +1 per summarisation, so the gap never closes, and pretending
+    // otherwise is what the saturation experiment got wrong. What it CAN do is outlast an
+    // incumbent the summariser has stopped restating, because staleness leads the ordering. That
+    // is not a theoretical route: on bob the four stalest location rows are all dead episode
+    // state and the three genuine places are the freshest.
+    const stale = s.list(KIND.LOCATION).find(r => r.key === 'old5');
+    stale.updated = 1;                       // nobody has restated this for an episode
+    s.put({ kind: KIND.LOCATION, key: 'Ridge camp 2', value: '5301,90,4101', origin: ORIGIN.AGENT });
+    check('...and the STALE incumbent is what makes way, not the newcomer', s.get(KIND.LOCATION, 'old5'), null);
+    check('...the newcomer is untouched', s.get(KIND.LOCATION, 'Village well') !== null, true);
+    check('...and so is the most reinforced row', s.get(KIND.LOCATION, 'old11') !== null, true);
+}
+{
+    // THE OTHER DIRECTION, which matters more: the eviction rule was written to stop a stuck bot
+    // narrating its loop over the durable facts, and opening the door to new facts must not
+    // reopen that. The guarantee is structural rather than statistical: established rows are only
+    // ever trimmed to `cap - probationSlots`, whatever the arrival RATE, because everything
+    // beyond the probation slice evicts other probationers.
+    const s = mk();
+    const durable = [];
+    for (let i = 0; i < 10; i++) {
+        const key = `durable${i}`;
+        durable.push(key);
+        s.records.set(recordId(KIND.LESSON, key), {
+            id: recordId(KIND.LESSON, key), kind: KIND.LESSON, key,
+            value: `durable lesson ${i} about ${'abcdefghij'[i]} which is worth keeping forever`,
+            origin: ORIGIN.AGENT, created: 1, updated: 100 + i, revision: 40 + i,
+        });
+    }
+    // A stuck bot restating eight genuinely different failures, six times over. Distinct enough
+    // not to fold, which is the hostile case - a folding paraphrase only ever costs one slot.
+    const noise = ['bedrock refused every excavation approach attempted underground tonight',
+        'pillar jumping upward from the void chamber produced no vertical gain at all',
+        'the village chest appears permanently full of cobblestone gravel and flint',
+        'torch placement consumed the entire remaining coal reserve within minutes',
+        'boat travel across the northern ocean stalled against an unexpected ice sheet',
+        'furnace smelting queue emptied before any iron ingots had actually appeared',
+        'sand collapsed repeatedly into the desert staircase during every descent',
+        'villager trading window closed instantly on each emerald offer this evening'];
+    for (let round = 0; round < 6; round++) {
+        for (const n of noise) s.put({ kind: KIND.LESSON, key: `n${round}-${n.slice(0, 8)}`, value: `${n} (attempt ${round})`, origin: ORIGIN.AGENT });
+    }
+    const survivors = durable.filter(k => s.get(KIND.LESSON, k));
+    const slots = probationSlots(10, 0);
+    check('narration cannot take more than the probation slice', survivors.length, 10 - slots);
+    check('...and the durable lessons that remain are the reinforced ones',
+        survivors.every(k => s.get(KIND.LESSON, k).revision >= 40), true);
+    check('...while the section is still exactly at cap', s.list(KIND.LESSON).length, 10);
+}
+{
+    // A summarisation is ONE statement of what the bot knows, so the cap is applied to the
+    // finished statement. Evicting per line makes whichever fact the model listed FIRST the
+    // stalest the moment the batch ends, and the new fact appended at the bottom of the same
+    // summary then evicts it - measured on a replay of andy's real store, `Shaft` (revision 75)
+    // and `DANGER` (73) destroyed for being listed first while junk listed last survived.
+    const order = (first) => {
+        const s = mk();
+        for (let i = 0; i < 12; i++) {
+            s.records.set(recordId(KIND.LOCATION, `p${i}`), {
+                id: recordId(KIND.LOCATION, `p${i}`), kind: KIND.LOCATION, key: `p${i}`,
+                value: `${3300 + i},62,${4800 + i}`, origin: ORIGIN.AGENT,
+                created: 1, updated: 100, revision: 50,
+            });
+        }
+        const keys = [...Array(12).keys()].map(i => `p${i}`);
+        const listed = first ? keys : [...keys].reverse();
+        s.importLegacyBlob('## Locations\n'
+            + listed.map(k => `- ${k}: ${3300 + Number(k.slice(1))},62,${4800 + Number(k.slice(1))}`).join('\n')
+            + '\n- New place: 5120,71,4402');
+        return keys.filter(k => s.get(KIND.LOCATION, k));
+    };
+    check('the survivors do not depend on the order the model listed them in',
+        JSON.stringify(order(true)), JSON.stringify(order(false)));
+}
+{
+    // Reinforcement SATURATES rather than decaying with age - see the block comment on
+    // ESTABLISHED_AT. Decay would rank the current bad episode above a hard-won fact, because
+    // narration is by construction the freshest thing in the store. Saturation instead stops an
+    // incumbent's lifetime total from compounding: at the ceiling, 8 and 800 are the same.
+    const s = mk();
+    const row = (key, revision, updated) => s.records.set(recordId(KIND.LESSON, key), {
+        id: recordId(KIND.LESSON, key), kind: KIND.LESSON, key, value: `lesson ${key} kept distinct`,
+        origin: ORIGIN.AGENT, created: 1, updated, revision,
+    });
+    for (let i = 0; i < 8; i++) row(`k${i}`, 500, 300);       // enormous, restated this batch
+    row('ceiling', 9, 300);                                   // just past the ceiling, same batch
+    row('stale', 900, 10);                                    // enormous, but nobody restates it
+    s.put({ kind: KIND.LESSON, key: 'new', value: 'a genuinely new lesson worth remembering here', origin: ORIGIN.AGENT });
+    check('reinforcement past the ceiling buys no protection over staleness', s.get(KIND.LESSON, 'stale'), null);
+    check('...and a row at the ceiling is as safe as one at 500', s.get(KIND.LESSON, 'ceiling') !== null, true);
+}
+
+// --- ITEM 2b: transient VALUES, not just transient keys -----------------------------------------
+// `isTransientPlaceKey` catches junk by NAME. It cannot catch a plausible name carrying an
+// unresolvable body, and andy's live store holds three of those. A place recorded as an offset
+// from a position the bot no longer occupies is unresolvable forever - and worse than useless,
+// because "5 blocks East" reads as actionable.
+//
+// OVER-FILTERING IS THE REAL DANGER HERE, so the must-KEEP list matters more than the must-drop
+// one. Every case below is real, from bots/{andy,bob}/memory_store.json(.journal.jsonl), 2026-08-31.
+{
+    // MUST be filtered - the three the plan names, plus the families the corpus turned up.
+    const mustFilter = [
+        ['5 chests', '`5 blocks East` of current position.'],
+        ['Veins from shaft', 'Cu 2W/2SW+2up; Fe 6W&7SW/3up; Coal 7-8W/SW+7dn.'],
+        ['Copper ore', '~14 blocks W, 12 down'],
+        ['Coal ore', '7-8 blk W/SW of base, 7 down'],
+        ['5 chests', '23 NW'],
+        ['Nearby red_bed', '3W'],
+        ['Furnace', '4 blocks SW'],
+        ['Water hazards', '1 block away, 2 blocks SE, 5 blocks South.'],
+        ['**Ore Found**', 'Coal vein at `12 blocks NW, 11 down` from current position.'],
+        ['asanrivas', 'nearby (exact coords still unknown)'],
+        ['- 8 blocks SE', '- 8 blocks SE'],
+    ];
+    for (const [key, value] of mustFilter) {
+        check(`isTransientPlaceValue filters ${JSON.stringify(value.slice(0, 40))}`,
+            isTransientPlaceValue(key, value), true);
+    }
+
+    // MUST be kept. A false KEEP costs one slot that the probation slice churns anyway; a false
+    // DROP costs the bot a place it can never recover.
+    const mustKeep = [
+        // Relative phrasing AND a real coordinate: the coordinate wins. A hazard call-out is a
+        // fact about a place, and this is the row the truncated evidence made look like junk.
+        ['DANGER', 'Water pockets at `~1 block away` and `2 blocks SE`; Cavity at `3394, 58, 4889`.'],
+        ['Base', '`~(3391, 62, 4890)` — Copper/Iron/Coal accessible.'],
+        ['Desert bed (respawn)', '`(4525, 69, 4881)`.'],
+        ['Shaft', '3392,62,4887 → vert. y45-56 → mine 3393-3399,y42-45,z~4888'],
+        ['Nearby sandy area', '4460–4470, 62, 4680–4690'],       // ranges, not points, but locatable
+        ['Red bed', '-2572,63,5269'],                             // negative coordinates
+        ['Doorway', '3392,62-63,4889 S wall'],                    // " S wall" trips the compass pattern
+        ['Water Pool', '~6 blocks NE (approx 4697–4703 range), depth varies (1–3 down)'],
+        ['desert village@X', '4744,Y:75,Z:4733 — Nearby village.'],
+        ['drop_zone@X', '4536-39, Y: -63 to -61, Z: 4747 — Bedrock breach.'],  // junk by KEY, not by value
+        ['chest@4882,64,4455', 'chest (full, but used for depositing items)'],  // coords in the KEY
+        ['asanrivas@4886.30,62.00,4456.53', 'asanrivas'],                       // decimals, in the key
+        ['Biome', 'Desert'],                                      // no coords, but no offset either
+        ['Block Below', 'Cobblestone.'],
+        ['Storage', '"ores" and "building" chests auto-sorted; Furnace clear.'],
+    ];
+    for (const [key, value] of mustKeep) {
+        check(`isTransientPlaceValue KEEPS ${JSON.stringify(String(key).slice(0, 34))}`,
+            isTransientPlaceValue(key, value), false);
+    }
+
+    check('empty value does not throw and is kept', isTransientPlaceValue('', ''), false);
+    check('non-string input does not throw', isTransientPlaceValue(undefined, undefined), false);
+
+    // The coordinate veto is the whole safety argument, so it is tested on its own.
+    check('a plain triple is coordinates', hasAbsoluteCoords('3391,62,4890'), true);
+    check('an axis-labelled value is coordinates', hasAbsoluteCoords('4744,Y:75,Z:4733'), true);
+    check('a bare y is coordinates', hasAbsoluteCoords('cobble lid @ y62'), true);
+    check('a distance is NOT coordinates', hasAbsoluteCoords('~14 blocks W, 12 down'), false);
+    check('a compass sketch is NOT coordinates', hasAbsoluteCoords('Cu 2W/2SW+2up; Fe 6W&7SW/3up'), false);
+}
+{
+    // End to end through importLegacyBlob, which is what summarisation calls.
+    const s = mk();
+    logged = [];
+    const n = s.importLegacyBlob(`## Locations
+- Base: \`(3391, 62, 4890)\`
+- 5 chests: \`5 blocks East\` of current position.
+- Veins from shaft: Cu 2W/2SW+2up; Fe 6W&7SW/3up; Coal 7-8W/SW+7dn.
+- DANGER: Water pockets at \`~1 block away\` and \`2 blocks SE\`; Cavity at \`3394, 58, 4889\`.`);
+    check('two unresolvable places refused, two real ones kept', n, 2);
+    check('Base kept', s.get(KIND.LOCATION, 'Base') !== null, true);
+    check('DANGER kept - it names a real coordinate', s.get(KIND.LOCATION, 'DANGER') !== null, true);
+    check('the relative "5 chests" is refused', s.get(KIND.LOCATION, '5 chests'), null);
+    check('the relative vein sketch is refused', s.get(KIND.LOCATION, 'Veins from shaft'), null);
+    check('the skips are counted', s.skippedPlaces, 2);
+    check('...and logged', logged.some(l => /dropped 2 transient location row/.test(l)), true);
+}
+{
+    // Refusing the WRITE does not remove the same junk already in the store, and until the
+    // probation slice existed that junk was immortal: `isTransientPlaceKey` shipped days ago, yet
+    // bob still holds `hold_spot@X` at revision 66 because a filtered write can no longer refresh
+    // it and nothing could out-score it.
+    const s = mk();
+    s.records.set(recordId(KIND.LOCATION, 'hold_spot@X'), {
+        id: recordId(KIND.LOCATION, 'hold_spot@X'), kind: KIND.LOCATION, key: 'hold_spot@X',
+        value: '3371, Y: 62, Z: 4845 — Safe zone.', origin: ORIGIN.AGENT,
+        created: 1, updated: 2, revision: 66,
+    });
+    s.importLegacyBlob('## Locations\n- hold_spot@X:3371,Y:62,Z:4845');
+    check('a refused write also prunes the row it would have refreshed', s.get(KIND.LOCATION, 'hold_spot@X'), null);
+    check('...and the prune is counted', s.prunedPlaces, 1);
+}
+{
+    // ...but ONLY when the incumbent fails the same test on its own merits. A summarisation that
+    // writes a relative body must never be able to delete a REAL place that shares its key.
+    const s = mk();
+    s.put({ kind: KIND.LOCATION, key: '5 chests', value: '4574,68,4814', origin: ORIGIN.AGENT });
+    s.importLegacyBlob('## Locations\n- 5 chests: `5 blocks East` of current position.');
+    check('a good row sharing the key is NOT pruned', s.get(KIND.LOCATION, '5 chests')?.value, '4574,68,4814');
+    check('...nothing was pruned', s.prunedPlaces, 0);
+    check('...and the junk write was still refused', s.skippedPlaces, 1);
+}
+{
+    // The filter is Locations only. A lesson describing a relative offset is prose about how the
+    // world works, not a claim to be a place.
+    const s = mk();
+    const n = s.importLegacyBlob('## Lessons\n- Ores sit about 7 blocks W/SW of a shaft, 7 down.');
+    check('a LESSON about relative offsets is untouched', n, 1);
+}
+
+// --- ITEM 3: a real duplicate survived the fold -------------------------------------------------
+// `"Stop immediately when a player says stop."` (revision 37) and `"Stop immediately when player
+// says stop."` (29) both reduce to {immediately, player, say, stop} - FOUR content words - so
+// PROSE_MIN_TOKENS refused to fold them and the same sentence held two of ten lesson slots
+// forever. MIN_TOKENS is NOT lowered: at four tokens a Jaccard of 0.6 means "three of five words
+// agree", which merges unrelated lessons. But a score of exactly 1.0 is not an approximation.
+{
+    const a = 'Stop immediately when a player says stop.';
+    const b = 'Stop immediately when player says stop.';
+    check('the pair really is under the fuzzy guard', proseTokens(a).length < 5, true);
+    check('...and their content words really are identical', proseTokens(a).join(' '), proseTokens(b).join(' '));
+
+    const s = mk();
+    s.put({ kind: KIND.LESSON, key: 'x', value: a, origin: ORIGIN.AGENT });
+    s.put({ kind: KIND.LESSON, key: 'y', value: b, origin: ORIGIN.AGENT });
+    check('the same short sentence twice is ONE row', s.list(KIND.LESSON).length, 1);
+    check('...and it counts as reinforcement, not as a new fact', s.list(KIND.LESSON)[0].revision, 2);
+}
+{
+    // The pair is already in andy's store, where neither write can collapse it: a fold picks one
+    // row, and the problem is a PAIR of incumbents. A restatement now merges them and the
+    // survivor inherits the other's reinforcement, the way scratchpad/compact.mjs folds.
+    const s = mk();
+    for (const [key, value, revision] of [
+        ['a', 'Stop immediately when a player says stop.', 37],
+        ['b', 'Stop immediately when player says stop.', 29]]) {
+        s.records.set(recordId(KIND.LESSON, key), {
+            id: recordId(KIND.LESSON, key), kind: KIND.LESSON, key, value,
+            origin: ORIGIN.AGENT, created: 1, updated: 2, revision,
+        });
+    }
+    logged = [];
+    s.put({ kind: KIND.LESSON, key: 'c', value: 'Stop immediately when player says stop', origin: ORIGIN.AGENT });
+    check('an incumbent duplicate PAIR is collapsed on the next restatement', s.list(KIND.LESSON).length, 1);
+    check('...and reinforcement is summed, not thrown away', s.list(KIND.LESSON)[0].revision, 37 + 29 + 1);
+    check('...and the collapse is announced', logged.some(l => /same sentence as an existing row/.test(l)), true);
+}
+{
+    // THE CONTROL, and it is the half that matters: short sentences that merely share vocabulary
+    // must still NOT merge. These are the false merges PROSE_MIN_TOKENS was written to stop, and
+    // exact-set equality does not let any of them through.
+    const distinct = [
+        // The sharpest case, and the reason the short fold compares SEQUENCES and not sets:
+        // identical content words {water, faster, walking}, opposite meanings.
+        ['Water is faster than walking.', 'Walking is faster than water.'],
+        ['Check the chest before mining.', 'Check the furnace before mining.'],
+        ['Bedrock cannot be broken.', 'Obsidian cannot be broken.'],
+        ['Sand falls when dug.', 'Gravel falls when dug.'],
+        ['Torches stop spawns.', 'Beds stop spawns.'],
+    ];
+    for (const [a, b] of distinct) {
+        const s = mk();
+        s.put({ kind: KIND.LESSON, key: 'a', value: a, origin: ORIGIN.AGENT });
+        s.put({ kind: KIND.LESSON, key: 'b', value: b, origin: ORIGIN.AGENT });
+        check(`distinct short lessons are NOT merged: ${JSON.stringify(a)}`, s.list(KIND.LESSON).length, 2);
+    }
+    // A single shared content word is a topic, not a sentence - one token never folds. ("here"
+    // and "there" are stopwords, so both of these reduce to the single token {sand}, while their
+    // normalised VALUES differ - so nothing but the short fold could merge them, and it must not.)
+    const s = mk();
+    s.put({ kind: KIND.NOTE, key: 'a', value: 'Sand here.', origin: ORIGIN.AGENT });
+    s.put({ kind: KIND.NOTE, key: 'b', value: 'Sand there.', origin: ORIGIN.AGENT });
+    check('one-token rows are left alone', s.list(KIND.NOTE).length, 2);
+}
+
 
 if (failures) {
     console.error(`\n${failures} check(s) FAILED`);

@@ -109,6 +109,31 @@ export function proseTokens(text) {
 }
 
 /**
+ * The same content words as `proseTokens`, but IN THE ORDER WRITTEN.
+ *
+ * `proseTokens` sorts, deliberately - a reordered clause is the same lesson, and at five-plus
+ * words a shared set is overwhelming evidence. At three or four words it is not: "Water is faster
+ * than walking." and "Walking is faster than water." have the identical set {water, faster,
+ * walking} and mean opposite things. Order is the only thing that separates them, so the short
+ * fold below compares sequences.
+ *
+ * Checked against every distinct lesson/note either bot has written (1575 values): requiring the
+ * sequence rather than the set folds the same nine pairs and no others - real duplicates do not
+ * permute their words, they add and drop filler.
+ *
+ * @returns {string[]} content words, de-duplicated, first occurrence order preserved
+ */
+export function proseSequence(text) {
+    const withoutLabel = String(text ?? '').replace(/^\s*\*{0,2}[^:*\n]{1,40}\*{0,2}:\s+/, '');
+    return [...new Set(withoutLabel
+        .toLowerCase()
+        .replace(/[^a-z0-9 ]+/g, ' ')
+        .split(/\s+/)
+        .map(w => w.replace(/s$/, ''))
+        .filter(w => w && (w.length > 1 || /[0-9]/.test(w)) && !PROSE_STOPWORDS.has(w)))];
+}
+
+/**
  * Jaccard overlap of two prose token sets. 1 = the same sentence reworded, 0 = unrelated.
  * @returns {number}
  */
@@ -134,6 +159,79 @@ const PROSE_DUPLICATE_AT = 0.6;
  * of one costs far less than silently merging two distinct lessons.
  */
 const PROSE_MIN_TOKENS = 5;
+
+/**
+ * ...but IDENTITY is not a fuzzy match, and the guard above was refusing both.
+ *
+ * Live on andy: `"Stop immediately when a player says stop."` (revision 37) and
+ * `"Stop immediately when player says stop."` (revision 29) sat as two rows, permanently, in a
+ * section that only renders 10. Both reduce to the token set {immediately, player, say, stop} -
+ * FOUR words, so `PROSE_MIN_TOKENS` blocked the fold and the same sentence occupied two of the
+ * ten slots forever.
+ *
+ * The guard is right about what it was written for. At 4 tokens a Jaccard of 0.6 means "3 of 5
+ * words agree", which merges unrelated short lessons - the tests that caught that are real and
+ * the threshold is untouched. But a score of exactly 1.0 is not an approximation: the two
+ * sentences contain the *same content words*. Nothing is being guessed, so the length of the
+ * sentence does not change the confidence.
+ *
+ * Measured over every distinct lesson/note either bot has ever written (1575 values,
+ * `bots/{andy,bob}/memory_store.json.journal.jsonl`): exact-set folding below MIN_TOKENS merges
+ * NINE pairs and every one is a genuine duplicate - the two "says stop" spellings, the same
+ * sentence with and without a trailing full stop, one with a `**Player commands**:` label, and
+ * "`goToSurface` is recovery (Y:64)" vs "for recovery". Zero false merges.
+ *
+ * Two tokens is the floor: a single shared content word is a topic, not a sentence.
+ */
+const PROSE_EXACT_MIN_TOKENS = 2;
+
+/**
+ * Reinforcement, and the ratchet it caused.
+ *
+ * `_evict` ranks by `revision` - how many times a fact has been independently re-learned - and
+ * that was the correct fix for a bot narrating its stuck loop into memory. But revision is a
+ * LIFETIME TOTAL that never decays, so once every incumbent is at 29-83 (measured on andy: 40
+ * of 40 rows, every kind exactly at cap, revisions 29..187) a genuinely new fact arrives at
+ * revision 1, sorts to the front of the victim list, and is evicted on the same call that
+ * created it. The bot could no longer learn anything it had not already learned many times, and
+ * nothing said so.
+ *
+ * WHY NOT DECAY REINFORCEMENT WITH AGE. It is the obvious fix and it is the wrong one here.
+ * Narration is, by construction, the most recently and most frequently restated content in the
+ * store - a stuck bot rewrites its loop on *every* summarisation. Any score that fades with
+ * time-since-last-restatement therefore systematically favours the current bad episode over a
+ * hard-won fact the bot has not had occasion to repeat this hour. That is precisely the recency
+ * eviction this file replaced.
+ *
+ * THE FIX IS NOT A NEW SCORE, IT IS RESERVED CAPACITY. A brand-new row cannot be reinforced if it
+ * is deleted before it has the chance, so a slice of each kind's cap is reserved for rows that
+ * have not yet reached `ESTABLISHED_AT`. Ranking is otherwise unchanged, and the arithmetic gives
+ * a bound that does not depend on the arrival RATE: with E established rows and P probationers,
+ * `over = E + P - cap` and probation absorbs `P - slots` of it, so established rows lose
+ * `max(0, E + slots - cap)` however many probationers turn up. Established shrinks to
+ * `cap - slots` and stops. Consequences, both intended:
+ *   - a new fact is admitted at the expense of the weakest established row and gets a real window
+ *     to be restated in, ranked above later arrivals as soon as it is restated once;
+ *   - a burst of non-folding paraphrases takes at most `probationSlots` of the cap, permanently.
+ *     Beyond that the variants evict EACH OTHER. That is the bound the original bug needed:
+ *     narration costs 3 of 10 lesson slots, not 10 of 10.
+ *
+ * The threshold is also where reinforcement stops mattering for admission - a row at
+ * `ESTABLISHED_AT` is in, and there is deliberately no band between "proved itself" and "safe".
+ * An earlier revision of this fix graduated rows at 3 while treating 8 as full protection, and
+ * the gap was a death zone: a graduate was the weakest established row from the moment it
+ * arrived, so it was evicted at revision 3 every time and the ratchet simply moved one step
+ * later. One threshold, no gap.
+ */
+const ESTABLISHED_AT = 8;
+const PROBATION_FRACTION = 0.3;
+const PROBATION_MIN = 2;
+
+/** How many below-threshold rows a kind may hold before they start evicting one another. */
+export function probationSlots(cap, userRows = 0) {
+    return Math.min(Math.max(PROBATION_MIN, Math.ceil(cap * PROBATION_FRACTION)),
+                    Math.max(0, cap - userRows));
+}
 
 /**
  * Collapse a key to its identity, so re-summarising updates a fact instead of duplicating it.
@@ -222,6 +320,79 @@ const TRANSIENT_PLACE_PATTERNS = [
     /^hold\s?spot/,                              // "hold_spot"
 ];
 
+/**
+ * Does this text pin a point in the world, at all?
+ *
+ * Deliberately GENEROUS, because it is used as a veto: anything it calls a coordinate is kept as
+ * a place. A false "yes" costs one slot; a false "no" can delete the bot's memory of where its
+ * base is. Two signals, either sufficient:
+ *   - an axis-labelled number, which is what the `saving_memory` template emits
+ *     (`4744,Y:75,Z:4733`, `x3391-3395`, `y42-48`);
+ *   - two or more runs of three-plus digits, which on this world is an X and a Z
+ *     (`3391,62,4890`, `-2572,63,5269`, `4460-4470, 62, 4680-4690`, `4886.30,62.00,4456.53`).
+ * No relative offset in the real corpus carries either: distances are one and two digit numbers.
+ */
+export function hasAbsoluteCoords(text) {
+    const s = String(text ?? '');
+    if (/\b[xyz]\s*[:=]?\s*~?-?\d/i.test(s)) return true;
+    return (s.match(/\d{3,}/g) || []).length >= 2;
+}
+
+/**
+ * Phrasing that describes a position only in relation to wherever the bot happened to be.
+ * "5 blocks East", "23 NW", "2W/2SW+2up", "12 down", "of current position", "coords unknown".
+ */
+const RELATIVE_VALUE_PATTERNS = [
+    /\b\d+\s*(?:[-–—]\s*\d+\s*)?(?:blocks?|blk)\b/i,   // "5 blocks East", "7-8 blk W/SW"
+    /\b\d+\s*(?:[-–—]\s*\d+)?\s*(?:N|S|E|W|NE|NW|SE|SW)\b/,  // "23 NW", "3W", "2W/2SW", "8 SE"
+    /\b\d+\s*(?:up|down|dn)\b/i,                                  // "12 down", "7dn", "+2up"
+    /\b(?:of|from)\s+(?:the\s+)?current\b/i,                      // "of current position"
+    /\bco-?ord(?:inate)?s?\b[^.;]{0,24}\bunknown\b/i,             // "exact coords unknown"
+];
+
+/**
+ * Transient episode state minted as a Location - the VALUE half.
+ *
+ * `isTransientPlaceKey` catches junk by NAME (`current@X`, `nav_failures@X`). It cannot catch a
+ * plausible name carrying an unresolvable body, and andy's live store holds three of those:
+ *
+ *     5 chests        `5 blocks East` of current position.
+ *     Veins from shaft  Cu 2W/2SW+2up; Fe 6W&7SW/3up; Coal 7-8W/SW+7dn.
+ *     Copper ore      ~14 blocks W, 12 down
+ *
+ * A place recorded as an offset from a position the bot no longer occupies is unresolvable
+ * forever - and worse than useless, because "5 blocks East" reads as actionable and sends the
+ * bot east from wherever it now is. The summariser mints these constantly: 93 distinct such
+ * values across 158 writes in the two real journals.
+ *
+ * THE VETO COMES FIRST, and it is the whole safety argument. Over-filtering - deleting the bot's
+ * genuine place memory - is far worse than tolerating junk, so a row is dropped only when it
+ * carries NO absolute coordinate ANYWHERE (key or value; `chest@4882,64,4455` puts them in the
+ * key) *and* it reads as a relative offset. Validated against every location either bot has ever
+ * written (947 distinct key/value pairs, `bots/{andy,bob}/*.journal.jsonl`, 2026-08-31): 93
+ * dropped, all relative, none with a coordinate.
+ *
+ * Must-KEEP cases this deliberately does NOT touch, all real:
+ *   - `DANGER: Water pockets at ~1 block away and 2 blocks SE; Cavity at 3394, 58, 4889.` -
+ *     relative phrasing AND a real coordinate. The coordinate wins; a hazard call-out is a fact
+ *     about a place.
+ *   - `Nearby sandy area: 4460-4470, 62, 4680-4690`, `Water Pool: ~6 blocks NE (approx
+ *     4697-4703 range)` - ranges, not points, but locatable.
+ *   - `Doorway: 3392,62-63,4889 S wall` - a trailing " S wall" that the compass pattern matches;
+ *     the coordinate veto keeps it.
+ *   - `chest@4882,64,4455: chest (full, but used for depositing items)` and
+ *     `asanrivas@4886.30,62.00,4456.53` - coordinates live in the KEY, so key and value are
+ *     tested together.
+ *   - `Biome: Desert`, `Block Below: Cobblestone.`, `Inventory: ...` - no coordinate and no
+ *     relative offset either. Junk, but not *this* junk; 39 such rows are tolerated on purpose
+ *     rather than widened into. The probation slice in `_evict` churns them out on its own.
+ */
+export function isTransientPlaceValue(key, value) {
+    const combined = `${key ?? ''} ${value ?? ''}`;
+    if (hasAbsoluteCoords(combined)) return false;
+    return RELATIVE_VALUE_PATTERNS.some(re => re.test(combined));
+}
+
 export function isTransientPlaceKey(key) {
     let s = String(key ?? '').toLowerCase().trim();
     if (!s) return false;
@@ -236,15 +407,20 @@ export class MemoryStore {
      * @param {object} [opts]
      * @param {() => number} [opts.now]        injectable clock, so tests do not depend on time
      * @param {number} [opts.maxRecords=200]   hard cap; oldest agent-origin rows evict first
+     * @param {(msg:string)=>void} [opts.log]  injectable, like the clock - tests collect instead
+     *                                         of printing, and can then ASSERT on what was said.
      */
     constructor(opts = {}) {
         this.now = opts.now || (() => Date.now());
+        this.log = opts.log || (msg => console.log(msg));
         this.maxRecords = opts.maxRecords ?? 200;
         /** @type {Map<string, object>} primary index: "kind:key" -> record */
         this.records = new Map();
         /** @type {object[]} pending journal entries, flushed by the file layer */
         this.pending = [];
         this.rejections = 0;
+        /** @type {object[]} every row eviction has taken, so a discard is never silent */
+        this.evicted = [];
     }
 
     /**
@@ -276,9 +452,9 @@ export class MemoryStore {
             // A lesson survives rewording, so exact-match folding never catches it. Compare
             // content-word SETS and treat a close enough match as the same lesson - otherwise
             // every summarisation mints one more spelling of a fact already recorded.
-            if (!folded && PROSE_KINDS.has(kind)) {
+            if (PROSE_KINDS.has(kind)) {
                 const tokens = proseTokens(value);
-                if (tokens.length >= PROSE_MIN_TOKENS) {
+                if (!folded && tokens.length >= PROSE_MIN_TOKENS) {
                     let best = null, bestScore = 0;
                     for (const r of this.records.values()) {
                         if (r.kind !== kind) continue;
@@ -288,6 +464,37 @@ export class MemoryStore {
                         if (score > bestScore) { best = r; bestScore = score; }
                     }
                     if (best && bestScore >= PROSE_DUPLICATE_AT) k = best.key;
+                } else if (tokens.length >= PROSE_EXACT_MIN_TOKENS && tokens.length < PROSE_MIN_TOKENS) {
+                    // Runs even when the key/value fold already matched: that fold picks ONE row,
+                    // and the thing being fixed here is a PAIR of incumbents. Short-circuiting on
+                    // it is why andy's two "says stop" rows survived every restatement.
+                    // Too short to guess at, but identity is not a guess: the same content words
+                    // in a different order or with different filler IS the same sentence. See
+                    // PROSE_EXACT_MIN_TOKENS - measured over 1575 real values, 9 folds, 0 wrong.
+                    const seq = proseSequence(value).join(' ');
+                    const same = [];
+                    for (const r of this.records.values()) {
+                        if (r.kind !== kind) continue;
+                        if (proseSequence(r.value).join(' ') === seq) same.push(r);
+                    }
+                    if (same.length) {
+                        // Rows the guard let in BEFORE this existed are still sitting there in
+                        // pairs - andy holds "...when a player says stop." at revision 37 beside
+                        // "...when player says stop." at 29, and neither can evict the other. A
+                        // write proves they are one sentence, so collapse them: the
+                        // best-reinforced survives and inherits the others' reinforcement, the
+                        // way `scratchpad/compact.mjs` folds. Safe ONLY on this branch - every
+                        // member has an identical token set, so they are mutually identical.
+                        // Fuzzy matches are not: A~C and B~C does not make A~B.
+                        same.sort((a, b) => (b.revision - a.revision) || (b.updated - a.updated)
+                            || (a.key < b.key ? -1 : 1));
+                        const survivor = same[0];
+                        for (const dup of same.slice(1)) {
+                            survivor.revision += dup.revision;
+                            this._discard(dup, 'same sentence as an existing row');
+                        }
+                        k = survivor.key;
+                    }
                 }
             }
         }
@@ -309,7 +516,7 @@ export class MemoryStore {
         };
         this.records.set(id, record);
         this._journal({ op: 'put', at: t, id, origin, value: record.value });
-        this._evict();
+        if (!this._batched) this._evict();
         return { ok: true, record };
     }
 
@@ -362,14 +569,16 @@ export class MemoryStore {
      * re-summarising is safe by construction rather than by the model's good behaviour.
      */
     replaceAgentRecords(kind, values) {
-        for (const r of this.list(kind)) {
-            if (r.origin === ORIGIN.AGENT) this.records.delete(r.id);
-        }
-        let n = 0;
-        for (const [key, value] of values) {
-            if (this.put({ kind, key, value, origin: ORIGIN.AGENT }).ok) n++;
-        }
-        return n;
+        return this._batch(() => {
+            for (const r of this.list(kind)) {
+                if (r.origin === ORIGIN.AGENT) this.records.delete(r.id);
+            }
+            let n = 0;
+            for (const [key, value] of values) {
+                if (this.put({ kind, key, value, origin: ORIGIN.AGENT }).ok) n++;
+            }
+            return n;
+        });
     }
 
     /**
@@ -443,9 +652,14 @@ export class MemoryStore {
      */
     importLegacyBlob(text, { allowGoal = false } = {}) {
         if (typeof text !== 'string' || !text.trim()) return 0;
+        return this._batch(() => this._importLegacyBlob(text, { allowGoal }));
+    }
+
+    _importLegacyBlob(text, { allowGoal }) {
         let imported = 0;
         this.skippedGoals = 0;
         this.skippedPlaces = 0;
+        this.prunedPlaces = 0;
         const sections = text.split(/^##\s+/m).filter(s => s.trim());
         const byHeading = Object.fromEntries(Object.entries(HEADINGS).map(([k, v]) => [v.toLowerCase(), k]));
 
@@ -481,8 +695,10 @@ export class MemoryStore {
                     // "Parched:: Parched:" came from a value that just restates its own key.
                     if (normalizeValue(value) === normalizeKey(key)) value = clean;
                 }
-                if (kind === KIND.LOCATION && isTransientPlaceKey(key)) {
+                if (kind === KIND.LOCATION
+                    && (isTransientPlaceKey(key) || isTransientPlaceValue(key, value))) {
                     this.skippedPlaces++;
+                    this.prunedPlaces += this._pruneTransientPlace(key);
                     continue;
                 }
                 if (this.put({ kind, key, value, origin: ORIGIN.AGENT }).ok) imported++;
@@ -492,11 +708,63 @@ export class MemoryStore {
         // silent". Logged here, not in history.js, because this filter is entirely internal
         // to importLegacyBlob and its evidence.
         if (this.skippedPlaces > 0) {
-            console.log(`[MemoryStore] dropped ${this.skippedPlaces} transient location row(s) `
+            this.log(`[MemoryStore] dropped ${this.skippedPlaces} transient location row(s) `
                 + `the summariser tried to store as places (current position / nav targets / `
-                + `teleport bookkeeping - already live in STATS, not a durable place).`);
+                + `teleport bookkeeping, or an offset from a position the bot has left - already `
+                + `live in STATS, not a durable place)`
+                + (this.prunedPlaces ? `; pruned ${this.prunedPlaces} already in the store.` : '.'));
         }
         return imported;
+    }
+
+    /**
+     * Refusing a write does not remove the same junk already sitting in the store, and until the
+     * saturation fix that junk was IMMORTAL: `isTransientPlaceKey` shipped, yet bob still holds
+     * `hold_spot@X` at revision 66 and `current@X` at 65, because a filtered write can no longer
+     * refresh them and nothing else could out-score them.
+     *
+     * So a refused write also prunes the row it would have refreshed - but ONLY if that row fails
+     * the same test on its own merits. The re-check is the safety: a summarisation that writes
+     * `5 chests: 5 blocks East of current position` must not be allowed to delete a stored
+     * `5 chests: 4574,68,4814`, which is a real place that happens to share a key.
+     *
+     * @returns {number} rows pruned
+     */
+    _pruneTransientPlace(key) {
+        const nk = normalizeKey(key);
+        let pruned = 0;
+        for (const r of [...this.records.values()]) {
+            if (r.kind !== KIND.LOCATION || r.origin !== ORIGIN.AGENT) continue;
+            if (normalizeKey(r.key) !== nk) continue;
+            if (!isTransientPlaceKey(r.key) && !isTransientPlaceValue(r.key, r.value)) continue;
+            this._discard(r, 'transient place, superseded by a filtered write');
+            pruned++;
+        }
+        return pruned;
+    }
+
+    /**
+     * Run `fn` as ONE write, capping the store against the finished statement rather than against
+     * each line as it lands.
+     *
+     * A summarisation restates everything the bot still knows and then adds what it just learned,
+     * so evicting per-row makes the row the summariser happens to list FIRST the stalest the
+     * moment the batch ends - and the new fact appended at the bottom of the same summary then
+     * evicts it. Measured on a replay of andy's real store: 15 summarisations, one new place each,
+     * and `Shaft` (revision 75) and `DANGER` (73) were destroyed purely for being listed first,
+     * while `5 chests: 5 blocks East of current position` survived for being listed late.
+     * Nothing about that is a judgement of the facts.
+     */
+    _batch(fn) {
+        this._batched = true;
+        // ONE timestamp for the whole statement. Without this the eviction order inside a
+        // summarisation is just the order the model happened to list its facts in, and the
+        // saturation replay showed exactly that: `Shaft` (revision 75) and `DANGER` (73) died for
+        // being written first while junk written last survived. Every fact restated in a
+        // summarisation is equally fresh, because it was restated in that summarisation.
+        const real = this.now, stamp = this.now();
+        this.now = () => stamp;
+        try { return fn(); } finally { this.now = real; this._batched = false; this._evict(); }
     }
 
     _reject(reason) {
@@ -519,26 +787,77 @@ export class MemoryStore {
      */
     _evict() {
         for (const [kind, cap] of Object.entries(KIND_CAPS)) {
-            const rows = [...this.records.values()]
-                .filter(r => r.kind === kind && r.origin === ORIGIN.AGENT)
-                // Least-REINFORCED first, then oldest. Recency alone hands the section to
-                // whatever the bot is currently looping on: a stuck bot narrates its loop every
-                // summarisation, so the newest rows are all one bad episode - including things
-                // that are simply false ("Successfully broke bedrock at Y:-62"). A lesson the
-                // summariser has restated across separate episodes has been folded onto that
-                // many times, so `revision` counts how often it was independently re-learned.
+            const mine = [...this.records.values()].filter(r => r.kind === kind);
+            let over = mine.length - cap;
+            if (over <= 0) continue;
+
+            const agentRows = mine.filter(r => r.origin === ORIGIN.AGENT);
+            const slots = probationSlots(cap, mine.length - agentRows.length);
+
+            // Below the threshold a row has not yet proved itself, so it is ranked on what
+            // evidence it does have (least-reinforced, then oldest - a row that has sat through
+            // several summarisations without being restated has been offered and refused).
+            const probation = agentRows.filter(r => r.revision < ESTABLISHED_AT)
                 .sort((a, b) => (a.revision - b.revision) || (a.updated - b.updated));
-            const userRows = [...this.records.values()].filter(r => r.kind === kind && r.origin !== ORIGIN.AGENT).length;
-            let over = rows.length + userRows - cap;
-            while (over-- > 0 && rows.length) this.records.delete(rows.shift().id);
+
+            // At or above it, the ORIGINAL ordering applies - but with the two keys swapped, so
+            // STALENESS leads and reinforcement only breaks the tie.
+            //
+            // Staleness leads because it is the signal the real stores actually carry. On bob the
+            // stalest location rows are `previous_drop_zone@X` (19h), `nav_failures@X` (18h) and
+            // `target@X` (9h) - all dead episode state - while the genuine `chest@X`,
+            // `iron_ore@X` and `desert village@X` are the freshest. On andy the two stalest of
+            // twelve are `Target dry spot` (11.7h) and `Current`, and the seven durable facts
+            // were all restated in the last batch. Leading with lifetime reinforcement instead
+            // would have kept `current@X` (65) and `hold_spot@X` (66) over `chest@X` (24) -
+            // exactly backwards.
+            //
+            // Reinforcement breaks the tie because eviction takes the MINIMUM, and that is what
+            // lets a new fact climb without ever endangering a durable one: a fresh graduate
+            // enters at ESTABLISHED_AT, below every incumbent, so `Base` at revision 160 is never
+            // the victim - while the graduate only has to out-rank the NEXT graduate, not `Base`,
+            // to survive and keep climbing.
+            const established = agentRows.filter(r => r.revision >= ESTABLISHED_AT)
+                .sort((a, b) => (a.updated - b.updated) || (a.revision - b.revision));
+
+            // 1. Probationers beyond their reserved slice evict each other. This is the bound on
+            //    narration: a burst of non-folding paraphrases churns inside the slice and can
+            //    never reach an established row.
+            let excess = probation.length - slots;
+            while (over > 0 && excess > 0 && probation.length) {
+                this._discard(probation.shift(), 'probation slice full'); over--; excess--;
+            }
+            // 2. Otherwise the new fact is admitted at the expense of the stalest established
+            //    row. This is what unfreezes a saturated store.
+            while (over > 0 && established.length) {
+                this._discard(established.shift(), 'least recently reinforced'); over--;
+            }
+            // 3. Nothing established left to trim - fall back inside the slice.
+            while (over > 0 && probation.length) {
+                this._discard(probation.shift(), 'over cap, none established'); over--;
+            }
         }
         if (this.records.size <= this.maxRecords) return;
         const agentRows = [...this.records.values()]
             .filter(r => r.origin === ORIGIN.AGENT)
             .sort((a, b) => a.updated - b.updated);
         while (this.records.size > this.maxRecords && agentRows.length) {
-            this.records.delete(agentRows.shift().id);
+            this._discard(agentRows.shift(), 'global record cap');
         }
+    }
+
+    /**
+     * Drop a row, and SAY SO. A silent discard is indistinguishable from never having been
+     * offered the fact - which is exactly how the saturation bug stayed invisible while the store
+     * quietly refused everything new for days. Journalled too, so "when did we lose that" is
+     * answerable after the fact, the same reason `put` and `delete` are.
+     */
+    _discard(record, reason) {
+        this.records.delete(record.id);
+        this.evicted.push({ ...record, reason });
+        this._journal({ op: 'evict', at: this.now(), id: record.id, reason, revision: record.revision });
+        this.log(`[MemoryStore] evicted ${record.kind} "${record.key}" (revision ${record.revision}, `
+            + `${reason}): ${record.value.slice(0, 60)}`);
     }
 }
 

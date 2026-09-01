@@ -4,6 +4,7 @@ import * as nav from './nav.js';
 import { pillarUp } from './skills.js';
 import * as blockIO from './block_io.js';
 import * as buildGuard from './build_guard.js';
+import * as flight from './flight.js';
 import fs from 'fs';
 
 /**
@@ -80,6 +81,10 @@ export function pottedPlantItem(blockName) {
 function itemNameFor(blockName) {
     // The pot goes down first; pottedPlantItem() supplies what is then used on it.
     if (blockName.startsWith('potted_')) return 'flower_pot';
+    // Planted crops are placed from their SEED/fruit item, which is named differently from the
+    // block. Same class as the potted plants: 13 of these in survival_base.json, each failing as
+    // "no item sweet_berry_bush" because no such item exists.
+    if (blockName === 'sweet_berry_bush') return 'sweet_berries';
     return blockName
         .replace(/_wall_hanging_sign$/, '_hanging_sign')
         .replace(/_wall_sign$/, '_sign')
@@ -185,9 +190,20 @@ export function offSite(pos, box, leash = SITE_LEASH) {
     return Math.hypot(dx, dz) > leash;
 }
 
-async function goNear(bot, P, reach = 3.0, ctx = null) {
+async function goNear(bot, P, reach = 3.0, ctx = null, faceVec = null) {
     const eyeDist = () => bot.entity.position.offset(0, 1.62, 0).distanceTo(P.offset(0.5, 0.5, 0.5));
     if (eyeDist() <= reach + 1.2) return true;
+    // FLY FIRST when we can. It costs nothing, changes no terrain, and reaches the work
+    // directly - where the walking path has to pillar a dirt column and dig it back out, which
+    // is where the original run lost 3,138 of 3,648 blocks. Re-measured 2026-08-31: 0 forcedMove
+    // corrections and 4/4 placements from the air (tools/fly_probe.mjs), against the stale note
+    // that said flight was rejected outright. The walking path below stays as the fallback, and
+    // is the ONLY path in survival.
+    // Remember where we were: whether the bot MOVED during a failed flight is the difference
+    // between two situations that look identical in the log.
+    const beforeFlight = bot.entity.position.clone();
+    if (ctx?.flying && await flight.flyNear(bot, P, reach, { faceVec })) return true;
+    const flewAtAll = bot.entity.position.distanceTo(beforeFlight);
     // Reel the bot back to the site BEFORE asking for another leg. Without this the recentring
     // walks compound: each failed leg leaves it further out, and it never returns on its own.
     if (ctx?.box && offSite(bot.entity.position, ctx.box)) {
@@ -195,6 +211,39 @@ async function goNear(bot, P, reach = 3.0, ctx = null) {
         console.log(`[builder] leash: ${bot.entity.position.floored()} is outside the site - walking back`);
         await nav.navigateTo(bot, { x: ctx.box.centreX, y: P.y, z: ctx.box.centreZ },
             { arriveDist: 4, arriveY: 6, maxReplans: 4 });
+    }
+    // DO NOT WALK WHEN FLIGHT HAS ALREADY FAILED - unless flight could not move us AT ALL.
+    //
+    // Normally, if flight (which searches a 7x5x7 neighbourhood) cannot put the eye in range,
+    // the ground navigator cannot help either; it just spends a leg timeout recentring inside a
+    // room it is already in. Measured at ten minutes for four blocks, and the single biggest
+    // cost in the run. So a free-but-unreachable cell fails fast and the retry pass gets it.
+    //
+    // But flight removes gravity, NOT collision. A bot WEDGED in the structure cannot fly out
+    // either - every leg collision-resolves straight back, which reads as `flew short by 12.2,
+    // eye 12.5` over and over while the bot sits at one position to twelve decimal places. That
+    // is what a person watching sees as "he's stuck again", and skipping the walk here removed
+    // the only escape there is: the stall ladder's dig, and `build_guard`'s relent valve, live
+    // on the walking path. Zero movement is therefore the one case that MUST still walk.
+    if (ctx?.flying && flewAtAll > 0.5) return false;
+    // WEDGED: the flight could not move the body at all. Do not simply give up and leave the bot
+    // where it is - that is how wedged states ACCUMULATE, because the next cell starts from
+    // inside the same wall and fails the same way. Measured twice tonight: bob motionless to
+    // twelve decimal places at y=75 and again at y=85, both times inside its own structure, with
+    // the walking ladder logging `pinned ... recentring` hundreds of times and `digAhead: build`
+    // refusing (correctly) to demolish the build to free it.
+    // Flying to open sky above the footprint always works, because the one thing reliably clear
+    // around an unfinished building is the air above it - and it resets the bot to a position
+    // every later cell can be reached from.
+    if (ctx?.flying && ctx.box?.topY) {
+        // Get the body free BEFORE asking for a long leg: a direct flight out of a pocket is
+        // blocked by the same wall that wedged us, so the station hop would fail too.
+        await flight.freeSelf(bot);
+        const rescued = await flight.flyTo(bot,
+            { x: ctx.box.centreX + 0.5, y: ctx.box.topY, z: ctx.box.centreZ + 0.5 },
+            { timeoutMs: 5000, noDetour: true });
+        console.log(`[builder] wedged - returned to station above the build (${rescued.toFixed(1)} short)`);
+        return false;
     }
     await nav.navigateTo(bot, { x: P.x, y: P.y, z: P.z },
         { arriveDist: reach, arriveY: 3, maxReplans: 3 });
@@ -294,25 +343,74 @@ async function waitForBlock(bot, P, ms = 8000) {
 // CLAUDE.md creative notes - it once bricked all 37 slots). Observed live as a mid-run
 // cliff: ~80% success until one interrupted equip, then every "no item X" after.
 // Slots 36-43 rotate; 44 is reserved for scaffold dirt.
-let equipSlot = 36;
+// Slots we may stage a build material in. The hotbar first (36-43) because that is where a
+// write is cheapest to observe, then the main inventory (10-35) - which is fair game because
+// `equip` follows every write with `bot.equip(item, 'hand')`, so the staging slot never has to
+// be a hotbar slot. 26 extra slots is the difference between a bricked hotbar ending the run
+// and it costing eight retries. Reserved and excluded: 9 (scaffolding), 44 (scaffold dirt).
+const SLOT_POOL = [
+    36, 37, 38, 39, 40, 41, 42, 43,
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+    23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
+];
+let slotIndex = 0;
+let equipSlot = SLOT_POOL[0];
+// Slots whose writes have stopped landing. mineflayer leaks a per-slot busy flag on an
+// overlapped or cancelled `setInventorySlot`, and a bricked slot NEVER recovers for the life of
+// the process - so rotating back onto one is guaranteed to fail again. Measured 2026-08-31 as
+// the documented mid-run cliff: `no item stripped_dark_oak_wood` went 12 -> 59 between two
+// checkpoints, cycling through slots 37, 38, 40, 41, 42, 43 and failing on every one.
+const deadSlots = new Set();
+// Serialise every creative slot write. Two overlapping writes are exactly what bricks a slot,
+// and `equip` is now reached from three places (placeOne, plantIntoPot, restoreBroken).
+let writeChain = Promise.resolve();
+function serialise(fn) {
+    const next = writeChain.then(fn, fn);
+    writeChain = next.then(() => {}, () => {});
+    return next;
+}
+function nextSlot() {
+    for (let i = 0; i < SLOT_POOL.length; i++) {
+        slotIndex = (slotIndex + 1) % SLOT_POOL.length;
+        equipSlot = SLOT_POOL[slotIndex];
+        if (!deadSlots.has(equipSlot)) return equipSlot;
+    }
+    return null;   // every staging slot is bricked
+}
+
 async function equip(bot, itemName) {
     if (bot.heldItem?.name === itemName) return true;
     let item = bot.inventory.findInventoryItem(itemName);
     for (let attempt = 0; attempt < 4 && !item; attempt++) {
+        if (deadSlots.has(equipSlot) && nextSlot() === null) {
+            console.log(`[builder] equip: all ${SLOT_POOL.length} staging slots are bricked - cannot equip anything`);
+            return false;
+        }
+        const slot = equipSlot;
         try {
-            await bot.creative.setInventorySlot(equipSlot, mc.makeItem(itemName, 1));
+            await serialise(() => bot.creative.setInventorySlot(slot, mc.makeItem(itemName, 1)));
         } catch (e) {
             if (/cancelled|again/i.test(e.message)) {
                 await new Promise(r => setTimeout(r, 400));
-                if (attempt >= 1) equipSlot = 36 + ((equipSlot - 36 + 1) % 8); // slot may be bricked - move on
+                if (attempt >= 1) { deadSlots.add(slot); nextSlot(); }
                 continue;
             }
             console.log(`[builder] equip ${itemName} failed: ${e.message}`);
             return false;
         }
-        item = bot.inventory.findInventoryItem(itemName);
+        // POLL, do not sample once. The write is acknowledged before the inventory copy is
+        // updated, so an immediate read reports "never appeared" for an item that arrives a tick
+        // later - the same mistake the placement path made with the block_place ack.
+        const deadline = Date.now() + 400;
+        while (Date.now() < deadline && !item) {
+            item = bot.inventory.findInventoryItem(itemName);
+            if (item) break;
+            await new Promise(r => setTimeout(r, 20));
+        }
+        // A slot that accepted a write and produced nothing is bricked, whatever it claimed.
+        if (!item) { deadSlots.add(slot); nextSlot(); }
     }
-    if (!item) { console.log(`[builder] equip ${itemName}: item never appeared (slot ${equipSlot})`); return false; }
+    if (!item) { console.log(`[builder] equip ${itemName}: item never appeared (${deadSlots.size} slot(s) now dead)`); return false; }
     try {
         // real equip so the SERVER's held-item state is synced - a raw hotbar write can
         // leave the server seeing an empty hand
@@ -395,6 +493,26 @@ function chooseFaces(bot, P, p) {
     return out;
 }
 
+
+/**
+ * Put back a block we removed for a placement that then failed.
+ *
+ * Best effort and deliberately quiet: this is the SECOND line of defence, behind checking
+ * feasibility before digging at all. It exists because the server can still refuse a placement
+ * we had every reason to expect to work, and an open cell at foundation depth beside water is
+ * how one refused placement turned into a flooded build.
+ */
+async function restoreBroken(bot, P, broke, choice) {
+    if (!broke || !choice) return;
+    const now = bot.blockAt(P);
+    if (now && now.name !== 'air' && now.name !== 'cave_air') return;   // something is there already
+    try {
+        if (!(await equip(bot, itemNameFor(broke)))) return;
+        const r = await blockIO.placeVerified(bot, choice.ref, choice.faceVec, { expectName: broke });
+        console.log(`[builder] restored ${broke} at (${P.x}, ${P.y}, ${P.z}): ${r.ok ? 'ok' : r.why}`);
+    } catch (e) { /* the hole stands; the feasibility check is what must stop this happening */ }
+}
+
 async function placeOne(bot, P, p, ctx = null) {
     // leaving high work? dismantle the scaffold under our feet first
     if (ctx?.pillar?.length &&
@@ -408,18 +526,38 @@ async function placeOne(bot, P, p, ctx = null) {
         if (!existing) return { ok: false, why: 'chunk not loaded' };
     }
     if (existing.name === p.name) return { ok: true, skipped: true };
-    if (!REPLACEABLE.has(existing.name)) {
-        // clear whatever occupies the cell first (instant in creative)
-        if (await goNear(bot, P, 3.0, ctx)) {
-            try { await bot.dig(existing, true); } catch (e) { /* keep going; place may still fail */ }
-        }
-    }
 
+    // ---- FEASIBILITY BEFORE DEMOLITION ----
+    // This block used to dig FIRST and work out whether a placement was even possible second,
+    // so a cell with nothing to click against was emptied and then reported as "no solid
+    // neighbor" - the block destroyed, nothing put back, and the failure logged as if the
+    // builder had merely declined.
+    //
+    // On open ground that is untidy. At foundation depth beside water it is unbounded: measured
+    // 2026-08-31, one such hole in the y=66 layer let the lake into the footprint and the flood
+    // spread under the build until bob was swimming in his own foundation, after which every
+    // later symptom (pillarUp finding nothing solid, endless `pinned`) pointed at the navigator
+    // instead of here. `night_safety` learned exactly this and the fix has the same shape:
+    // "shelterFeasibility now runs BEFORE any ground is broken".
+    //
+    // chooseFaces only ever inspects P's NEIGHBOURS, never P itself, so its answer is the same
+    // before and after the dig - which is what makes moving it earlier a pure reordering.
     const choices = chooseFaces(bot, P, p);
     const choice = choices[0];
     if (!choice) {
         const nb = (dx, dy, dz) => { const b = bot.blockAt(P.offset(dx, dy, dz)); return b ? `${b.name}/${b.boundingBox}` : 'NULL'; };
         return { ok: false, why: `no solid neighbor (self=${bot.blockAt(P)?.name} below=${nb(0,-1,0)} above=${nb(0,1,0)} n=${nb(0,0,-1)} s=${nb(0,0,1)} w=${nb(-1,0,0)} e=${nb(1,0,0)})` };
+    }
+
+    // What we broke, so a failed placement can put it back rather than leave a hole. Prevention
+    // above is the real fix - a repair cannot run if the flood has already moved the bot - but
+    // the server can still refuse a placement we had every reason to expect to work.
+    let broke = null;
+    if (!REPLACEABLE.has(existing.name)) {
+        if (await goNear(bot, P, 3.0, ctx, choice.faceVec)) {
+            broke = existing.name;
+            try { await bot.dig(existing, true); } catch (e) { broke = null; /* nothing was removed */ }
+        }
     }
 
     // ---- auto angle, by POSITION not by forced look ----
@@ -438,8 +576,17 @@ async function placeOne(bot, P, p, ctx = null) {
     } else if (SIDE_FACES.includes(choice.faceName)) {
         approach = P.plus(new Vec3(choice.faceVec.x * 2, 0, choice.faceVec.z * 2)); // in front of the clicked face
     }
-    if (!(await goNear(bot, approach, 3.0, ctx)) && !(await goNear(bot, P, 3.0, ctx))) {
+    if (!(await goNear(bot, approach, 3.0, ctx, choice.faceVec))
+        && !(await goNear(bot, P, 3.0, ctx, choice.faceVec))) {
         // above walking reach: pillar a dirt scaffold next to the work
+        // The dirt pillar is the fallback for when flight is NOT available - in survival, or a
+        // creative session where startFlying was refused. Under flight it is pure cost: a pillar
+        // only creates a place to STAND, and a flying bot can already occupy any clear cell, so
+        // if `flyNear` (which searches a 7x5x7 neighbourhood) found nowhere with the eye in
+        // range, there is nowhere for a pillar to put us either. Measured: `nocol=41` scaffold
+        // attempts on a flight-enabled run, each one walking and digging, with the placement
+        // rate back down to 10 blocks/min.
+        if (ctx?.flying) return { ok: false, why: 'out of reach (no clear hover within range)' };
         if (!(ctx && P.y > bot.entity.position.y + 1.5 && await scaffoldTo(bot, P, ctx)))
             return { ok: false, why: 'out of reach (no walkable route)' };
     }
@@ -474,6 +621,7 @@ async function placeOne(bot, P, p, ctx = null) {
             if (r.ok || !/refused by server/.test(r.why)) break;
         }
         if (!r || !r.ok) throw new Error(r ? r.why : 'no face to place from');
+        broke = null;   // placed successfully; nothing owed
         if (plant) {
             const potted = await plantIntoPot(bot, P, plant, p.name);
             // An empty pot where a planted one was wanted is a real mismatch, so say which half
@@ -496,7 +644,11 @@ async function placeOne(bot, P, p, ctx = null) {
             if (now && now.name === p.name) break;
             await new Promise(r => setTimeout(r, 25));
         }
-        if (!now || now.name !== p.name) return { ok: false, why: e.message };
+        if (!now || now.name !== p.name) {
+            await restoreBroken(bot, P, broke, choice);
+            return { ok: false, why: e.message };
+        }
+        broke = null;
     }
 
     // interactive states the place packet cannot express
@@ -606,7 +758,8 @@ export async function buildBlueprint(agent, filePath, origin) {
             const xs = all.map(p => origin.x + p.x), zs = all.map(p => origin.z + p.z);
             const minX = Math.min(...xs), maxX = Math.max(...xs);
             const minZ = Math.min(...zs), maxZ = Math.max(...zs);
-            return { minX, maxX, minZ, maxZ,
+            const topY = origin.y + Math.max(...all.map(p => p.y)) + 5;
+            return { minX, maxX, minZ, maxZ, topY,
                      centreX: Math.round((minX + maxX) / 2), centreZ: Math.round((minZ + maxZ) / 2) };
         })(),
     };
@@ -638,6 +791,15 @@ export async function buildBlueprint(agent, filePath, origin) {
         console.log('[builder] stocked 64 scaffolding (slot 9)');
     } catch (e) { console.log(`[builder] could not stock scaffolding: ${e.message}`); }
 
+    // Flight is the whole reason this command requires creative mode - see the guard at the top
+    // of buildBlueprint. `ctx.flying` records that WE started it, because stopFlying without a
+    // matching startFlying nulls bot.physics.gravity and breaks walking for the rest of the
+    // session (creative.js captures normalGravity lazily).
+    ctx.flying = flight.beginFlight(bot);
+    console.log(ctx.flying
+        ? '[builder] flight ENABLED - reaching high work directly instead of pillaring'
+        : '[builder] flight unavailable (not creative) - walking and pillaring');
+
     let placed = 0, skipped = 0;
     const failures = [];
     const started = Date.now();
@@ -663,8 +825,27 @@ export async function buildBlueprint(agent, filePath, origin) {
         const probe = await waitForBlock(bot, new Vec3(origin.x + 16, origin.y - 1, origin.z + 16), 20000);
         if (!probe) throw new Error('chunks at the build site never loaded');
 
+        // HOW MUCH OF THIS BUILD ALREADY EXISTS? Sampled once, and it decides whether the
+        // terrain clear runs at all. On a RESUMED build the clear pass is pure waste: it walks
+        // every cell of the lower six layers looking for natural terrain that was dug out hours
+        // ago, and on a site that is now a building it cannot even path - measured 2026-08-31,
+        // 21 of 192 rows in ten minutes with the bot pinned inside its own walls. Every restart
+        // paid that toll before placing a single block, and this build has been restarted a lot.
+        let alreadyThere = 0, sampled = 0;
+        for (let i = 0; i < buildable.length; i += Math.max(1, Math.floor(buildable.length / 400))) {
+            const q = buildable[i];
+            const b = bot.blockAt(new Vec3(origin.x + q.x, origin.y + q.y, origin.z + q.z));
+            if (!b) continue;            // unloaded: no evidence either way, do not count it
+            sampled++;
+            if (b.name === q.name) alreadyThere++;
+        }
+        const presentPct = sampled ? (alreadyThere / sampled) * 100 : 0;
+        const resuming = sampled >= 20 && presentPct >= 25;
+        console.log(`[builder] site is ${presentPct.toFixed(0)}% built (${alreadyThere}/${sampled} sampled)`
+            + `${resuming ? ' - RESUMING, skipping the terrain clear' : ''}`);
+
         // clear natural terrain poking into the lower floors of the footprint
-        if (meta.size) {
+        if (meta.size && !resuming) {
                         for (let y = 0; y < Math.min(6, meta.size.height); y++) {
                 console.log(`[builder] clearing terrain layer ${y}`);
                 for (let x = 0; x < meta.size.width; x++) {
@@ -677,7 +858,12 @@ export async function buildBlueprint(agent, filePath, origin) {
                         const P = new Vec3(origin.x + x, origin.y + y, origin.z + z);
                         const b = bot.blockAt(P);
                         if (b && NATURAL_TERRAIN.has(b.name)) {
-                            if (!(await goNear(bot, P))) continue; // unreachable bump; skip
+                            // Pass ctx so this can FLY. Without it the clear pass walks, and on a
+                            // resumed build it is walking around a finished structure - which is
+                            // exactly the interior the ground navigator cannot path. Measured:
+                            // 47 of 192 rows in nine minutes on a site with almost nothing left
+                            // to clear.
+                            if (!(await goNear(bot, P, 3.0, ctx))) continue; // unreachable bump; skip
                             await new Promise(r => setTimeout(r, 120)); // stay under the packet limiter
                             try { await bot.dig(b, true); } catch (e) { /* skip stubborn */ }
                             // heartbeat per DIG: a dig-dense row outlasts every staleness
@@ -774,6 +960,8 @@ export async function buildBlueprint(agent, filePath, origin) {
         // structure nobody is working on any more - and the escape valve would never fire,
         // because the bot is not enclosed, it is just walking past.
         buildGuard.clearProtectedBuild();
+        // Strictly paired with beginFlight. Never call it speculatively - see flight.js.
+        flight.endFlight(bot, ctx.flying);
         try { bot.modes.unPauseAll(); } catch (e) { /* best effort */ }
         // NOTE: no stopFlying here - we never startFlying now, and calling stopFlying
         // without a prior startFlying sets bot.physics.gravity to null (creative.js

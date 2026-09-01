@@ -85,7 +85,7 @@ const settings = {
     // true = the bot's own eyes (what !vision wants). false = a third-person orbit camera,
     // which is what tools/timelapse.mjs needs: first person disposes the OrbitControls it
     // drives to park the camera overhead. Changing this needs a bot restart.
-    viewer_first_person: false,
+    viewer_first_person: true,
 
     allow_insecure_coding: true, // allows newAction command and model can write/run code on your computer. enable at own risk
     allow_vision: true, // allows vision model to interpret screenshots as inputs

@@ -941,7 +941,15 @@ export const actionsList = [
         perform: runAsAction(async (agent, file, x, y, z) => {
             const { buildBlueprint } = await import('../library/blueprint_builder.js');
             return await buildBlueprint(agent, file, new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)));
-        }, false, 240)  // minutes - a few thousand blocks at ~1s each needs hours of headroom
+        }, true, 240)  // RESUMABLE, and minutes: a few thousand blocks needs hours of headroom.
+        // resume:true because a blueprint build is long enough that a mode WILL interrupt it.
+        // Measured 2026-08-31: `self_preservation` (which the builder deliberately does not
+        // pause, being a genuine safety mode) fired during a night with hostiles about; the
+        // builder's `finally` then ran `unPauseAll`, every other mode became live, and the run
+        // simply ended at 480/581 of its retry pass with the bot standing motionless for fifteen
+        // minutes. Nothing was wrong with the build - nothing brought it back.
+        // Replaying is safe and cheap: placeOne returns `skipped` for any cell already correct,
+        // and a resumed run now skips the terrain clear too, so a resume costs seconds.
     },
     {
         name: '!serverFill',

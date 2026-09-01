@@ -134,11 +134,31 @@ export function isHostile(mob) {
     ];
     // Note: zombified_piglin, piglin, wolf, bee, iron_golem, polar_bear are neutral (only attack when provoked)
     // They are NOT included to prevent Andy from attacking first and provoking them
+    //
+    // NEVER SUBSTRING-MATCH A MOB NAME. This function used to end with
+    //
+    //     mobName.includes('zombie') || mobName.includes('skeleton') || mobName.includes('illager')
+    //
+    // and `"villager".includes("illager")` is TRUE. That is the same defect as
+    // `"sandstone".includes("sand")` in `tools.isFallingBlockName`, in a different domain - the
+    // rule was already written down in CLAUDE.md and got re-earned anyway.
+    //
+    // Measured cost before the fix: 469,887 `[SELF_DEFENSE]` lines in one log, ~6 per second
+    // forever, because `self_defense` found a villager, ran an `isClearPath` pathfinder query on
+    // it, logged, and then discarded it via `isFriendly` - every tick, for as long as a villager
+    // was within 8 blocks. The log flood is the visible half; the wasted path query is the
+    // expensive half, and `cowardice` was fleeing from villagers on the same predicate.
+    //
+    // The substring form was also WRONG IN BOTH DIRECTIONS: it made `skeleton_horse` and
+    // `zombie_horse` (both passive mounts) hostile, and it missed `illusioner`, which is a real
+    // illager and contains no "illager".
+    const EXTRA_HOSTILE = [
+        'zombie_villager', 'illusioner',
+        // husk/drowned/stray/wither_skeleton/bogged are already in the list above; named here
+        // only so the reasoning is visible: every zombie- or skeleton-ish hostile is EXPLICIT.
+    ];
     const mobName = mob.name.toLowerCase();
-    return hostileMobs.includes(mobName) ||
-           mobName.includes('zombie') && !mobName.includes('zombified_piglin') ||
-           mobName.includes('skeleton') ||
-           mobName.includes('illager');
+    return hostileMobs.includes(mobName) || EXTRA_HOSTILE.includes(mobName);
 }
 
 // blocks that don't work with collectBlock, need to be manually collected

@@ -28,7 +28,8 @@ import { createRequire } from 'module';
 import { Vec3 } from 'vec3';
 import settings from '../settings.js';
 
-const require = createRequire('/home/asanrivas/mindcraft/');
+// Resolve from THIS checkout: the pinned /home/asanrivas/mindcraft does not exist on every host.
+const require = createRequire(import.meta.url);
 const mineflayer = require('mineflayer');
 
 const arg = (n, d) => { const i = process.argv.indexOf(`--${n}`); return i !== -1 && process.argv[i + 1] ? process.argv[i + 1] : d; };
@@ -58,7 +59,9 @@ bot.on('forcedMove', () => {
 });
 
 const rcon = async (cmd) => {
-    const p = Bun.spawn(['bun', 'tools/rcon.mjs', cmd], { cwd: '/home/asanrivas/mindcraft', stdout: 'pipe' });
+    // Repo root derived from this file, not pinned to one host's home directory.
+    const root = new URL('..', import.meta.url).pathname;
+    const p = Bun.spawn(['bun', 'tools/rcon.mjs', cmd], { cwd: root, stdout: 'pipe' });
     await p.exited;
     return new Response(p.stdout).text();
 };

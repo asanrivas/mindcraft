@@ -11,7 +11,10 @@ Plain `bun` scripts, no framework: arrays of `[input, expected]`, a `failures` c
 `process.exit(1)` on any failure.
 
 ```bash
-bun run test        # every tests/*.test.mjs
+bun run test        # every tests/*.test.mjs, in parallel (tests/run_all.mjs)
+bun run test:list   # print the suites that would run
+bun tests/run_all.mjs --only build    # just the suites whose names contain "build"
+bun tests/run_all.mjs --jobs 2        # fewer workers, if something looks contention-sensitive
 ```
 
 | Suite | Covers |
@@ -25,6 +28,11 @@ bun run test        # every tests/*.test.mjs
 | `tests/torch.test.mjs` | the torch-placing light check, all four light/time quadrants |
 | `tests/teleport.test.mjs` | teleport detection: the threshold, and every branch that must NOT fire |
 | `tests/memory_store.test.mjs` | durable memory, goal authority, and that summarisation cannot mint goals |
+| `tests/facing_verify.test.mjs` | `orientationMismatch`: is the block in the world facing the way the blueprint asked |
+| `tests/facing_repair.test.mjs` | `cellIsDone` (name equality is NOT completion) and that the place yaw comes from the blueprint, not from where the bot stands |
+
+This table has never been complete. **`bun run test:list` is the authoritative list** — it globs the
+directory, which is the same thing the runner does, so it cannot disagree with what actually runs.
 
 ### The regression cases — keep them
 

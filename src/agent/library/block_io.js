@@ -106,13 +106,72 @@ export function bodyClearsCell(s) {
 /**
  * Snap the head to a point. `bot.look(..., true)` is instant; `bot.lookAt(p)` without force
  * turns smoothly over several ticks, which is fatal inside a jump.
+ *
+ * AND PUT IT ON THE WIRE HERE, rather than leaving it to the physics tick. `bot.look(y, p, true)`
+ * only mutates `bot.entity.yaw/pitch` locally (mineflayer physics.js:348 - `force` sets
+ * `lastSentYaw` and returns); the `look` packet goes out on the NEXT physics tick, up to 50ms
+ * later. Every caller here writes its interaction packet immediately afterwards, so the
+ * interaction overtakes the rotation on the wire and the SERVER still holds the old yaw - which is
+ * how a blueprint's stairs, doors, gates, chests and barrels ended up facing whichever way the bot
+ * happened to be looking on the PREVIOUS placement.
+ *
+ * Measured with `tools/facing_probe.mjs` at 4683,63,4571, all 4 cardinals x 7 look-steered
+ * classes, every trial confirmed to have achieved its intended yaw first:
+ *   as written, no delay      4/28 correct
+ *   +1 physics tick (50ms)   25/26
+ *   +3 physics ticks (150ms) 27/27
+ * A delay works only because a hovering bot eventually emits a position update that carries the
+ * new yaw; it is a race, not a fix. Writing the packet here is ordered by TCP and costs nothing.
  */
-export async function snapLook(bot, point) {
+/**
+ * How long to let a forced rotation settle on the SERVER before clicking.
+ *
+ * Writing the `look` packet ourselves (see snapLook) is ordered by TCP, so in principle the server
+ * holds the new yaw before it reads the click. In practice it does not always, and this file already
+ * has the measurement - `tools/facing_probe.mjs`, all four cardinals x 7 look-steered classes:
+ *
+ *     as written, no delay      4/28 correct
+ *     +1 physics tick (50ms)   25/26
+ *     +3 physics ticks (150ms) 27/27
+ *
+ * The packet write alone was read as making the delay unnecessary. It does not: it moves the odds,
+ * it does not close the window. Live confirmation, 2026-09-24, repairing the wizard tower's facings
+ * with the packet write and no delay: 306 re-placements, 26 landing a QUARTER TURN off - and the
+ * errors ran both clockwise and anticlockwise, which is the signature of a race rather than of a
+ * wrong constant, since a bad table is wrong the same way every time.
+ *
+ * 150ms, because 27/27 is worth three ticks when the whole cost is ~1200 oriented cells in a
+ * blueprint - about three minutes across a build that runs for hours.
+ *
+ * ONLY on a forced rotation. Pillaring and bridging place blocks inside a jump, where the body has
+ * to clear the target cell before the click; a delay there would break timing that is already
+ * tight, and neither passes a yaw.
+ */
+const LOOK_SETTLE_MS = 150;
+
+export async function snapLook(bot, point, yawOverride = null) {
     const p = bot.entity.position.offset(0, bot.entity.height ?? 1.62, 0);
     const dx = point.x - p.x, dy = point.y - p.y, dz = point.z - p.z;
-    const yaw = Math.atan2(-dx, -dz);
+    // A caller that KNOWS the horizontal angle it needs (a blueprint cell whose `facing` dictates
+    // it) passes it here. The pitch still aims at the click point, so the ray stays vertically
+    // honest and the cursor - which is what carries `half`, the hinge and the clicked face - is
+    // untouched. Only the horizontal component, the one the server reads to derive `facing`,
+    // is taken from the caller instead of from where the bot happens to be standing.
+    const yaw = yawOverride !== null && yawOverride !== undefined ? yawOverride : Math.atan2(-dx, -dz);
     const pitch = Math.atan2(dy, Math.sqrt(dx * dx + dz * dz));
     await bot.look(yaw, pitch, true);
+    // Same packet and the same notchian conversions mineflayer's own sendPacketLook uses
+    // (lib/physics.js:114, lib/conversions.js). A duplicate on the next tick is harmless; the
+    // rotation arriving after the click is not.
+    try {
+        const onGround = bot.entity.onGround;
+        bot._client?.write('look', {
+            yaw: (180 / Math.PI) * (Math.PI - yaw),
+            pitch: (180 / Math.PI) * -pitch,
+            onGround,
+            flags: { onGround, hasHorizontalCollision: undefined },   // 1.21.3+
+        });
+    } catch (e) { /* no client, or a schema without this packet: the physics tick still sends it */ }
 }
 
 /**
@@ -132,7 +191,27 @@ export async function snapLook(bot, point) {
  * @param {object} [opts.placeOpts] extra options forwarded to _genericPlace
  * @returns {Promise<{ok: boolean, why: string}>}
  */
+// Blocks that OPEN or TOGGLE when right-clicked. A player places against one by SNEAKING, which
+// makes the click a placement instead of a use; without it the server uses the block and refuses
+// the place packet. Measured 2026-09-27: a cathedral grille's only support anchor was the anvil
+// below it - `support chain of 1 failed at link 1: refused by server (ack 38ms)`, every time.
+// Whole names and whole suffixes only (see isFallingBlockName for why substrings are banned).
+export const INTERACTIVE_REF = /^(anvil|chipped_anvil|damaged_anvil|chest|trapped_chest|ender_chest|barrel|furnace|blast_furnace|smoker|crafting_table|cartography_table|fletching_table|smithing_table|loom|stonecutter|grindstone|enchanting_table|brewing_stand|lectern|beacon|hopper|dropper|dispenser|crafter|jukebox|note_block|bell|cake|respawn_anchor|lever|comparator|repeater|daylight_detector|decorated_pot|chiseled_bookshelf|.*_shulker_box|shulker_box|.*_door|.*_trapdoor|.*_fence_gate|.*_bed|.*_button|.*_sign|.*_hanging_sign)$/;
+
+/** Sneak for the click when the reference block would otherwise be USED rather than placed on. */
 export async function placeVerified(bot, refBlock, faceVector, opts = {}) {
+    if (!refBlock || !INTERACTIVE_REF.test(refBlock.name ?? '')) return placeVerifiedCore(bot, refBlock, faceVector, opts);
+    bot.setControlState('sneak', true);
+    await new Promise((r) => setTimeout(r, SNEAK_SETTLE_MS));   // the input packet must precede the click
+    try {
+        return await placeVerifiedCore(bot, refBlock, faceVector, opts);
+    } finally {
+        bot.setControlState('sneak', false);
+    }
+}
+const SNEAK_SETTLE_MS = 100;
+
+async function placeVerifiedCore(bot, refBlock, faceVector, opts = {}) {
     if (!refBlock) return { ok: false, why: 'no reference block' };
     const verifyMs = opts.verifyMs ?? 400;
     const dest = refBlock.position.plus(faceVector);
@@ -174,7 +253,12 @@ export async function placeVerified(bot, refBlock, faceVector, opts = {}) {
         };
         // Snap, never turn. A smooth `lookAt` outlasts a jump's apex, and the server validates
         // that the click is plausible from our eye - so the look has to land BEFORE the packet.
-        await snapLook(bot, refBlock.position.offset(cursor.x, cursor.y, cursor.z));
+        const forcedYaw = opts.placeOpts?.yaw ?? null;
+        await snapLook(bot, refBlock.position.offset(cursor.x, cursor.y, cursor.z), forcedYaw);
+        // Let the rotation land before the click. See LOOK_SETTLE_MS: the packet write improves the
+        // odds but does not close the window, and a click the server answers with the PREVIOUS yaw
+        // is a block a quarter or a half turn out.
+        if (forcedYaw !== null) await new Promise((r) => setTimeout(r, LOOK_SETTLE_MS));
         const seq = nextSequence();
         let packet;
         try {

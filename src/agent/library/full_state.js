@@ -101,7 +101,15 @@ export function getFullState(agent) {
         },
         modes: {
             summary: bot.modes.getMiniDocs()
-        }
+        },
+        // The live blueprint build, if one has run in this process: rates, ETA, phase, the dominant
+        // failure, the trend. The MindServer polls this every second, so it is what the web UI's
+        // build panel draws. Kept after the build ends so its result stays readable. A failure to
+        // snapshot must never take the whole state update down with it.
+        build: (() => {
+            try { return agent.buildTelemetry ? agent.buildTelemetry.snapshot(Date.now()) : null; }
+            catch (e) { return { error: String(e?.message || e) }; }
+        })(),
     };
 
     return state;

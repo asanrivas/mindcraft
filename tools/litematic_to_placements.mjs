@@ -16,6 +16,30 @@
 import fs from 'fs';
 import nbt from 'prismarine-nbt';
 
+/**
+ * Blocks Mojang RENAMED between the version a schematic was authored in and the one we connect as.
+ * A stale name is not a missing block, it is the same block under its old spelling - but nothing
+ * downstream can tell the difference, and the symptom is far from the cause:
+ * `mcData.itemsByName['chain']` is undefined on 1.21.11, so `new Item(undefined, 1)` yields an item
+ * whose `.components` is undefined, and the builder reports
+ * `equip chain failed: undefined is not an object (evaluating 'item.components.length')` followed
+ * by `no item chain` for every one. Measured 2026-09-22: 31 in wizard_tower, 14 in survival_base,
+ * plus 136 `grass` (now `short_grass`) that would have failed the same way.
+ *
+ * Renaming at IMPORT, not at placement time, is deliberate. A rename applied while placing would
+ * put `iron_chain` in the world and then verify it against the blueprint's `chain` and score a
+ * perfectly good placement as a failure - the builder compares block names, so the name has to be
+ * right in the data.
+ */
+const RENAMES = {
+    chain: 'iron_chain',        // 1.21.9: chain -> iron_chain (copper_chain variants added)
+    grass: 'short_grass',       // 1.20.3: grass -> short_grass
+    grass_path: 'dirt_path',    // 1.17
+    snow_layer: 'snow',
+    sign: 'oak_sign',
+    wall_sign: 'oak_wall_sign',
+};
+
 const [, , inPath, outPath] = process.argv;
 if (!inPath || !outPath) {
     console.error('Usage: litematic_to_placements.mjs <input.litematic> <output.json>');
@@ -24,6 +48,15 @@ if (!inPath || !outPath) {
 
 function toUnsigned64(v) {
     return v < 0n ? v + (1n << 64n) : v;
+}
+
+/** Current name for a block, and a note when it had to be translated. */
+const renamed = new Map();
+function currentName(name) {
+    const to = RENAMES[name];
+    if (!to) return name;
+    renamed.set(name, (renamed.get(name) || 0) + 1);
+    return to;
 }
 
 function decodeRegion(region) {
@@ -75,7 +108,7 @@ function decodeRegion(region) {
                 const sz = minCorner.z + z;
                 const placement = {
                     x: sx, y: sy, z: sz,
-                    name: entry.Name.replace('minecraft:', ''),
+                    name: currentName(entry.Name.replace('minecraft:', '')),
                     properties: entry.Properties || {},
                 };
                 const te = tileEntityByPos.get(`${sx},${sy},${sz}`);
@@ -128,5 +161,6 @@ const output = {
 
 fs.writeFileSync(outPath, JSON.stringify(output));
 console.log(`Decoded ${allPlacements.length} blocks (expected ${root.Metadata?.TotalBlocks}), size ${bounds.width}x${bounds.height}x${bounds.length}`);
+if (renamed.size) console.log(`Renamed to current 1.21.11 names: ${[...renamed].map(([n, c]) => `${n}->${RENAMES[n]} x${c}`).join(', ')}`);
 console.log('Top blocks:', topBlocks.map(([n, c]) => `${n}:${c}`).join(', '));
 console.log(`Wrote ${outPath}`);

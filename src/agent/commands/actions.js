@@ -8,6 +8,7 @@ import { ORIGIN as MEM_ORIGIN } from '../memory_store.js';
 import { Vec3 } from 'vec3';
 import fs from 'fs';
 import settings from '../settings.js';
+import { BUILD_BLUEPRINT_TIMEOUT_MIN } from '../library/build_telemetry.js';
 import convoManager from '../conversation.js';
 
 
@@ -911,6 +912,26 @@ export const actionsList = [
         })
     },
     {
+        name: '!placeWithSupport',
+        description: 'Creative only: place ONE block at x,y,z even with nothing to attach to - builds a temporary dirt support, places, removes it. block may carry states: "oak_log[axis=z]". Not for structures.',
+        params: {
+            'block': { type: 'string', description: 'Block name, optionally with states, e.g. "oak_log[axis=z]" or "lever[face=wall,facing=east]".' },
+            'x': { type: 'int', description: 'World X.' },
+            'y': { type: 'int', description: 'World Y.' },
+            'z': { type: 'int', description: 'World Z.' }
+        },
+        perform: runAsAction(async (agent, block, x, y, z) => {
+            const { parseBlockSpec, placeWithSupport } = await import('../library/blueprint_builder.js');
+            const spec = parseBlockSpec(block);
+            if (!spec) return `Could not read "${block}" - use a block name, optionally with states like oak_log[axis=z].`;
+            const r = await placeWithSupport(agent, new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)), spec);
+            // Logged, not only returned: the return goes to the model's context, and a failure no
+            // one can read afterwards costs a probe to reconstruct.
+            console.log(`[${agent.name}] placeWithSupport: ${r.message}`);
+            return r.message;
+        }, false, 5)
+    },
+    {
         name: '!fill',
         description: 'Walk and place blocks by hand (slow, can fail on rough terrain). Takes only X/Z corners then a SINGLE y and a height: (blockType, x1, z1, x2, z2, y, height). This is NOT the vanilla /fill order.',
         params: {
@@ -941,7 +962,18 @@ export const actionsList = [
         perform: runAsAction(async (agent, file, x, y, z) => {
             const { buildBlueprint } = await import('../library/blueprint_builder.js');
             return await buildBlueprint(agent, file, new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)));
-        }, true, 240)  // RESUMABLE, and minutes: a few thousand blocks needs hours of headroom.
+        }, true, BUILD_BLUEPRINT_TIMEOUT_MIN)  // RESUMABLE, and MINUTES. See the notes below.
+        // 240 was measured to be short: the wizard tower (8,335 cells) was force-stopped at
+        // exactly four hours on 2026-09-22 with `Code execution timed out after 240 minutes`,
+        // mid-way through retry round 2. The throw propagates past the verification block, so the
+        // run ends with no `VERIFIED BUILD` line at all - the work is in the world, but the report
+        // that reads it back never runs, which is the worst possible way to end a four-hour job.
+        //
+        // The clock was standing in for a stop condition the builder did not have. It has three
+        // now, all of which end a bad run in minutes rather than hours: `progressVerdict` (200
+        // consecutive attempts that placed nothing), `ctx.stuck` (rescues that make no progress
+        // toward the station), and the retry loop's own `gained === 0`. A longer clock is safe
+        // precisely because none of those existed when 240 was chosen.
         // resume:true because a blueprint build is long enough that a mode WILL interrupt it.
         // Measured 2026-08-31: `self_preservation` (which the builder deliberately does not
         // pause, being a genuine safety mode) fired during a night with hostiles about; the
@@ -950,6 +982,11 @@ export const actionsList = [
         // minutes. Nothing was wrong with the build - nothing brought it back.
         // Replaying is safe and cheap: placeOne returns `skipped` for any cell already correct,
         // and a resumed run now skips the terrain clear too, so a resume costs seconds.
+        //
+        // 600 was short too, and for the same reason: the cathedral (35,142 cells) was force-stopped
+        // at exactly ten hours on 2026-09-25, 63% built and placing 22/min, still in pass 1 - it
+        // needs ~27h at that rate. The ceiling is now derived from the largest blueprint at the
+        // slowest measured rate, and tests/build_timeout.test.mjs fails if a blueprint outgrows it.
     },
     {
         name: '!serverFill',
@@ -1333,7 +1370,18 @@ export const actionsList = [
     },
     {
         name: '!endGoal',
-        description: 'Call when you have accomplished your goal. It will stop self-prompting and the current action. Refused if the last build verification showed the work is incomplete.',
+        // "Will stop", not "It will stop": compactDescription() keeps a follow-up sentence
+        // only when it starts with an imperative in KEEP_SENTENCE, and "It" is not one - so
+        // this clause was deleted before any model saw it, exactly the §1 failure in
+        // docs/OBEDIENCE.md, on a command that sweep did not cover. The clause is the only
+        // thing separating !endGoal from !stop, and without it the choice is genuinely
+        // ambiguous. Measured 2026-09-20 with `bun scratchpad/obedience_jev.mjs`: the old
+        // wording scored 7/8 with this case landing on NONE 0.45 / !endGoal 0.29 / !stop 0.14,
+        // while the same run against the UNtruncated descriptions scored 8/8 - i.e. the
+        // disambiguator existed and the renderer ate it. With this wording, 8/8 three runs of
+        // three, !endGoal 0.62-0.65. Do not reword the opening word away from KEEP_SENTENCE.
+        // tests/obedience_contract.test.mjs pins it.
+        description: 'Call when you have accomplished your goal. Will stop self-prompting and the current action. Refused if the last build verification showed the work is incomplete.',
         perform: async function (agent) {
             // Guard against declaring victory the world does not support. Prompt rules alone
             // do not prevent this (the model will assert completion regardless), so the check

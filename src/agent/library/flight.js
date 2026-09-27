@@ -33,6 +33,7 @@
  * builder still obeys the same ~4.5 block interaction range as a walking one.
  */
 import { Vec3 } from 'vec3';
+import { isLavaName } from './tools.js';
 
 /** How close the body must get before a placement is worth attempting. */
 export const FLY_REACH = 3.0;
@@ -167,9 +168,35 @@ export async function flyTo(bot, dest, opts = {}) {
     // rule this repo keeps re-earning: a retry that can fail identically must not be taken.)
     const beforeClimb = bot.entity.position.y;
     await flyDirect(bot, new Vec3(p.x, cruise, p.z), budget);
-    if (bot.entity.position.y - beforeClimb < 0.5 && cruise - beforeClimb > 1) return direct;
-    await flyDirect(bot, new Vec3(target0.x, cruise, target0.z), budget);
-    return await flyDirect(bot, target0, budget);
+    if (bot.entity.position.y - beforeClimb >= 0.5 || cruise - beforeClimb <= 1) {
+        await flyDirect(bot, new Vec3(target0.x, cruise, target0.z), budget);
+        const overTop = await flyDirect(bot, target0, budget);
+        if (overTop <= 1.0) return overTop;
+    }
+    // Neither the straight line nor the climb worked. Under a roof, inside a shell, in a stairwell
+    // - the cases where a route exists but no heuristic finds it. Plan one.
+    //
+    // ROUTING IS ON BY DEFAULT, and only `flyNear`'s per-candidate probing opts out. It was the
+    // other way round at first, which silently left every OTHER caller unrouted - including the
+    // builder's wedge rescue at blueprint_builder.js:242, the one call that runs precisely when the
+    // bot is stuck inside its own build. The symptom was a bot walled in at 26 blocks from its
+    // station repeating `wedged - returned to station above the build (26.4 short)` every 37
+    // seconds with an unchanging shortfall, while `no route` stayed at 0 because nothing ever asked
+    // for a route. A default that excludes the case the feature exists for is not a default.
+    if (opts.route === false) return bot.entity.position.distanceTo(target0);
+    // SAY WHEN THERE IS NO ROUTE. This path used to return silently, so a caller that is sealed in
+    // looked identical to one whose flight merely fell short - and the `no route (sealed)` counter
+    // in flyNear reported 0 while the builder's wedge rescue was failing by the same 26 blocks
+    // every 37 seconds. An absence has to be announced or it defaults to "fine".
+    const route = planFlight(bot, target0, opts);
+    if (!route) {
+        const d = bot.entity.position.distanceTo(target0);
+        console.log(`[${bot.username ?? '?'}] flyTo (${target0.x.toFixed(0)}, ${target0.y.toFixed(0)}, `
+            + `${target0.z.toFixed(0)}): NO ROUTE for a 0.6x1.8 body, ${d.toFixed(1)} away `
+            + `- sealed in, or no body-sized opening`);
+        return d;
+    }
+    return await flyRoute(bot, route, opts);
 }
 
 /** One straight-line leg. The primitive `flyTo` bends into a route when a leg is blocked. */
@@ -201,6 +228,362 @@ async function flyDirect(bot, dest, opts = {}) {
     }
     bot.entity.velocity.set(0, 0, 0);
     return bot.entity.position.distanceTo(target);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Routing through geometry
+//
+// Straight line, then over the top, then THIS. The first two cannot enter a closed volume, and
+// that is precisely where a builder spends the end of a build: measured 2026-09-22 on the Wizard
+// Tower, bob parked at its station at (4672, 89.5, 4618) with the remaining cells at y 73-79
+// inside the finished shell - 5,238 consecutive `flyNear ... failed: flew short by 11-15 | budget
+// spent` lines, the builder's own tally `0 placed, 183 failed` with `140-216x out of reach (no
+// clear hover within range)` per pass, and `wedged - returned to station above the build` putting
+// it back where nothing is reachable. Nothing was wrong with flight itself: zero forcedMove
+// events on our side and zero `moved too quickly` on the server's. The bot simply had no route,
+// because "fly at it and climb if blocked" is not a route.
+//
+// So: A* over cells the BODY fits in. Deliberately not `nav.planPath` - that planner is about
+// standing (`standCost`, drops, jumps, dig costs, support underfoot), and a flying body has none
+// of those constraints while having one the walker does not: it must clear overhead too. Sharing
+// it would mean teaching every ground cost model to ignore itself.
+// ---------------------------------------------------------------------------------------------
+
+/** Search ceiling. A route inside a building is short; a long search means there is no way in. */
+const ROUTE_MAX_NODES = 6000;
+/**
+ * flyNear's ONE planned attempt, which searches for ANY of its clear candidates at once. Measured
+ * 2026-09-26 replaying 530 of the cathedral's 3,176 leftover cells against the live world, each
+ * from the previous cell's hover, at the default 64-block range: first candidate only at 6,000
+ * nodes (the old call) routed 430 (81%), 15ms a cell; the goal set in one search routed 438 at
+ * 6,000, 476 at 20,000 (90%, 23ms a cell), 490 at 60,000 (28ms). None of the 3,176 is actually
+ * sealed - a flood fill from outside reached a hover for every one - so each "no route" was the
+ * search, not the building. Against the ~20s a failed attempt cost in retry round 1 (1.4 placed a
+ * minute), any of these is free; 20,000 is where the gain flattens.
+ */
+export const FLYNEAR_ROUTE_MAX_NODES = 20000;
+/** How far outside the start/goal box the search may wander, in blocks. */
+const ROUTE_PAD = 16;
+/**
+ * Longest flight this will plan. Flight is a LOCAL manoeuvre - get into the room, round the wall,
+ * down the stairwell. Crossing country is `skills.travelToward`'s job, over ground, with
+ * checkpoints and a survey behind it (docs/MARATHON.md). Planning a 400-block flight would also
+ * promise something the per-leg timeouts cannot deliver, which reads as a stall rather than as a
+ * refusal.
+ */
+const ROUTE_MAX_RANGE = 64;
+const ROUTE_MOVES = [[1, 0, 0], [-1, 0, 0], [0, 0, 1], [0, 0, -1], [0, 1, 0], [0, -1, 0]];
+
+const ckey = (x, y, z) => `${x},${y},${z}`;
+
+/**
+ * Can the body occupy this cell? Feet cell and head cell both free, both loaded, neither lethal.
+ *
+ * An UNLOADED cell is blocked, not free: `blockAt` returning null means we cannot see it, and
+ * flying into what we cannot see is how a bot ends up inside a wall. Same rule `hoverIsClear`
+ * already applies - this is its cell-indexed, memoised form, because A* re-reads columns.
+ */
+function flyable(bot, x, y, z, cache) {
+    const k = ckey(x, y, z);
+    const hit = cache.get(k);
+    if (hit !== undefined) return hit;
+    let ok = false;
+    const at = bot.blockAt(new Vec3(x, y, z));
+    const head = bot.blockAt(new Vec3(x, y + 1, z));
+    if (at && head && at.boundingBox === 'empty' && head.boundingBox === 'empty'
+        && !isLavaName(at.name) && !isLavaName(head.name)
+        && at.name !== 'fire' && at.name !== 'soul_fire' && at.name !== 'powder_snow') ok = true;
+    cache.set(k, ok);
+    return ok;
+}
+
+/** Binary min-heap on .f. Same shape as the planner's in nav.js, kept local to avoid a new export. */
+class FHeap {
+    constructor() { this.a = []; }
+    get size() { return this.a.length; }
+    push(n) {
+        const a = this.a; a.push(n);
+        let i = a.length - 1;
+        while (i > 0) {
+            const p = (i - 1) >> 1;
+            if (a[p].f <= a[i].f) break;
+            const t = a[p]; a[p] = a[i]; a[i] = t; i = p;
+        }
+    }
+    pop() {
+        const a = this.a, top = a[0], last = a.pop();
+        if (a.length) {
+            a[0] = last;
+            for (let i = 0; ;) {
+                const l = 2 * i + 1, r = l + 1;
+                let m = i;
+                if (l < a.length && a[l].f < a[m].f) m = l;
+                if (r < a.length && a[r].f < a[m].f) m = r;
+                if (m === i) break;
+                const t = a[m]; a[m] = a[i]; a[i] = t; i = m;
+            }
+        }
+        return top;
+    }
+}
+
+/**
+ * Is the straight segment a->b flyable BY THE BODY throughout?
+ *
+ * The body is 0.6 wide, and the plan is a line of points. Checking only the cell each sample point
+ * falls in passes a diagonal that shaves a corner the hitbox cannot: measured 2026-09-22 in the
+ * live build as `route of 5 legs left 10.2, eye 13.0` - the plan was clear, the flight was not.
+ * A* itself is safe without this (its moves are axis-aligned centre-to-centre, so the body stays
+ * inside the two cells), but SMOOTHING introduces the diagonals, so the smoother has to answer the
+ * question the body will ask.
+ */
+const HALF_WIDTH = 0.3;
+const BODY_HEIGHT = 1.8;
+/** Exported for flyNear's skip rule and its test; `cache` is optional. */
+export function lineIsClear(bot, a, b, cache = new Map()) {
+    return clearLine(bot, new Vec3(a.x, a.y, a.z), new Vec3(b.x, b.y, b.z), cache);
+}
+function clearLine(bot, a, b, cache) {
+    const d = b.minus(a);
+    const steps = Math.ceil(d.norm() / 0.25);
+    for (let i = 0; i <= steps; i++) {
+        const p = a.plus(d.scaled(i / steps));
+        // EVERY CELL THE BODY OVERLAPS, not just the feet cell and the one above. `flyable` clears
+        // two cells, which is the body exactly at an integer y - but a leg that climbs or descends
+        // puts the feet at FRACTIONAL y, where a 1.8-tall body reaches into a THIRD cell that was
+        // never checked. Measured 2026-09-26 against the live cathedral: 13 of 183 planned legs (in
+        // 10 of 82 routes) crossed a cell the body could not fit, every one passed by this check,
+        // and the flight then pressed into the ceiling - `route leg made no progress ... rose 1.9`,
+        // the pattern behind the wedge that stopped the build at 95.5%.
+        const yTop = Math.floor(p.y + BODY_HEIGHT - 1e-6);
+        for (const ox of [-HALF_WIDTH, HALF_WIDTH]) {
+            for (const oz of [-HALF_WIDTH, HALF_WIDTH]) {
+                const x = Math.floor(p.x + ox), z = Math.floor(p.z + oz);
+                if (!flyable(bot, x, Math.floor(p.y), z, cache)) return false;
+                // flyable(y) covers y and y+1; the body only needs y+2 when it pokes into it
+                if (yTop > Math.floor(p.y) + 1 && !flyable(bot, x, Math.floor(p.y) + 1, z, cache)) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/**
+ * Plan a flight from where the bot is to `dest` as cell waypoints, or null if there is no way.
+ *
+ * Pure with respect to the world: it only reads `bot.blockAt` and `bot.entity.position`, so it is
+ * testable against a fake grid with no server (tests/flight_route.test.mjs).
+ *
+ * @returns {Vec3[]|null} waypoints, cell centres, ending at the destination cell
+ */
+export function planFlight(bot, dest, opts = {}) {
+    const maxNodes = opts.maxNodes ?? ROUTE_MAX_NODES;
+    const pad = opts.pad ?? ROUTE_PAD;
+    const cache = opts.cache ?? new Map();
+    const s = bot.entity.position.floored();
+    // `dest` may be ONE point or a SET of them - any hover that puts the cell in reach will do, so
+    // search once for the nearest reachable one rather than committing to the first (see
+    // FLYNEAR_ROUTE_MAX_NODES for the measurement).
+    const maxRange = opts.maxRange ?? ROUTE_MAX_RANGE;
+    const goals = [];
+    for (const d of Array.isArray(dest) ? dest : [dest]) {
+        const g = new Vec3(Math.floor(d.x), Math.floor(d.y), Math.floor(d.z));
+        if (s.distanceTo(g) > maxRange) continue;
+        // A DESTINATION may legitimately be a cell the body cannot occupy (a hover point computed
+        // against geometry that has since been filled). That is a "no route", not a crash - drop
+        // it rather than searching the whole box for something that cannot be entered.
+        if (!flyable(bot, g.x, g.y, g.z, cache)) continue;
+        if (!goals.some(o => o.equals(g))) goals.push(g);
+    }
+    if (!goals.length) return null;
+    const goalKeys = new Set(goals.map(g => ckey(g.x, g.y, g.z)));
+
+    const lo = new Vec3(Math.min(s.x, ...goals.map(g => g.x)) - pad, Math.min(s.y, ...goals.map(g => g.y)) - pad, Math.min(s.z, ...goals.map(g => g.z)) - pad);
+    const hi = new Vec3(Math.max(s.x, ...goals.map(g => g.x)) + pad, Math.max(s.y, ...goals.map(g => g.y)) + pad, Math.max(s.z, ...goals.map(g => g.z)) + pad);
+    const inBox = (x, y, z) => x >= lo.x && x <= hi.x && y >= lo.y && y <= hi.y && z >= lo.z && z <= hi.z;
+    // Admissible for a goal SET: the distance to the nearest goal.
+    const h = (x, y, z) => { let m = Infinity; for (const g of goals) m = Math.min(m, Math.hypot(g.x - x, g.y - y, g.z - z)); return m; };
+
+    const start = { x: s.x, y: s.y, z: s.z, g: 0, parent: null };
+    start.f = h(s.x, s.y, s.z);
+    const open = new FHeap();
+    open.push(start);
+    const best = new Map([[ckey(s.x, s.y, s.z), 0]]);
+    const closed = new Set();
+    let expanded = 0;
+
+    while (open.size && expanded < maxNodes) {
+        const cur = open.pop();
+        const k = ckey(cur.x, cur.y, cur.z);
+        if (closed.has(k)) continue;
+        closed.add(k);
+        expanded++;
+
+        if (goalKeys.has(k)) {
+            const out = [];
+            for (let n = cur; n; n = n.parent) out.unshift(new Vec3(n.x + 0.5, n.y, n.z + 0.5));
+            return smoothRoute(bot, out, cache);
+        }
+
+        for (const [dx, dy, dz] of ROUTE_MOVES) {
+            const nx = cur.x + dx, ny = cur.y + dy, nz = cur.z + dz;
+            if (!inBox(nx, ny, nz)) continue;
+            const nk = ckey(nx, ny, nz);
+            if (closed.has(nk)) continue;
+            if (!flyable(bot, nx, ny, nz, cache)) continue;
+            const ng = cur.g + 1;
+            if (best.has(nk) && best.get(nk) <= ng) continue;
+            best.set(nk, ng);
+            open.push({ x: nx, y: ny, z: nz, g: ng, parent: cur, f: ng + h(nx, ny, nz) });
+        }
+    }
+    return null;   // no way in, or the budget ran out - both mean "do not pretend to fly there"
+}
+
+/**
+ * The NEAREST WAY OUT of a footprint: breadth-first over cells the body fits in, to the first one
+ * outside `box` (beyond its x/z edges, or above topY). Waypoints like planFlight, or null.
+ *
+ * The wedge rescue aims at ONE point - `parkSpot`, just beyond the nearest wall at the bot's own
+ * height - and plans to it with the ordinary 6,000-node A*. From deep inside a finished building
+ * that point is behind the wall, and the way to it winds out through a door or a window first.
+ * Measured 2026-09-26: the cathedral stopped at 95.5% with bob in the nave, `33.0 from open ground`,
+ * five rescues moving him under 1.6 blocks - while a flood fill from outside had already shown every
+ * interior hover there connects to open air. The question a rescue asks is "which way is out", not
+ * "how do I get to that point", and BFS answers it directly.
+ */
+export const ESCAPE_MAX_NODES = 60000;
+export function planEscape(bot, box, opts = {}) {
+    const maxNodes = opts.maxNodes ?? ESCAPE_MAX_NODES;
+    const cache = opts.cache ?? new Map();
+    const s = bot.entity.position.floored();
+    const out = (x, y, z) => x < box.minX || x > box.maxX || z < box.minZ || z > box.maxZ
+        || (box.topY !== undefined && box.topY !== null && y > box.topY);
+    const nodes = [{ x: s.x, y: s.y, z: s.z, parent: null }];
+    const seen = new Set([ckey(s.x, s.y, s.z)]);
+    for (let i = 0; i < nodes.length && i < maxNodes; i++) {
+        const cur = nodes[i];
+        if (i > 0 && out(cur.x, cur.y, cur.z)) {
+            const path = [];
+            for (let n = cur; n; n = n.parent) path.unshift(new Vec3(n.x + 0.5, n.y, n.z + 0.5));
+            return smoothRoute(bot, path, cache);
+        }
+        for (const [dx, dy, dz] of ROUTE_MOVES) {
+            const nx = cur.x + dx, ny = cur.y + dy, nz = cur.z + dz;
+            const k = ckey(nx, ny, nz);
+            if (seen.has(k)) continue;
+            seen.add(k);
+            if (!flyable(bot, nx, ny, nz, cache)) continue;
+            nodes.push({ x: nx, y: ny, z: nz, parent: cur });
+        }
+    }
+    return null;
+}
+
+/** Drop every waypoint the previous one can already see, so the route is few long legs. */
+function smoothRoute(bot, path, cache) {
+    if (path.length <= 2) return path;
+    const out = [path[0]];
+    let i = 0;
+    while (i < path.length - 1) {
+        let j = path.length - 1;
+        while (j > i + 1 && !clearLine(bot, path[i], path[j], cache)) j--;
+        out.push(path[j]);
+        i = j;
+    }
+    return out;
+}
+
+/**
+ * Fly a planned route leg by leg. Each leg is a straight line by construction, so `noDetour` is
+ * correct here: a leg that cannot be flown means the world changed under the plan, and the answer
+ * is to replan, not to improvise a climb.
+ *
+ * @returns {Promise<number>} distance remaining to the last waypoint
+ */
+export async function flyRoute(bot, path, opts = {}) {
+    const last = path[path.length - 1];
+    // HONOUR THE INTERRUPT, or this function becomes a busy loop that kills the client.
+    // `flyDirect` breaks instantly while `bot.interrupt_code` is set, so every leg returns with no
+    // progress, `freeSelf` does the same, and the caller replans - as fast as the CPU allows.
+    // Measured 2026-09-22 after a `!stop`: 1,524 `made no progress` lines and 781 wedges in 70
+    // seconds (4-6 per second, each reporting a 3535ms budget it never waited on), then
+    // `Agent bob disconnected` and `exited with code 1`. That is CLAUDE.md's "await is not a yield":
+    // a loop whose awaits all resolve immediately starves the event loop and the server drops us.
+    if (bot.interrupt_code) return bot.entity.position.distanceTo(last);
+    // UNSTRADDLE FIRST. The plan is a chain of cell centres and the body is 0.6 wide, so a bot
+    // sitting off-centre straddles two cells - and if either is solid it cannot leave along ANY
+    // leg until it centres itself. That is what produced `route leg 2/6 made no progress: needed
+    // 5.0, budget 1200ms, still 4.6 away`: 1200ms is 8 blocks of travel at 7 blocks/second, and
+    // the bot moved nothing at all, so the obstacle was never the budget. path[0] is the cell the
+    // bot is already in, which the loop below skips; flying to it is the cheap unwedge.
+    // SNAP TO THE GRID THE PLAN WAS MADE ON. Waypoints are cell centres at integer y, and
+    // `flyable` therefore clears exactly two cells - feet and head. A bot at a FRACTIONAL y (which
+    // is what `freeSelf` leaves behind: rise 1.9 from 67.5 and you are at 69.4) has its 1.8-tall
+    // body spanning THREE cells, and the third was never checked. Flying such a body along a plan
+    // that assumed two is how a 2.3-block leg with a 1200ms budget moves nothing at all.
+    if (path.length) {
+        // The vertical snap is a SUB-STEP move and must not go through flyDirect, which returns
+        // immediately for anything under STEP (`if (dist < 0.35) break`). Measured 2026-09-22: the
+        // first version of this snap used flyDirect and therefore could never perform the one move
+        // it exists for - the log still read `body is off-grid at y=72.25 (fraction 0.25)` right
+        // after it ran. A 0.25-block correction is exactly the case it refuses.
+        //
+        // Safe because path[0] is the cell the bot is already in and the planner has already
+        // asserted the body fits there; dropping to that cell's floor cannot enter a new block.
+        const here = bot.entity.position;
+        const floorY = Math.floor(here.y);
+        if (here.y - floorY > 0.05) {
+            bot.entity.position.set(here.x, floorY, here.z);
+            bot.entity.velocity.set(0, 0, 0);
+            await new Promise(r => setTimeout(r, 50));
+        }
+        // Then the horizontal unstraddle, which IS a normal move.
+        await flyDirect(bot, new Vec3(path[0].x, Math.floor(bot.entity.position.y), path[0].z),
+            { ...opts, timeoutMs: 900, noDetour: true });
+        const frac = bot.entity.position.y - Math.floor(bot.entity.position.y);
+        if (frac > 0.15 && frac < 0.85) {
+            console.log(`[${bot.username ?? '?'}] route: body still off-grid at `
+                + `y=${bot.entity.position.y.toFixed(2)} after snapping - something is holding it there`);
+        }
+    }
+    for (let i = 1; i < path.length; i++) {
+        if (bot.interrupt_code) return bot.entity.position.distanceTo(last);
+        const w = path[i];
+        const before = bot.entity.position.clone();
+        const need = before.distanceTo(w);
+        // A BUDGET THAT CANNOT COVER THE DISTANCE IS NOT A TIMEOUT, IT IS A REFUSAL. A flat 2500ms
+        // cannot fly a leg longer than ~10 blocks, and smoothing exists precisely to produce long
+        // legs: measured 2026-09-22 in the live build as 12 routes reached against 50
+        // planned-and-abandoned leaving 16-18 blocks.
+        //
+        // The rate is MEASURED, not derived. STEP/tick suggests 0.35 per 50ms = 7 blocks/second,
+        // but `tools/flight_check.mjs` in open air flew 20 blocks in 5251ms - 262ms per block, less
+        // than half the theoretical rate, because each step awaits a timer rather than riding the
+        // physics tick. Budgeting from the theoretical figure is how the first version of this line
+        // came out under-funded: 320ms/block leaves margin over the measurement instead.
+        const ms = Math.max(opts.minLegMs ?? 1200, Math.min(opts.maxLegMs ?? 9000, need * 320));
+        const short = await flyDirect(bot, w, { ...opts, timeoutMs: ms, noDetour: true });
+        const moved = bot.entity.position.distanceTo(before);
+        if (short <= 1.0) continue;
+        // Stuck on a leg the plan called clear: the world is not what the plan assumed. Say WHICH
+        // leg and by how much - "route left 16.8" alone cannot distinguish a wedged start from a
+        // budget that ran out halfway, and those need opposite fixes.
+        if (moved < 0.5) {
+            // Unwedge, then hand back so the caller REPLANS. Retrying this same waypoint after
+            // freeSelf has lifted the body two blocks flies a stale leg from a position the plan
+            // never saw - measured as `needed 2.3 ... rose 2.0, still 3.0 away`, i.e. the retry
+            // ended FURTHER from the waypoint than it started. A plan invalidated by our own
+            // recovery is not a plan to retry; it is one to throw away.
+            const rose = await freeSelf(bot, 3);
+            console.log(`[${bot.username ?? '?'}] route leg ${i}/${path.length - 1} made no progress: `
+                + `needed ${need.toFixed(1)}, budget ${ms.toFixed(0)}ms, rose ${rose.toFixed(1)} - replanning`);
+            return bot.entity.position.distanceTo(last);
+        }
+        console.log(`[${bot.username ?? '?'}] route leg ${i}/${path.length - 1} short: needed `
+            + `${need.toFixed(1)}, moved ${moved.toFixed(1)}, ${short.toFixed(1)} left (budget ${ms.toFixed(0)}ms)`);
+    }
+    return bot.entity.position.distanceTo(last);
 }
 
 /**
@@ -259,12 +642,44 @@ export function nearbyClearHovers(bot, P, radius = 3, maxEye = 4.0) {
                 const eyeD = new Vec3(p.x, p.y + EYE_HEIGHT, p.z).distanceTo(centre);
                 if (eyeD > maxEye || eyeD < 1.2) continue;
                 if (!hoverIsClear(bot, p)) continue;
-                out.push({ p, eyeD });
+                out.push({ p, eyeD, boxed: isBoxedIn(bot, p) });
             }
         }
     }
-    out.sort((a, b) => a.eyeD - b.eyeD);
+    // OPEN CELLS FIRST, then by distance. A free cell under a roof is a place the body can get
+    // INTO and then not get out of: measured 2026-09-23 on the wizard tower, where bob was
+    // repeatedly sealed inside his own build (`NO ROUTE for a 0.6x1.8 body ... no body-sized
+    // opening`, and an escape that reported `the obstruction is sideways`). Only 45 of the 922
+    // cells he had left actually required being inside - he was ending up there because this scan
+    // returns "anywhere nearby that is free" and a roofed cell is nearer than an open one.
+    //
+    // A PREFERENCE, NOT A FILTER. Interior work is real work, and refusing roofed hovers would
+    // make the inside of every finished building unbuildable. Ordering costs nothing when the open
+    // cell works and loses nothing when it does not, because the roofed candidates are still
+    // there, just later.
+    out.sort((a, b) => (a.boxed - b.boxed) || (a.eyeD - b.eyeD));
     return out.map((o) => o.p);
+}
+
+/**
+ * Is this hover point under a roof - i.e. somewhere the body can enter and then be sealed into?
+ *
+ * A cheap proxy for "connected to open air": scan straight up. Anything solid overhead within
+ * `lift` means the cell is inside something. It cannot distinguish a courtyard from open sky, and
+ * does not try: it only has to rank two free cells against each other, and the cost of being wrong
+ * is trying the second candidate instead of the first.
+ *
+ * An unloaded chunk reads as null, which is NOT free space - the same rule hoverIsClear follows -
+ * so an unreadable column counts as boxed in rather than open.
+ */
+export function isBoxedIn(bot, p, lift = 6) {
+    const x = Math.floor(p.x), z = Math.floor(p.z), y0 = Math.floor(p.y);
+    for (let dy = 2; dy <= lift; dy++) {
+        const b = bot.blockAt(new Vec3(x, y0 + dy, z));
+        if (!b) return 1;
+        if (b.boundingBox === 'block') return 1;
+    }
+    return 0;
 }
 
 /**
@@ -365,12 +780,32 @@ export async function flyNear(bot, P, reach = FLY_REACH, opts = {}) {
     // of the wall clock. Blocked candidates are free to reject, so only flights are charged.
     const budgetUntil = Date.now() + (opts.budgetMs ?? 6000);
     const rejected = [];
+    const lineCache = new Map();
     let freed = false;   // only one unwedge attempt per call
     for (const p of tries) {
+        // An interrupt is a stop, not a reason to try the next candidate: every subsequent attempt
+        // would return instantly and the loop would spin.
+        if (bot.interrupt_code) { rejected.push('interrupted'); break; }
         if (!hoverIsClear(bot, p)) { rejected.push(`blocked@${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}`); continue; }
         if (Date.now() > budgetUntil) { rejected.push('budget spent'); break; }
+        // A BLOCKED STRAIGHT LINE IS NOT WORTH A DIRECT FLIGHT. The direct attempt is a straight
+        // leg plus an over-the-top detour, up to its whole timeout each, and inside a standing
+        // building the line almost always crosses masonry: measured 2026-09-26 on the cathedral's
+        // leftover cells, 86 flyNear failures to 46 route successes in 25 minutes, the budget spent
+        // bumping walls before the planner ever ran. The planner below finds any over-the-top way
+        // too, in ~23ms, so a blocked line goes straight to it. (Skipped only while the body is
+        // somewhere it can be - a wedged start reads every line as blocked, and then the direct
+        // attempt is what triggers freeSelf.)
+        if (flyable(bot, Math.floor(bot.entity.position.x), Math.floor(bot.entity.position.y), Math.floor(bot.entity.position.z), lineCache)
+            && !clearLine(bot, bot.entity.position.clone(), new Vec3(p.x, p.y, p.z), lineCache)) {
+            rejected.push(`line blocked@${p.x.toFixed(1)},${p.y.toFixed(1)},${p.z.toFixed(1)}`);
+            continue;
+        }
         const was = bot.entity.position.clone();
-        const short = await flyTo(bot, p, { ...opts, timeoutMs: Math.min(opts.timeoutMs ?? 4000, Math.max(600, budgetUntil - Date.now())) });
+        // route: false - this is the CHEAP pass over up to fourteen candidates. Planning here would
+        // pay for the search fourteen times to answer one question; the single planned attempt
+        // happens once, after this loop.
+        const short = await flyTo(bot, p, { ...opts, route: false, timeoutMs: Math.min(opts.timeoutMs ?? 4000, Math.max(600, budgetUntil - Date.now())) });
         const d = eyeDistanceTo(bot, P);
         if (d <= reach + 1.5) return true;
         rejected.push(`flew short by ${short.toFixed(1)}, eye ${d.toFixed(1)}`);
@@ -384,6 +819,36 @@ export async function flyNear(bot, P, reach = FLY_REACH, opts = {}) {
         }
     }
     if (eyeDistanceTo(bot, P) <= reach + 1.5) return true;
+
+    // ONE planned route, after everything cheap has failed. This is the case that dominates the
+    // end of a build: the cell is inside a shell the bot has just finished closing, and no
+    // straight line or climb can reach it - measured 2026-09-22 as 5,238 consecutive flyNear
+    // failures and `0 placed` while bob sat at its station above the tower. A* over cells the body
+    // fits in either finds the way in or says there is none, and "there is none" is a useful
+    // answer: it is what tells the caller to defer the cell rather than retry it forever.
+    // EVERY clear candidate is a goal. Planning to the first alone failed whenever that one sat in a
+    // pocket the others did not (see FLYNEAR_ROUTE_MAX_NODES).
+    const routable = tries.filter(p => hoverIsClear(bot, p));
+    if (routable.length) {
+        // Two attempts, and the second REPLANS rather than repeating. A leg that made no progress
+        // means the world is not what the plan assumed - usually the body started wedged, and
+        // `freeSelf` above has since moved it - so the useful retry is a new plan from where the
+        // bot actually is, not the same waypoints again. (A retry that can fail identically must
+        // not be taken.)
+        for (let attempt = 0; attempt < 2 && !bot.interrupt_code; attempt++) {
+            const plan = planFlight(bot, routable, { maxNodes: FLYNEAR_ROUTE_MAX_NODES });
+            if (!plan) { rejected.push('no route (sealed or out of range)'); break; }
+            const short = await flyRoute(bot, plan, { timeoutMs: 2500 });
+            const d = eyeDistanceTo(bot, P);
+            if (d <= reach + 1.5) {
+                console.log(`[${bot.username ?? '?'}] flyNear (${P.x}, ${P.y}, ${P.z}) reached by route `
+                    + `(${plan.length} legs${attempt ? ', replanned' : ''}) after ${rejected.length} direct attempts failed`);
+                return true;
+            }
+            rejected.push(`route of ${plan.length} legs left ${short.toFixed(1)}, eye ${d.toFixed(1)}`);
+            if (attempt === 0) await freeSelf(bot, 3);
+        }
+    }
     console.log(`[${bot.username ?? '?'}] flyNear (${P.x}, ${P.y}, ${P.z}) failed: ${rejected.join(' | ') || 'no candidates'}`);
     return false;
 }

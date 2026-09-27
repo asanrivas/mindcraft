@@ -23,10 +23,15 @@ resource as contended:
 - **Announce before any world-modifying RCON command** (`fill`, `setblock`, `tp`, `give`,
   `difficulty`, `time set`). Another session's gym run is somebody's evidence.
 - **Partition files.** Do not edit a file another session is live in. Say which files you own.
-- **`package.json`'s `test` script is a single line every session edits.** Concurrent writes
-  silently dropped **four suites**. Never hand-edit it — regenerate it from
-  `glob('tests/*.test.mjs')` so a lost suite is impossible rather than merely unlikely. (53 suites /
-  53 files as of 2026-08-31; if those numbers disagree, a write was lost.)
+- **`package.json`'s `test` script no longer lists the suites, and must not go back to doing so.**
+  It is `bun tests/run_all.mjs`, which globs `tests/*.test.mjs` at RUN time, so a suite that exists
+  is a suite that runs. The list it replaced was the most contended line in the repo — every
+  session edited it, and concurrent writes silently dropped suites twice, most recently 54 entries
+  against 62 files on disk, so **eight** suites were skipped by `bun run test` including every one
+  written since. "Regenerate it from a glob" was the old rule and it only worked while everyone
+  remembered; deleting the list is the actual fix. The runner also runs the suites in parallel
+  (23s → 13s here) and prints output only for failures. `bun tests/x.test.mjs` still works
+  unchanged, and is still how you debug one.
 
 ## Quick Reference
 
@@ -34,8 +39,9 @@ resource as contended:
 systemctl --user restart mindcraft       # ANNOUNCE FIRST - restarts BOTH bots
 tailgate                                 # LIVE combined view: bot + server console
 tail -f logs/service.log                 # Bot log only
+bun tools/build_status.mjs --watch       # A running blueprint build: rate, ETA, failures (also a panel in the web UI)
 bun install && bun run main.js           # Start manually
-bun run test                             # All unit suites (no server needed)
+bun run test                             # Every tests/*.test.mjs in parallel, ~13s (no server needed)
 npx patch-package [pkg]                  # Patch node_modules
 
 # RCON server console (mc -> tools/rcon.mjs; password in ~/.config/mc-rcon.env)
@@ -45,8 +51,15 @@ mc "tp andy 1500 65 -900"                # Teleport
 mc "difficulty"                          # READ it - do not assume; it has changed 3x unannounced
 ```
 
-**RCON: use ONE persistent connection.** Reconnecting per command stalls the server after ~13 rapid
-cycles, and `socket.setTimeout` does not fire on it.
+**RCON: never write two frames in one event-loop tick.** Node coalesces same-tick writes into one
+TCP segment and this server reads ONE packet per socket read, discarding the rest — so the second
+frame is dropped, its reply never comes, and the connection is wedged. Measured `list` x5 on one
+connection: pipelined **1/5** then endless timeouts, spaced 30ms **5/5**, one-at-a-time **8/8**.
+"Reconnecting stalls it after ~13 cycles" was this same defect misattributed. `tools/rcon.mjs`
+serialises for you and takes many commands over one connection on stdin
+(`printf 'a\nb\n' | bun tools/rcon.mjs -`). **Silence there is an ERROR, never an empty success** —
+it used to print a blank line and exit 0, and a `give` that never ran read as done.
+Evidence: docs/OPERATIONS.md.
 
 **NBT reads over RCON are unreliable.** `data get` truncates long values (~120 chars — a full
 inventory read as empty, which looked like a bug in working code) and keys move between versions:
@@ -190,7 +203,7 @@ numbers quoted here).
 
 ## Commands
 
-**Build** `!fill` · **Move** `!travel` `!navTo` `!goToPlayer` `!followPlayer` `!climbOut` ·
+**Build** `!fill` `!placeWithSupport` · **Move** `!travel` `!navTo` `!goToPlayer` `!followPlayer` `!climbOut` ·
 **Water** `!swimTo` `!dive` `!surface` `!swimProbe` · **Combat** `!shoot` (refuses players) ·
 **World, operator** `!worldSeed` `!locateBiome` `!serverGive` `!serverGamemode` `!serverSpawnpoint`
 · **Resources** `!collectBlocks` `!craftRecipe` `!getCraftingPlan` · **Storage** `!putInChest`

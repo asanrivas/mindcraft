@@ -69,6 +69,20 @@ if (process.env.MINECRAFT_PORT) {
 if (process.env.MINDSERVER_PORT) {
     settings.mindserver_port = process.env.MINDSERVER_PORT;
 }
+// A SECOND main.js on one host collides here, and the collision is fatal. The viewer binds
+// `3000 + count_id`, so a separate process running one bot also asks for 3000 - already held
+// by the first process's first bot. prismarine-viewer's express listen error is ASYNC, so the
+// try/catch around addBrowserViewer in agent.js cannot catch it: the agent dies with
+// `EADDRINUSE ... Is port 3000 in use?` AFTER reporting "logged in", and main.js then
+// respawns it into the crash loop CLAUDE.md describes. Measured 2026-09-24 starting andy
+// alongside a running bob.
+// RENDER_BOT_VIEW=false turns the viewer off for this process; VIEWER_PORT_BASE moves it.
+if (process.env.RENDER_BOT_VIEW) {
+    settings.render_bot_view = process.env.RENDER_BOT_VIEW !== 'false';
+}
+if (process.env.VIEWER_PORT_BASE) {
+    settings.viewer_port_base = Number(process.env.VIEWER_PORT_BASE);
+}
 if (process.env.PROFILES && JSON.parse(process.env.PROFILES).length > 0) {
     settings.profiles = JSON.parse(process.env.PROFILES);
 }
@@ -77,6 +91,18 @@ if (process.env.INSECURE_CODING) {
 }
 if (process.env.BLOCKED_ACTIONS) {
     settings.blocked_actions = JSON.parse(process.env.BLOCKED_ACTIONS);
+}
+// Two bots under SEPARATE MindServers cannot see each other as agents: serverProxy.agents
+// only holds its own, so getNumOtherAgents() is 0 on both sides and each falls through to
+// "single agent mode - respond to all public chat", treating the other as an ordinary player.
+// They then answer each other forever, one full LLM turn per line, billed on both accounts.
+// Measured 2026-09-24 running andy beside bob: 627 messages from andy on bob's side and 124
+// back, inside a few minutes, while bob was mid-build. settings.js line 28 records the same
+// runaway from 2026-08-26; what stopped it then was bob's only_chat_with list.
+// Per-process override so a second bot can be told to ignore the first without changing the
+// shared default, which would also alter the other bot on ITS next restart.
+if (process.env.ONLY_CHAT_WITH) {
+    settings.only_chat_with = JSON.parse(process.env.ONLY_CHAT_WITH);
 }
 if (process.env.MAX_MESSAGES) {
     settings.max_messages = process.env.MAX_MESSAGES;

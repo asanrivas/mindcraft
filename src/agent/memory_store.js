@@ -186,6 +186,53 @@ const PROSE_MIN_TOKENS = 5;
 const PROSE_EXACT_MIN_TOKENS = 2;
 
 /**
+ * Would `put` fold these two prose values onto one row by its own rules? The same test the
+ * store applies - Jaccard at PROSE_DUPLICATE_AT for sentences of PROSE_MIN_TOKENS or more,
+ * exact content-word sequence below that - exported so the Jev second opinion
+ * (memory_fold_jev.js) asks only about the pairs this rule DECLINES, which is the union
+ * scratchpad/fold_gym.mjs measured. Keep it in step with `put`.
+ */
+export function wouldFold(a, b) {
+    const ta = proseTokens(a), tb = proseTokens(b);
+    if (ta.length >= PROSE_MIN_TOKENS && tb.length >= PROSE_MIN_TOKENS)
+        return proseSimilarity(ta, tb) >= PROSE_DUPLICATE_AT;
+    if (ta.length >= PROSE_EXACT_MIN_TOKENS && ta.length < PROSE_MIN_TOKENS
+        && tb.length >= PROSE_EXACT_MIN_TOKENS && tb.length < PROSE_MIN_TOKENS)
+        return proseSequence(a).join(' ') === proseSequence(b).join(' ');
+    return false;
+}
+
+/** How a fold hint is addressed: one kind, one exact value as `importLegacyBlob` will put it. */
+export function foldHintKey(kind, value) { return `${kind}\n${value}`; }
+
+/** A lesson/note row's key: its normalised content, identity only, never rendered. */
+export function proseKey(clean) { return normalizeKey(clean).slice(0, 48) || clean.slice(0, 32); }
+
+/**
+ * The lesson and note lines `importLegacyBlob` will write, parsed by the SAME rules (section
+ * split, heading map, bullet strip) so an async pre-pass sees exactly the values `put` will get.
+ * tests/memory_fold_jev.test.mjs asserts the two stay in step.
+ * @returns {{kind: string, value: string}[]}
+ */
+export function legacyProseEntries(text) {
+    if (typeof text !== 'string' || !text.trim()) return [];
+    const byHeading = Object.fromEntries(Object.entries(HEADINGS).map(([k, v]) => [v.toLowerCase(), k]));
+    const out = [];
+    for (const section of text.split(/^##\s+/m).filter(s => s.trim())) {
+        const nl = section.indexOf('\n');
+        const heading = (nl === -1 ? section : section.slice(0, nl)).trim().toLowerCase();
+        const body = (nl === -1 ? '' : section.slice(nl + 1)).trim();
+        const kind = byHeading[heading] || KIND.NOTE;
+        if (!body || !PROSE_KINDS.has(kind)) continue;
+        for (const line of body.split('\n')) {
+            const clean = line.replace(/^[-*]\s*/, '').trim();
+            if (clean) out.push({ kind, value: clean });
+        }
+    }
+    return out;
+}
+
+/**
  * Reinforcement, and the ratchet it caused.
  *
  * `_evict` ranks by `revision` - how many times a fact has been independently re-learned - and
@@ -421,6 +468,13 @@ export class MemoryStore {
         this.rejections = 0;
         /** @type {object[]} every row eviction has taken, so a discard is never silent */
         this.evicted = [];
+        /**
+         * Record ids `_evict` must not take on this write: a row a vetoed contradiction disputes
+         * (see `put`'s `disputes`). Cleared after every eviction pass, so it never outlives the
+         * write that set it and general eviction policy is untouched.
+         * @type {Set<string>}
+         */
+        this._protected = new Set();
     }
 
     /**
@@ -433,7 +487,19 @@ export class MemoryStore {
      * @param {string} r.origin  ORIGIN.USER | AGENT | SYSTEM
      * @returns {{ok:boolean, reason?:string, record?:object}}
      */
-    put({ kind, key, value, origin = ORIGIN.AGENT }) {
+    /**
+     * `foldInto` / `noFold` are hints from an async second opinion (memory_fold_jev.js), for
+     * prose kinds only. `foldInto`: the key of a row that states the same lesson - it outranks the
+     * word-overlap rules, honoured only while that row exists and is agent-authored. `noFold`:
+     * the rules below WOULD fold this line, and the model says it contradicts that row ("not
+     * case-sensitive" vs "case-sensitive" are one token set) - so it is kept as its own row.
+     * `disputes`: with `noFold`, the key of the row this line contradicts. That row is exempt
+     * from THIS write's eviction - otherwise, at capacity, the contradiction evicts the very
+     * lesson it argues with (measured on bob's store: the disputed row is his only revision-1
+     * lesson, so it is deterministically the casualty). Someone is told instead; see
+     * memory_fold_jev.announceConflicts. Without hints the store's own rules decide, as before.
+     */
+    put({ kind, key, value, origin = ORIGIN.AGENT, foldInto = null, noFold = false, disputes = null }) {
         if (!kind || typeof kind !== 'string') return this._reject('missing kind');
         if (typeof value !== 'string' || !value.trim()) return this._reject('empty value');
         if (!Object.values(ORIGIN).includes(origin)) return this._reject(`bad origin "${origin}"`);
@@ -442,7 +508,14 @@ export class MemoryStore {
         // Fold onto an existing row that means the same thing, so a re-worded restatement UPDATES
         // the fact rather than adding a third copy of it. Match on the normalised key first, then
         // on the normalised value - two different keys can carry one fact ("Coal" / "Coal ore").
-        if (kind !== KIND.GOAL) {
+        // Each flag does what its name says, independently: `disputes` only adds the eviction
+        // exemption; a hint (`foldInto`, or `noFold` alone) bypasses the rules below entirely.
+        // The `else` binds to the HINT test - it once bound to the disputes test, which ran the
+        // fuzzy fold for `noFold` without `disputes` and let rules override a `foldInto`.
+        if (noFold && disputes && PROSE_KINDS.has(kind)) this._protected.add(recordId(kind, disputes));
+        const hinted = this._hintedKey(kind, k, value, foldInto, noFold);
+        if (hinted !== null) k = hinted;
+        else if (kind !== KIND.GOAL) {
             const nk = normalizeKey(k), nv = normalizeValue(value);
             let folded = false;
             for (const r of this.records.values()) {
@@ -521,6 +594,25 @@ export class MemoryStore {
     }
 
     /** @returns {object|null} */
+    /** The key a fold hint dictates, or null to let the store's own rules decide. See `put`. */
+    _hintedKey(kind, k, value, foldInto, noFold) {
+        if (!PROSE_KINDS.has(kind)) return null;
+        if (foldInto) {
+            const target = this.records.get(recordId(kind, foldInto));
+            if (target && target.origin === ORIGIN.AGENT) return target.key;
+        }
+        if (noFold) {
+            // Its own row even if its key collides with the row it contradicts - keys are cut at
+            // 48 characters, and landing on that id would overwrite the lesson it disagrees with.
+            const v = value.trim();
+            for (let n = 1, cand = k; ; cand = `${k}~${++n}`) {
+                const ex = this.records.get(recordId(kind, cand));
+                if (!ex || ex.value === v) return cand;
+            }
+        }
+        return null;
+    }
+
     get(kind, key = 'current') {
         return this.records.get(recordId(kind, key)) || null;
     }
@@ -650,12 +742,12 @@ export class MemoryStore {
      * logged - or not at all. Only the one-time legacy migration passes `allowGoal: true`,
      * because there the blob IS the previous state rather than a fresh invention.
      */
-    importLegacyBlob(text, { allowGoal = false } = {}) {
+    importLegacyBlob(text, { allowGoal = false, foldHints = null } = {}) {
         if (typeof text !== 'string' || !text.trim()) return 0;
-        return this._batch(() => this._importLegacyBlob(text, { allowGoal }));
+        return this._batch(() => this._importLegacyBlob(text, { allowGoal, foldHints }));
     }
 
-    _importLegacyBlob(text, { allowGoal }) {
+    _importLegacyBlob(text, { allowGoal, foldHints = null }) {
         let imported = 0;
         this.skippedGoals = 0;
         this.skippedPlaces = 0;
@@ -687,7 +779,7 @@ export class MemoryStore {
                     // where the key was a TRUNCATED PREFIX OF ITS OWN VALUE, displayed twice.
                     // Key them by normalised content instead - identity only, never rendered.
                     value = clean;
-                    key = normalizeKey(clean).slice(0, 48) || clean.slice(0, 32);
+                    key = proseKey(clean);
                 } else {
                     const m = clean.match(/^([^:]{1,40}):\s*(.+)$/);
                     key = m ? m[1].trim() : clean.slice(0, 32);
@@ -701,7 +793,9 @@ export class MemoryStore {
                     this.prunedPlaces += this._pruneTransientPlace(key);
                     continue;
                 }
-                if (this.put({ kind, key, value, origin: ORIGIN.AGENT }).ok) imported++;
+                const hint = PROSE_KINDS.has(kind) ? foldHints?.get(foldHintKey(kind, value)) : null;
+                if (this.put({ kind, key, value, origin: ORIGIN.AGENT, foldInto: hint?.into ?? null,
+                    noFold: hint?.veto === true, disputes: hint?.veto ? (hint.against ?? null) : null }).ok) imported++;
             }
         }
         // Never silent - see `skippedGoals` above and CLAUDE.md's "an override is never
@@ -786,13 +880,23 @@ export class MemoryStore {
      * Bounding each kind at its own cap means a runaway section can only ever crowd out itself.
      */
     _evict() {
+        // Protection lasts exactly one pass - every exit, including the early return below.
+        try { this._evictPass(); } finally { this._protected.clear(); }
+    }
+
+    _evictPass() {
         for (const [kind, cap] of Object.entries(KIND_CAPS)) {
             const mine = [...this.records.values()].filter(r => r.kind === kind);
             let over = mine.length - cap;
             if (over <= 0) continue;
 
-            const agentRows = mine.filter(r => r.origin === ORIGIN.AGENT);
-            const slots = probationSlots(cap, mine.length - agentRows.length);
+            // A disputed row is never this pass's casualty; if nothing else can go, the kind sits
+            // one over its cap until the next write rather than losing the lesson in question.
+            // Slots are sized from ALL agent rows, protected or not - excluding one here would
+            // count it as a user row and quietly resize the probation slice for this write.
+            const allAgent = mine.filter(r => r.origin === ORIGIN.AGENT);
+            const slots = probationSlots(cap, mine.length - allAgent.length);
+            const agentRows = allAgent.filter(r => !this._protected.has(r.id));
 
             // Below the threshold a row has not yet proved itself, so it is ranked on what
             // evidence it does have (least-reinforced, then oldest - a row that has sat through
@@ -839,7 +943,7 @@ export class MemoryStore {
         }
         if (this.records.size <= this.maxRecords) return;
         const agentRows = [...this.records.values()]
-            .filter(r => r.origin === ORIGIN.AGENT)
+            .filter(r => r.origin === ORIGIN.AGENT && !this._protected.has(r.id))
             .sort((a, b) => a.updated - b.updated);
         while (this.records.size > this.maxRecords && agentRows.length) {
             this._discard(agentRows.shift(), 'global record cap');

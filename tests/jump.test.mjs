@@ -203,5 +203,39 @@ function fakeBot() {
     check('active self-expires even if nobody calls end()', ja.active, false);
 }
 
+// --- the shipped assist configuration -----------------------------------------------------
+// A RULE THAT IS ONLY A PARAGRAPH IS ADVISORY; AN ASSERTION IS OPERATIVE. This guards the one
+// inference the docs actively invite someone to make and get wrong.
+//
+// CLAUDE.md now states loudly that `onGround` is NOT broken here - a clean mineflayer bot
+// measures 60/60 true and a vanilla 1.252 apex on this server, and the old "apex 0.000" came
+// from a sim that FORCES the flag false and then measures no jump. That correction is right and
+// it has to be there, because its absence is what makes people rebuild workarounds.
+//
+// But it sits next to `settings.assists`, which turns each assist off in one word. The reader
+// who joins those two facts concludes "the flag is fine, so the workaround is unnecessary",
+// flips jump_assist off, and the climb gym silently drops from 4/4 to 1/4 with no obvious cause.
+// The two facts are NOT in tension: the flag is fine AND the asserted take-off is still what
+// makes a pillar step reliable. Measured 2026-08-30, four stone cases per arm:
+//
+//     baseline, all on   4/4      jump_assist off   1/4   (three cases die at exactly +4.0)
+//     auto_jump off      3/4      ground_truth off  4/4   and faster in 3 of 4
+//
+// To re-run that experiment, flip a switch, run scratchpad/updig_gym.mjs, and flip it back -
+// do not COMMIT it flipped. This test guards the shipped default, not your working tree.
+{
+    const settings = (await import('../settings.js')).default;
+    const a = settings.assists ?? {};
+    const c = (l, g, w) => { if (g !== w) { console.error(`FAIL ${l}: got ${g}, expected ${w}`); failures++; } };
+
+    c('jump_assist ships ENABLED - 1/4 without it, measured', a.jump_assist !== false, true);
+    c('auto_jump ships ENABLED - loses stone 12 without it', a.auto_jump !== false, true);
+    c('swim_assist ships ENABLED - it owns the jump key while wet', a.swim_assist !== false, true);
+    // The converse: ground_truth showed NO benefit and cost time, so shipping it on would be
+    // the same unexamined-workaround habit in the other direction. It fires on 0 of 60 ticks on
+    // flat ground; the code stays for the rare case, the default does not.
+    c('ground_truth ships DISABLED - no measured benefit', a.ground_truth === false, true);
+}
+
 if (failures) { console.error(`\n${failures} check(s) FAILED`); process.exit(1); }
 console.log('jump: all checks passed');

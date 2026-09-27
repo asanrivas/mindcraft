@@ -18,6 +18,7 @@
  * expose window.pv for tools/timelapse.mjs -> rebuild the browser bundles.
  */
 import { createRequire } from 'module';
+import { createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
@@ -103,13 +104,92 @@ window.pv = {
     say('patched lib/index.js to expose window.pv');
 }
 
-// 5. Rebuild the browser bundles so they carry minecraft-data for this version and the patch
-//    above. The worker bundle is the slow one (~4.5 min, 121MB); the index bundle is ~6s.
-if (!fs.existsSync(path.join(PV, 'node_modules/webpack'))) {
-    say('installing webpack into prismarine-viewer (one time)');
-    run('bun', ['add', '-d', 'webpack@^5', 'webpack-cli@^6'], PV);
+// 5. Keep three's legacy side-effect shim, or the viewer renders a BLACK SCREEN.
+//
+//    `lib/index.js` line 5 is a bare `require('three/examples/js/controls/OrbitControls')`
+//    whose exports are never used - the module exists only for its last line,
+//    `THREE.OrbitControls = OrbitControls`. three's package.json declares
+//    `"sideEffects": false`, so webpack 5 tree-shakes that module away entirely and leaves
+//    the call site at line 23 with nothing defining it:
+//
+//      pageerror: THREE.OrbitControls is not a constructor
+//
+//    That throw lands BETWEEN `new Viewer(renderer)` (line 21) and `window.pv = {...}`
+//    (line 25), so the canvas is created and then nothing is ever drawn on it: no socket
+//    handlers, no render loop, no window.pv. Measured 2026-09-22 against the live viewer -
+//    `typeof THREE.OrbitControls === 'undefined'`, `window.viewer === undefined`, and an
+//    all-black 800x512 screenshot. It is NOT darkness; it looks identical at noon.
+//
+//    The prebuilt bundle prismarine-viewer ships was not built by webpack 5, which is why
+//    this appears only after step 6 has run once. Marking that path side-effectful is the
+//    whole fix. Appended after the config's own object literals so nothing has to be parsed.
+const wpFile = path.join(PV, 'webpack.config.js');
+let wp = fs.readFileSync(wpFile, 'utf8');
+if (!wp.includes('mindcraft: keep three')) {
+    wp = wp.replace('module.exports = [indexConfig, workerConfig]',
+        `// PATCHED (mindcraft: keep three's legacy examples/js shims). three declares
+// "sideEffects": false, so webpack 5 drops the OrbitControls shim that lib/index.js needs
+// and the viewer renders black. See tools/setup_viewer_assets.mjs step 5.
+indexConfig.module = indexConfig.module || {}
+indexConfig.module.rules = (indexConfig.module.rules || []).concat([
+  { include: /three[\\/\\\\]examples[\\/\\\\]js/, sideEffects: true }
+])
+
+module.exports = [indexConfig, workerConfig]`);
+    fs.writeFileSync(wpFile, wp);
+    say('patched webpack.config.js to keep three/examples/js side effects');
 }
-say('rebuilding browser bundles - the worker bundle takes several minutes');
-run(path.join(PV, 'node_modules/.bin/webpack'), [], PV);
+
+// 6. Rebuild the browser bundles so they carry minecraft-data for this version and the patches
+//    above. The worker bundle is the slow one (~4.5 min, 121MB); the index bundle is ~6s.
+//
+//    Invoked through THIS runtime rather than through `node_modules/.bin/webpack`. That shim
+//    starts `#!/usr/bin/env node`, so on a host running the project under bun with no `node`
+//    on PATH the whole step died with `env: 'node': No such file or directory` - after the
+//    atlas had already been installed, which made it look like the rebuild had succeeded.
+//    SKIPPED WHEN NOTHING CHANGED, because this build is the most expensive thing in the
+//    repo. Measured 2026-09-22 on a 2-core 11.9GB arm64 host that also runs the Minecraft
+//    server (2.7GB): webpack peaked at 5.5-5.7GB RSS and drove available memory down to
+//    809MB, at which point another session killed it to save the box. Re-running it when the
+//    output would be byte-identical spends that for nothing.
+//
+//    webpack's own `output.compareBeforeEmit` already avoids REWRITING an identical file -
+//    which is why worker.js can keep an older mtime after a successful build - but it still
+//    does the whole build to find that out. The stamp below skips the build itself.
+//
+//    Fingerprint, not mtime: mtimes change when `bun install` reinstalls identical files.
+const stampFile = path.join(PV, 'public/.mindcraft-stamp.json');
+const fingerprint = () => {
+    const h = createHash('sha256');
+    h.update(VERSION);
+    for (const f of ['lib/index.js', 'webpack.config.js', 'viewer/lib/version.js']) {
+        h.update(fs.readFileSync(path.join(PV, f)));
+    }
+    // Bundle size, so a truncated or half-written bundle never counts as current.
+    for (const b of ['public/index.js', 'public/worker.js']) {
+        const p2 = path.join(PV, b);
+        h.update(String(fs.existsSync(p2) ? fs.statSync(p2).size : 0));
+    }
+    return h.digest('hex');
+};
+const bundlesExist = ['public/index.js', 'public/worker.js'].every(b => fs.existsSync(path.join(PV, b)));
+let stamp = null;
+try { stamp = JSON.parse(fs.readFileSync(stampFile, 'utf8')); } catch { /* absent or corrupt */ }
+const current = bundlesExist && stamp && stamp.fingerprint === fingerprint();
+
+if (current && !process.env.VIEWER_FORCE_REBUILD) {
+    say(`browser bundles already current for ${VERSION} - skipping the rebuild `
+        + '(set VIEWER_FORCE_REBUILD=1 to force it)');
+} else {
+    if (!fs.existsSync(path.join(PV, 'node_modules/webpack'))) {
+        say('installing webpack into prismarine-viewer (one time)');
+        run(process.argv0 === 'bun' ? 'bun' : process.execPath, ['add', '-d', 'webpack@^5', 'webpack-cli@^6'], PV);
+    }
+    say('rebuilding browser bundles - the worker bundle takes several minutes and peaks near 6GB');
+    const wpCli = path.join(PV, 'node_modules/webpack-cli/bin/cli.js');
+    run(process.execPath, [wpCli], PV);
+    // Written only after webpack returns 0, so a killed build is never recorded as current.
+    fs.writeFileSync(stampFile, JSON.stringify({ version: VERSION, fingerprint: fingerprint(), at: new Date().toISOString() }, null, 2));
+}
 
 say(`done. Restart the bot, then check the log for "Using version: ${VERSION}".`);

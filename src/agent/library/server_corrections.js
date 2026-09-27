@@ -36,6 +36,33 @@
 export const TELEPORT_MIN_BLOCKS = 8;
 
 /**
+ * How far the bot must be moved before a running action is CANCELLED, as opposed to merely
+ * reported.
+ *
+ * Separate from TELEPORT_MIN_BLOCKS on purpose, and deliberately NOT a retune of it: that constant
+ * answers "did the server relocate us deliberately", which is what SwimAssist's anti-cheat valve
+ * needs, and moving it would silently change the valve (the warning above this file's threshold
+ * exists for exactly that). This one answers a different question - "is the destination we were
+ * walking to still meaningful?" - and a 15-block nudge does not make a target 50 blocks away
+ * wrong.
+ *
+ * MEASURED over every teleport in this repo's logs (17 events, `grep -E "TELEPORTED [0-9]+ blocks
+ * .* during action:"`). The distribution is cleanly bimodal with nothing in between:
+ *
+ *   8-21 blocks, 13 events   server corrections, during navTo (5), travel (4), groundProbe (2),
+ *                            buildBlueprint (2); dy mostly 0-3
+ *   173-1181 blocks, 4 events  somebody moved the bot, during collectBlocks, chestDepositAll,
+ *                            navTo, travel
+ *
+ * So TELEPORT_MIN_BLOCKS's own comment - "8 blocks is far above any correction observed here" -
+ * was true when written and is not true now. Cancelling on the small ones is a false alarm that
+ * throws away a running action and tells the model not to resume: measured 2026-09-22 killing a
+ * `!navTo` mid-walk after a 15-block correction, which then read as the bot refusing to go where
+ * it was sent. 32 sits above every measured correction and below every measured real teleport.
+ */
+export const TELEPORT_CANCEL_BLOCKS = 32;
+
+/**
  * Below this, the server did not disagree with us - it re-synced a position we already held.
  *
  * Counting those is how a valve trips on a bot standing still: this server sends position

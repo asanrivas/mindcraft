@@ -7,6 +7,7 @@ import { initModes } from './modes.js';
 import { difficultyName, installDifficultyField } from './difficulty.js';
 import { reconnectDirective, standDownIsCurrent, isStandDown } from './resume_policy.js';
 import { deixisVerdict } from './deixis.js';
+import { routeByIntent } from './system_one_router.js';
 import { initBot } from '../utils/mcdata.js';
 import { containsCommand, commandExists, executeCommand, truncCommandMessage, isAction, takesOverBot, blacklistCommands } from './commands/index.js';
 import { ActionManager } from './action_manager.js';
@@ -39,7 +40,7 @@ import { IdleBehavior } from './idle_behavior.js';
  * no code change at the site of the failure. See `library/server_corrections.js` for the full
  * reasoning and for why the other assists' thresholds are deliberately NOT shared.
  */
-import { TELEPORT_MIN_BLOCKS } from './library/server_corrections.js';
+import { TELEPORT_MIN_BLOCKS, TELEPORT_CANCEL_BLOCKS } from './library/server_corrections.js';
 /** Login sends a position packet before the bot has done anything. Ignore that one. */
 const TELEPORT_SPAWN_GRACE_MS = 5000;
 /** Being moved several times in a row is ONE event to the model, not five. */
@@ -53,6 +54,17 @@ const TELEPORT_REPORT_COOLDOWN_MS = 3000;
  *
  * @returns {'report'|'below-threshold'|'spawn'|'expected'|'cheat'|'coalesced'}
  */
+/**
+ * Does a jump of this size invalidate what the bot was doing?
+ *
+ * Reporting and cancelling are different decisions. A correction of a dozen blocks is worth the
+ * model knowing about; it is not worth throwing away a walk to a target fifty blocks away and
+ * telling the model not to resume. Measured split in server_corrections.js.
+ */
+export function teleportCancels(jumped) {
+    return jumped >= TELEPORT_CANCEL_BLOCKS;
+}
+
 export function teleportVerdict({ jumped, sinceSpawnMs, expected = false, cheatOn = false,
                                   sinceLastReportMs = Infinity }) {
     if (!(jumped >= TELEPORT_MIN_BLOCKS)) return 'below-threshold';
@@ -541,6 +553,11 @@ export class Agent {
         message = await handleEnglishTranslation(message);
         console.log('received message from', source, ':', message);
 
+        // A plain-English order a typed model is SURE about runs like a typed `!command` and
+        // skips the LLM turn; anything else, and every router failure, falls through unchanged.
+        // Humans only, same as the typed-command path above. See system_one_router.js.
+        if (!self_prompt && !from_other_bot && await routeByIntent(this, source, message)) return true;
+
         const checkInterrupt = () => this.self_prompter.shouldInterrupt(self_prompt) || this.shut_up || convoManager.responseScheduledFor(source);
 
         let behavior_log = this.bot.modes.flushBehaviorLog().trim();
@@ -806,18 +823,36 @@ export class Agent {
             // enough - the idle handler replays the stored resume, so the bot would walk back
             // to the old target anyway, which is the whole behaviour this is here to stop.
             // A destination chosen before the move is simply no longer the destination.
-            if (interrupted) {
+            // Cancel only when the move was big enough to make the destination meaningless. A
+            // server correction of 8-21 blocks (13 of the 17 teleports in these logs) leaves the
+            // target exactly where it was, and cancelling cost a live `!navTo` on 2026-09-22.
+            const cancelled = interrupted && teleportCancels(jumped);
+            if (cancelled) {
                 this.actions.cancelResume();
                 this.actions.stop();
+            } else if (interrupted) {
+                console.log(`[${this.name}] correction of ${jumped.toFixed(0)} blocks - `
+                    + `${interrupted} continues (cancel threshold ${TELEPORT_CANCEL_BLOCKS})`);
             }
 
             this.handleMessage('system',
                 `(AUTO MESSAGE) You were teleported ${jumped.toFixed(0)} blocks by the server, `
                 + `from ${fmt(from)} to ${fmt(now)}. `
-                + (interrupted
+                // SAY WHAT ACTUALLY HAPPENED. The cancel is gated on TELEPORT_CANCEL_BLOCKS,
+                // but this sentence was gated only on there BEING an action - so every
+                // sub-threshold correction told the model its action had been cancelled while
+                // the action carried on running. Measured 2026-09-23: a 21-block move during a
+                // four-hour blueprint build produced "Your action 'action:buildBlueprint' was
+                // cancelled", and bob duly reported "Interrupted from action:buildBlueprint, now
+                // on floor layer recovery" about a build that was still going. A message that
+                // contradicts the state is worse than no message: the model acts on it.
+                + (cancelled
                     ? `Your action '${interrupted}' was cancelled, because its destination was `
                       + `chosen before you were moved. `
-                    : '')
+                    : interrupted
+                        ? `Your action '${interrupted}' is STILL RUNNING - the move was too small `
+                          + `to make its destination meaningless. Do not restart it. `
+                        : '')
                 + 'Do not walk back unless someone asks you to. Check where you are now and '
                 + 'wait for instructions.');
         });

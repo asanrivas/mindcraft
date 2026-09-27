@@ -75,6 +75,107 @@ counterpart, so nothing anywhere could clear it.
   nothing stopped it INVENTING one where none stood.
 - A goal is a **directive**, not a memory. It arrives through `!goal` or not at all.
 
+#### A goal outlives the request that set it
+
+*Added 2026-09-22, after the restructure - not part of the verbatim CLAUDE.md text above.
+Measured by the session driving the builds; cross-checked against live state from a second
+session.*
+
+**This is not a defect, and that is what makes it expensive.** A self-prompting goal is
+reasserted after every interruption - that is what a goal is *for*. The surprise is that a goal
+set for one job silently outlives a person asking for a different one. bob held
+`self_prompt: "Continue building the survival_base.json blueprint at 4649, 70, 4605"`, set
+legitimately by an earlier session (the memory blob still records it:
+`- claude: Restarted Bob; set survival_base.json blueprint to be built at 4649, 70, 4605`), and
+for a day that goal quietly displaced every other build asked of it:
+
+- a **wizard_tower** build was displaced three times, once after it had already placed 75
+  foundation blocks.
+
+**How it displaced them: by starting a COMPETING BUILD, not by steering the bot.** This
+distinction was got wrong first time round and is the whole point of the section. The goal never
+misdirected the navigator - both `!navTo` calls planned straight at the tower lot:
+
+```
+06:43:35 [navTo] plan took 133ms length=29 ... last={"x":4592.5,"y":64,"z":4611.5}
+06:46:15 [navTo] plan took 842ms length=19 ... last={"x":4592.5,"y":64,"z":4611.5}
+```
+
+What looked like one symptom ("bob was 49 blocks from the lot and ended up 77 blocks away") was
+**three unrelated causes** stacked, and the bot moving away was it EXECUTING survival_base after
+the goal reopened it:
+
+1. **The build sequence fought itself.** `06:43:42 Refused !buildBlueprint: 'action:navTo' was
+   started by a user and is still running. Wait for it to finish, or ask them to stop it - you
+   cannot cancel it yourself.` A build command sent behind a still-running walk, refused by
+   action ownership working exactly as designed (`tests/action_owner.test.mjs` exists for this).
+   The refusal was in the log and went unread. Two more of the same at 06:31:42 and 06:42:28,
+   there against a running `action:buildBlueprint`.
+2. **The goal reopened the competing build.** `06:44:21 Generated response: I see there are still
+   blocks to be fixed. I will resume building the blueprint.` -> `[builder] protecting 3654
+   cells`. This is the self-prompt loop, and it fired BEFORE the `!endGoal` at 06:45:49.
+3. **A server teleport cancelled the second walk.** `06:46:23 [bob] TELEPORTED 15 blocks
+   (4652, 64, 4633) -> (4638, 65, 4630) during action:navTo`. Not the goal.
+
+On (3): **cause unmeasured, deliberately.** It is a 15-block server-side correction while the bot
+was WALKING, and nothing here attributes it to the navigator or anything else. `TELEPORTED N
+blocks ... during action:X` occurs **17 times** across this log's history, mostly during
+`action:buildBlueprint`, so it recurs and deserves its own measurement rather than a guess. The
+grep is `grep -E "TELEPORTED [0-9]+ blocks .* during action:" logs/service.log`. The
+teleport-detection behaviour around it is correct: the mode noticed, cancelled the action, and
+told the model *"Do not walk back unless someone asks you to"* - right, since a teleport usually
+means a person moved the bot.
+
+**Both sessions first diagnosed this as `resume_policy` reclaiming a stored build, and both were
+wrong.** The reconnect line fitted the theory perfectly - `"your unfinished task has been
+resumed for you: Continue building the survival_base.json blueprint"` - and one restart happened
+to sit right next to a blueprint swap. But that line quotes a goal that was genuinely live; the
+self-prompt loop would have reasserted it with or without a reconnect. A reconnect message naming
+a task is evidence about the GOAL, not about resume policy. **Read `self_prompt`, not the
+reconnect line.**
+
+**The check, before starting a build that differs from what the bot was doing:**
+
+```bash
+python3 -c "import json;print(json.load(open('bots/bob/memory.json')).get('self_prompt'))"
+mc "msg bob !endGoal"                    # if it names a different job
+python3 -c "import json;print(json.load(open('bots/bob/BUILD_STATUS.json'))['total'])"
+```
+
+`BUILD_STATUS.json`'s `total` names the blueprint that actually took: **8285 = wizard_tower,
+3648 = survival_base**. Compare its **mtime to the wall clock** before believing it - the file
+persists across restarts, so a stale copy reads exactly like a live one (the UTC/+0800 trap in
+CLAUDE.md, same discipline).
+
+**`!endGoal` works. Check who sent the next command before you doubt it.** A fresh
+survival_base pass opened minutes after the goal was cleared, and this file briefly recorded
+that as a limit of `!endGoal` - "necessary but not sufficient". It was not. The log settles it
+in one line:
+
+```
+06:45:49  bob received message from ADMIN : !endGoal          <- self_prompt -> null
+06:46:14  bob received message from ADMIN : !navTo(4592, 66, 4611)
+06:46:23  (AUTO MESSAGE) You were teleported 15 blocks by the server ... action 'action:navTo'
+          was cancelled
+06:47:09  bob received message from asanrivas : resume build   <- A PERSON
+06:47:15  [builder] protecting 3654 cells                      <- survival_base reopens
+```
+
+A person typed `resume build` in chat 80 seconds after the goal was cleared, and bob resolved
+it against the only build it knew about. That is the system working correctly, and a phantom
+`!endGoal` defect in this file would have sent the next session hunting it.
+
+**The method rule, which cost three wrong diagnoses in one day.** Both sessions reasoned about
+mechanisms - resume policy, the self-prompt loop, an Rcon requester - before either checked the
+sender. `grep "received message from" logs/service.log` answers "who asked for this?" in one
+command, and it outranks every inference about which subsystem *could* have done it. Run it
+FIRST. It is the same rule as measuring the thing you are concluding about rather than a proxy
+for it: an action's author is recorded, so read it instead of deducing it.
+
+The `## Goal` heading also survives in the summarised `$MEMORY` blob until the next
+summarisation. Nothing drives it once `self_prompt` is null, but it still renders into the
+prompt every turn, so a model reading its own memory can still be told it has that job.
+
 #### On reconnect, the last thing a PERSON said wins
 
 Reported as *"after a restart Andy still does the past task even though I asked it to stop

@@ -155,6 +155,16 @@ const settings = {
     max_messages: "auto", // "auto" scales with context window; or a number
     num_examples: "auto", // "auto" scales with context window; or a number
     max_commands: -1, // max number of commands that can be used in consecutive responses. -1 for no limit
+    // Plain-English orders a System One model is sure about ("follow me", "stop") run without
+    // an LLM turn - src/agent/system_one_router.js. Needs TYPESAFE_API_KEY; fails open to the
+    // LLM on anything else. threshold 0.7: scratchpad/router_gym.mjs, 2026-09-25 - 0 false
+    // routes at every threshold over 23 chat/trap messages x2, 26/30 real orders routed at 0.7,
+    // nearest false candidate 0.32. Hosted, not local Laya: Laya scored 2/8 on the same menu.
+    system_one_router: { enabled: true, threshold: 0.7, timeout_ms: 2500 },
+    // Jev second opinion on memory duplicates the Jaccard rule declines - src/agent/memory_fold_jev.js.
+    // Its 0.75 threshold is a constant there, not a setting: scratchpad/fold_gym.mjs pinned it as
+    // the lowest step with zero false merges (union 43/51 vs 38/51, 0 false merges).
+    memory_fold_jev: { enabled: true, timeout_ms: 4000 },
     show_command_syntax: "full", // "full", "shortened", or "none"
     narrate_behavior: true, // chat simple automatic actions ('Picking up item!')
 

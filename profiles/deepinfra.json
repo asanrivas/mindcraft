@@ -1,0 +1,10 @@
+{
+    "name": "deepinfra",
+
+    "model": "deepinfra/meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+
+    "embedding": {
+        "api": "deepinfra",
+        "model": "BAAI/bge-large-en-v1.5"
+    }
+}

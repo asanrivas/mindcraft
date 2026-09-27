@@ -124,3 +124,100 @@ prismarine-viewer limitation) - blocks are correct, mobs may not be.
 | Bot stuck | Check modes.js unstuck, reduce area size |
 | Vision blank | Expected in Docker/headless |
 
+
+## Driving a running agent from the shell (2026-09-22)
+
+**`mc "msg <bot> <message>"` does not work on this server.** Measured: the whisper returned no
+reply, produced no log line, and the bot went idle rather than acting on the command inside it.
+`msg` is in the same class as `tp`, `say` and `locate biome` - commands whose sender feedback this
+server drops over RCON - so a lost whisper looks exactly like a delivered one.
+
+Use **`bun tools/say_to_agent.mjs <agent> '<message>'`** instead. It emits the MindServer's own
+`send-message` event, which reaches `src/agent/mindserver_proxy.js:64` and calls the agent's
+respondFunc - the same path the web UI's ADMIN box uses. An agent that is not connected produces
+`Agent <name> not in game, cannot send message via MindServer` instead of silence.
+
+Commands work inside the message, so this is how you hand a build back to a bot after a restart:
+
+```bash
+bun tools/say_to_agent.mjs bob '!buildBlueprint("blueprints/survival_base.json", 4649, 70, 4605)'
+```
+
+ASCII quotes only - curly quotes parse as zero arguments.
+
+### The restart script's guard had a hole
+
+`scratchpad/restart_bot.sh` anchored its liveness check at `^[^ ]*/bun`, which requires a path
+ending in `/bun`. A bot started as plain `bun run main.js` (PATH lookup - how the 23-hour run on
+this host was launched) did not match, so the guard reported nothing alive, killed only the agent
+children, and started a SECOND `main.js`. Only the 8080 bind failing (`EADDRINUSE`) prevented the
+duplicate-login crash loop the script exists to stop. It now matches a bare `bun` invocation too,
+and its paths are derived from the script's own location rather than hardcoded to `/home/asanrivas`.
+
+## RCON wedged itself, and reported the wedge as success (2026-09-22)
+
+A session ran three RCON commands back to back — `clear` (count before), `give ... grass_block
+192`, `clear` (count after). All three printed **nothing** and exited **0**. There was no error to
+read, so the give looked like it had worked. It had not: a later count showed the player still had
+zero grass blocks.
+
+### The defect: two frames in one event-loop tick
+
+`tools/rcon.mjs` paired every command with an **empty-body sentinel command**, written immediately
+after it, to mark the end of a reply that the server might split across packets:
+
+```js
+sock.write(frame(2, 2, command));
+sock.write(frame(3, 2, ''));      // sentinel - both writes in the SAME tick
+```
+
+Node concatenates same-tick writes into one TCP segment. This server reads **one packet per socket
+read and discards the rest of the buffer**, so the sentinel was silently dropped, the `id === 3`
+reply that the client was waiting for never arrived, and the connection was wedged from then on.
+
+Measured against the live server, one connection, `list` x5, per-command timeout 6s:
+
+| How the frames are written | Result |
+|---|---|
+| `write(cmd); write(sentinel)` — same tick | **1/5 OK**, then 6000ms timeouts forever |
+| `write(cmd); await 30ms; write(sentinel)` | **5/5 OK**, ~31ms each |
+| `write(cmd)` only, await the reply, then the next | **8/8 OK**, 0–2ms each |
+
+`setNoDelay(true)` does not help — the coalescing happens in Node, above the socket.
+
+Two things this rules out, both of which were believed beforehand:
+
+- **It is not the sentinel.** A connection answering normally still answers **3/3** after one empty
+  frame is fired at it. Pairing it with a command in the same tick is what kills it.
+- **It is not reconnecting.** CLAUDE.md said "reconnecting per command stalls the server after ~13
+  rapid cycles". Reconnect-per-command did fail in a probe — but the probe pipelined too. One
+  connection reused for 15 rapid commands, one frame at a time, is **15/15**.
+- **It is not load.** The failures are silence, not slowness: a 40s per-command timeout expired
+  just as an 8s one did, while healthy replies land in 0–2ms.
+
+### The second defect: silence read as success
+
+The old client resolved on the sentinel's reply and `console.log`ged whatever it had accumulated —
+so "no reply at all" and "the command printed nothing" were the same output, followed by `exit 0`.
+That is the house bug shape: *absence of evidence defaulting to fine*. `send()` now **rejects**
+when no frame echoing its request id ever arrives, the CLI exits 1, and the message says the
+command *may or may not have run*. A reply that is present but empty resolves normally, with a note
+on stderr, because the server answering means the command did run.
+
+### What the client does now
+
+- One frame in flight, always; concurrent `send()` calls queue (`tests/rcon.test.mjs` pins both).
+- No empty-body command is ever sent. Split replies are reassembled with a **25ms idle window**
+  after the last same-id frame, which needs no extra command to delimit.
+- Many commands over one connection in one invocation:
+  `printf 'list\nseed\n' | bun tools/rcon.mjs -`. Single-arg and joined-argv forms still work, so
+  `mc "give andy stone 1"` is unchanged.
+- `RconClient` is exported with an injectable `connect`, so the suite drives it against a fake
+  socket with no server.
+
+### Collateral: `difficulty` was never a quirk
+
+`mc "difficulty"` returning an empty body was written off as a server quirk (and briefly recorded
+as one). It was this bug. The fixed client answers `The difficulty is Peaceful` — which also means
+the world was **not** on the `easy` that `server.properties` shows, so `mode:night_safety` and
+`self_defense` were standing down. Read it, do not assume; it has now changed four times.

@@ -1,6 +1,7 @@
 import { Vec3 } from 'vec3';
 import { digWithTool, isTreeTrunk, isLavaName, isSwimmable, isBubbleColumn, isWaterName } from './tools.js';
 import * as buildGuard from './build_guard.js';
+import * as repair from './repair.js';
 // swim.js imports only tools.js, so this is not a cycle.
 import { climbBank } from './swim.js';
 
@@ -81,6 +82,7 @@ const DEFAULTS = {
     // most ~120 blocks, and 200 keeps "go around" cheaper than "go through" for every route
     // that exists. FINITE on purpose - a bot sealed inside its own walls must still be able to
     // plan an exit, which is why this is a price and build_guard's refusal has an escape valve.
+    // Also charged for any block `build_guard.isPlayerMadeName` recognises, registered or not.
     buildDigCost: 200,
     // Digging a cell that will FLOOD is not a route, it is a longer swim. On land a dug block
     // yields a path; at or below the waterline it yields water, so the bot pays the effort and
@@ -223,6 +225,10 @@ function standCost(ctx, x, y, z) {
     const feet = classify(ctx, x, y, z);
     const head = classify(ctx, x, y + 1, z);
     const below = classify(ctx, x, y - 1, z);
+    // A fence, wall or gate is SOLID to `classify` but 1.5 tall, and a jump peaks at 1.252. A
+    // plan that stepped "up onto" one pinned the bot against it, and `digAhead` then mined it -
+    // the actual mechanism behind "andy breaks my fence". See build_guard.isTallCollisionName.
+    if (below === SOLID && buildGuard.isTallCollisionName(nameAt(ctx, x, y - 1, z))) return null;
 
     return swimCostFor({ feet, head, below }, o);
 }
@@ -279,8 +285,12 @@ function digCostAt(ctx, x, y, z) {
         // A cell the active build owns is priced so high that A* only routes through the
         // structure when there is genuinely no way round it - high, but FINITE, because a bot
         // sealed inside its own walls still has to be able to plan an exit. See build_guard.js.
-        const base = buildGuard.isProtected(x, y + dy, z) ? o.buildDigCost
-                   : isTreeTrunk(nameAt(ctx, x, y + dy, z)) ? o.treeDigCost
+        // A block somebody built with gets the same price whether or not a build registered it:
+        // a finished house and a player's fence were otherwise plain `digCost`. Checked before
+        // the tree test, which claims stripped logs.
+        const name = nameAt(ctx, x, y + dy, z);
+        const base = (buildGuard.isProtected(x, y + dy, z) || buildGuard.isPlayerMadeName(name)) ? o.buildDigCost
+                   : isTreeTrunk(name) ? o.treeDigCost
                    : o.digCost;
         cost += floods(y + dy) ? Math.max(base, o.floodDigCost) : base;
     }
@@ -698,6 +708,23 @@ export async function followPath(bot, path, opts = {}) {
             if (bot.interrupt_code) break;
             const p = bot.entity.position;
 
+            // Put back what this bot had to break, once it is past it. `nextRepair` only offers
+            // a hole the bot can place from WITHOUT moving (repair.js), so this pauses the walk
+            // and never re-routes it. Forward is ours to pause; jump is not (AutoJump owns it).
+            const hole = repair.nextRepair(bot);
+            if (hole) {
+                const fwd = bot.controlState.forward;
+                bot.setControlState('forward', false);
+                try {
+                    await repair.repairOne(bot, hole);
+                } finally {
+                    bot.setControlState('forward', fwd);
+                    // A repair is a pause, not a stall - or the pinned ladder fires on the way out.
+                    stallSince = Date.now();
+                    lastProgress = Date.now();
+                }
+            }
+
             // Retire every waypoint we have actually reached. This has to consider height:
             // an XZ-only test discards a "drop down 3" waypoint the moment the bot is standing
             // above it, so the bot then steers at the waypoint *after* the drop and walks
@@ -864,7 +891,7 @@ export async function followPath(bot, path, opts = {}) {
                 // digging and walking round are all preferable when they work.
                 const bridged = climbed ? { placed: false }
                     : await bridgeAhead(bot, yaw, wet);
-                const dug = (!climbed && !bridged.placed) ? await digAhead(bot, yaw) : false;
+                const dug = (!climbed && !bridged.placed) ? await digAhead(bot, yaw, path) : false;
                 if (!climbed && !bridged.placed && !dug) {
                     // NAME THE RUNG THAT FAILED. This is the recovery of last resort, and it was
                     // entirely silent when every rung declined - leaving "the bot is against a
@@ -1458,11 +1485,25 @@ async function climbAhead(bot, yaw) {
 }
 
 /**
+ * Does the plan put the bot's body in cell `t`? A dig move's node is the dug cell at feet
+ * height, so `t` is on the plan when a node stands in it or directly beneath it (head height).
+ * Smoothing cannot drop such a node: `walkableLine` refuses any line through a solid cell.
+ */
+export function planGoesThrough(path, t) {
+    if (!path || !t) return false;
+    return path.some((q) => Math.floor(q.x) === t.x && Math.floor(q.z) === t.z
+        && (Math.floor(q.y) === t.y || Math.floor(q.y) === t.y - 1));
+}
+
+/**
  * Mine whatever is directly ahead at feet and head height. Used only when the bot is pinned:
  * the planner already charges `digCost` for routes that need this, so acting on it here is
  * honouring the plan, not improvising around it.
+ *
+ * `path` is the plan being followed. A player-made block is mined only when the plan goes
+ * through it - see `planGoesThrough`.
  */
-async function digAhead(bot, yaw) {
+async function digAhead(bot, yaw, path = null) {
     const p = bot.entity.position;
     const fx = -Math.sin(yaw), fz = -Math.cos(yaw);
     const skipped = [];
@@ -1491,6 +1532,17 @@ async function digAhead(bot, yaw) {
             // prevent, so the case where it is allowed must never be silent.
             console.log(`[${bot.username ?? '?'}] digAhead: ${v.why} - `
                 + `breaching the build at (${t.x}, ${t.y}, ${t.z})`);
+        } else if (buildGuard.isPlayerMadeName(b.name)) {
+            // Nobody registered it, but somebody built it. Pinned against a fence is not a
+            // reason to mine the fence: the planner priced it at `buildDigCost`, so if the plan
+            // routes AROUND it the bot has merely drifted into it, and the recentring rung
+            // below puts it back on the route. Mined only when the plan itself goes through -
+            // the planner's measured answer that no cheaper route exists - or in a one-cell
+            // pocket. A plain refusal here is the 97-minute stone_bricks strand again.
+            const planned = planGoesThrough(path, t);
+            if (!planned && !enclosed(bot)) { skipped.push(`${dy}:player-made ${b.name}`); continue; }
+            console.log(`[${bot.username ?? '?'}] digAhead: ${planned ? 'the plan has no way round' : 'walled in'}`
+                + ` - breaking player-made ${b.name} at (${t.x}, ${t.y}, ${t.z})`);
         }
         // REFUSE TO DIG A HOLE THAT WILL FLOOD. Underwater a dug block yields water, not
         // passage: the bot pays the effort, gains a longer swim, and repeats one block on. That
@@ -1499,7 +1551,12 @@ async function digAhead(bot, yaw) {
         // the traveller never even saw a stall. The planner already prices this
         // (`floodDigCost`); the executor has to honour it too or it just overrides the plan.
         if (wouldFlood(bot, t)) { skipped.push(`${dy}:would-flood`); continue; }
-        if (await digWithTool(bot, b)) return true;
+        // Decided BEFORE the dig, from the block as it was: afterwards the cell is air.
+        const guarded = buildGuard.isProtected(t.x, t.y, t.z) || buildGuard.isPlayerMadeName(b.name);
+        if (await digWithTool(bot, b)) {
+            if (guarded) repair.noteBreach(bot, t, b);   // put back once we are past it
+            return true;
+        }
         skipped.push(`${dy}:${b.name} dig-failed`);
     }
     // Say what was in the way and why it was left. A silent `false` here is the difference
@@ -1791,6 +1848,10 @@ export async function navigateTo(bot, goal, opts = {}) {
             justBridged = false;
         }
     }
+
+    // Whatever this journey broke that is still in reach from where it stopped. Out-of-reach
+    // holes stay pending for the next journey that passes them (repair.js).
+    if (!bot.interrupt_code) await repair.repairInReach(bot);
 
     const p = bot.entity.position;
     return {

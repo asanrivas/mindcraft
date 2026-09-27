@@ -124,6 +124,20 @@ for (const [a, b] of pairs) {
     contains('!climbOut names the situation (buried/stuck)', climbOut, 'stuck');
 }
 
+// --- !endGoal keeps the clause that separates it from !stop ---------------------------------
+// Both commands stop what the bot is doing; only this clause says !endGoal is the one that
+// also ends the self-prompt loop. compactDescription() keeps a follow-up sentence only when
+// it opens with a KEEP_SENTENCE imperative, so the original wording ("It will stop...") was
+// dropped before the model saw it and the choice became a coin flip - measured 2026-09-20
+// against jev-1.13 as NONE 0.45 / !endGoal 0.29 / !stop 0.14 (7/8 on the compact docs, 8/8
+// on the same descriptions untruncated), and 8/8 three runs of three with the clause
+// restored. Asserted on the RENDERED line, not the source string.
+{
+    const endGoal = lineFor(docs, '!endGoal');
+    check('!endGoal line exists', endGoal.length > 0);
+    contains('!endGoal keeps its self-prompt clause', endGoal, 'stop self-prompting');
+}
+
 // --- !placeHere keeps its prohibition ---------------------------------------------------------
 contains('!placeHere keeps "Do NOT use to build structures"', lineFor(docs, '!placeHere'), 'Do NOT use to build structures');
 

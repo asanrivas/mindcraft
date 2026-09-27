@@ -23,6 +23,14 @@
                 "max_tokens": 4096,
                 "temperature": 0.7
             }
+        },
+        {
+            "api": "deepinfra",
+            "model": "meta-llama/Meta-Llama-3.1-70B-Instruct-Turbo",
+            "params": {
+                "max_tokens": 4096,
+                "temperature": 0.7
+            }
         }
     ],
     "backup_cooldown_secs": 60,

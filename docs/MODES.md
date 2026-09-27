@@ -322,3 +322,38 @@ tested - the ones that must NOT fire matter more than the one that must.
 Verified live: `TELEPORTED 230 blocks (3393, 62, -1797) -> (3601, 80, -1700) during
 action:navTo`, 1 detection and 0 false positives.
 
+
+## Teleport detection: reporting and cancelling are different decisions (2026-09-22)
+
+A position jump used to do both at once — report it to the model AND cancel the running action with
+its resume. Measured over every teleport in this repo's logs
+(`grep -E "TELEPORTED [0-9]+ blocks .* during action:" logs/*.log`, 17 events), that conflates two
+phenomena whose distributions do not overlap:
+
+| | count | distance | during |
+|---|---|---|---|
+| server corrections | 13 | **8-21 blocks** | navTo 5, travel 4, groundProbe 2, buildBlueprint 2 |
+| somebody moved the bot | 4 | **173-1181 blocks** | collectBlocks, chestDepositAll, navTo, travel |
+
+Nothing falls between 21 and 173. The small ones are mostly `dy` 0-3; two are vertical (+20, -14).
+
+`TELEPORT_MIN_BLOCKS = 8` says "the server relocated us deliberately", and SwimAssist's anti-cheat
+valve depends on that meaning — so it was NOT retuned. Its own comment ("8 blocks is far above any
+correction observed here") was true when written and is not true now, which is worth knowing before
+anyone trusts it for a second purpose.
+
+What changed instead: **`TELEPORT_CANCEL_BLOCKS = 32`** in `library/server_corrections.js`, used by
+`teleportCancels()` in `agent.js`. Detection still fires at 8 and the model is still told; the
+running action is only cancelled at 32+. A correction of a dozen blocks leaves a target fifty
+blocks away exactly where it was, and cancelling cost a live `!navTo` on 2026-09-22 — the bot was
+walking to (4592, 64, 4611), a 15-block correction landed, the action and its resume were thrown
+away, and the model was told "Do not walk back unless someone asks you to". From outside that reads
+as the bot refusing to go where it was sent.
+
+The cancel path is otherwise correct and should stay: for a real teleport, a destination chosen
+before the move is no longer the destination, and cancelling the resume as well is what stops the
+idle handler walking the bot back.
+
+**Unmeasured, deliberately:** what causes the 13 corrections. They happen while walking and while
+building, one is +20 in Y, and nothing here attributes a cause. The samples are in the logs if
+someone wants to.

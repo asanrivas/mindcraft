@@ -713,3 +713,75 @@ every column reads as missing and it looks like the bot destroyed the terrain. U
   Swimming section below. `skills.escapeWater` remains the fallback for water too wide to
   cross; pillaring cannot work while floating - there is nowhere to place a block underneath.
 
+
+## Flight routing: getting INTO a closed volume (2026-09-22)
+
+`flyTo` had two strategies, a straight line and a climb-cross-descend detour, and neither can enter
+an enclosed space. That is fine while a build is open to the sky and useless at the end of one,
+which is when the remaining cells are inside the shell the bot has just finished closing.
+
+**The measurement.** Wizard Tower, bob parked at its station at (4672, 89.5, 4618), remaining work
+at y 73-79 inside the shell:
+
+- **5,238** consecutive `flyNear ... failed: flew short by 11-15 | budget spent` lines
+- builder tally `3400/3648 (0 placed, 3217 pre-existing, 183 failed)`, dominated by
+  **140-216x `out of reach (no clear hover within range)`** per pass
+- `wedged - returned to station above the build`, which puts the bot back where nothing is reachable
+- last genuine placement at 01:02; the loop ran for about an hour
+- **not the server**: zero `forcedMove` on our side, zero `moved too quickly`/`moved wrongly` in the
+  server log. `freeSelf` still rose 1.9 blocks on request, so flight itself worked throughout
+
+**The fix.** `planFlight` in `flight.js`: A* over cells the BODY fits in (feet and head both free,
+loaded, non-lethal), 6-neighbour, Euclidean heuristic, bounded by `ROUTE_MAX_NODES` (6000),
+`ROUTE_PAD` (16 blocks outside the start/goal box) and `ROUTE_MAX_RANGE` (64 blocks - flight is a
+local manoeuvre; crossing country stays `travelToward`'s job). The route is smoothed by dropping
+every waypoint its predecessor can already see, so it comes out as a few long legs.
+
+`flyNear` plans **once**, after the cheap geometry is exhausted, rather than once per hover
+candidate. `flyTo` only plans when passed `route: true`, for the same reason.
+
+**Cost** (fake grid, search only): 0.4ms per plan when a way in exists, 2 legs; 33.9ms worst case
+when the volume is sealed and the budget is exhausted. Against ~7s per cell spent failing, free.
+
+**"No route" is a useful answer.** A sealed volume and an unloaded opening both return null, and
+that is what should tell the builder to defer a cell rather than retry it forever. An unloaded cell
+is never treated as free space: flying into what we cannot see is how a bot ends up in a wall.
+
+Asserted by `tests/flight_route.test.mjs` - including the two cases that must NOT find a route.
+
+### Flight is not dead here, and the rate is 262ms/block (2026-09-22)
+
+`tools/flight_check.mjs` measures the mechanism in EMPTY AIR, edits nothing, and settles two
+questions the build logs cannot. Run it before attributing anything to flight:
+
+```
+horizontal +20x: moved 19.9 of 20, 5251ms, forcedMove +1
+vertical   +10y: moved  9.8 of 10, 1409ms, forcedMove +0
+horizontal +20z: moved 20.0 of 20, 2868ms, forcedMove +0
+VERDICT: horizontal WORKS, vertical works, 3 forcedMove corrections total
+```
+
+**1. Client-driven flight works, horizontally and vertically.** The old note in
+`blueprint_builder.js` ("dead on this server, 1,870 forcedMove corrections") stays retired.
+
+**2. The real speed is 262ms per block, not the 143ms `STEP`/tick implies.** Each step awaits a
+timer rather than riding the physics tick, so the theoretical 7 blocks/second is about 3.8 in
+practice. `flyRoute` budgets 320ms/block from this measurement; the first version of that line used
+220ms derived from `STEP` and cut long legs off mid-flight.
+
+**Why it was worth measuring in air at all.** During the build every route leg reported `made no
+progress` while `freeSelf` rose 1.9-2.0 blocks on the same bot in the same tick window. Vertical
+writes landing while horizontal writes did nothing has two possible causes with opposite fixes: a
+body embedded in geometry (prismarine-physics resolves an intersection along the axis of least
+penetration, usually vertical) or a server refusing horizontal movement. Only air can tell them
+apart, because in air nothing can be embedded in anything. It was the first.
+
+**Two fixes that measurement rejected**, recorded so they are not tried again:
+
+- *Unstraddling to the bot's own cell centre before flying.* Reasonable - the body is 0.6 wide and a
+  plan is a chain of cell centres - but it changed nothing: 0 routes reached in the 90s after it
+  shipped.
+- *Retrying the same leg after `freeSelf`.* Actively wrong. `freeSelf` lifts the body ~2 blocks, so
+  the retry flies a stale waypoint from a position the plan never saw: measured as `needed 2.3 ...
+  rose 2.0, still 3.0 away` - further from the target than when it started. A plan our own recovery
+  invalidated must be discarded, not retried. `flyRoute` now hands back and `flyNear` replans.

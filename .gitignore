@@ -52,3 +52,4 @@ scratchpad/*.mp4
 scratchpad/*.png
 data/
 bots/*/corpus/
+.venv-laya/

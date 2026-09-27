@@ -6,6 +6,7 @@ import { cosineSimilarity } from '../utils/math.js';
 import { getNamedChestsJson } from './library/skills.js';
 import { getBudget } from '../utils/context_budget.js';
 import { MemoryStore, ORIGIN, KIND, saveStore, loadStore } from './memory_store.js';
+import { planFolds, announceConflicts } from './memory_fold_jev.js';
 
 /**
  * Clean up old log files, keeping only the most recent ones
@@ -181,7 +182,14 @@ export class History {
         // No allowGoal. A goal is a directive that arrives through `!goal`, never something
         // derived from chat history - otherwise a goal the user just ended is re-minted on the
         // next summarisation out of the very turns in which they ended it.
-        this.store.importLegacyBlob(summary);
+        // foldHints: a Jev second opinion on the duplicates the store's own rule declines (the
+        // measured union - memory_fold_jev.js). Off, keyless or failing, it returns none and the
+        // import is exactly what it was.
+        const foldHints = await planFolds(this.store, summary);
+        this.store.importLegacyBlob(summary, { foldHints });
+        // Two lessons that contradict each other are both kept, and a person decides which is
+        // right - the store must not pick the casualty itself (memory_fold_jev.announceConflicts).
+        announceConflicts(this.agent, this.store, foldHints);
         const blocked = this.store.rejections - rejectedBefore;
         if (blocked > 0) {
             console.log(`[History] memory store rejected ${blocked} agent write(s) against user-authored records.`);

@@ -13,7 +13,8 @@
  * routine anti-cheat corrections this server sends constantly. Counting them unconditionally is
  * the exact mistake that tripped SwimAssist's sprint-boost valve during spawn.
  */
-import { teleportVerdict } from '../src/agent/agent.js';
+import fs from 'fs';
+import { teleportVerdict, teleportCancels } from '../src/agent/agent.js';
 
 let failures = 0;
 const check = (label, got, want) => {
@@ -78,6 +79,36 @@ check('below threshold wins over everything',
 // distanceTo on a missing entity should never be reported as a teleport.
 check('NaN is not a teleport', teleportVerdict({ jumped: NaN, ...SETTLED }), 'below-threshold');
 
+// ---- the AUTO MESSAGE must match what actually happened
+//
+// The cancel is gated on TELEPORT_CANCEL_BLOCKS; the SENTENCE announcing it was gated only on
+// there being an action at all. Measured 2026-09-23: a 21-block correction during a four-hour
+// blueprint build told the model `Your action 'action:buildBlueprint' was cancelled` while the
+// build carried on, and bob then reported himself "Interrupted from action:buildBlueprint, now on
+// floor layer recovery" about work that was still running. The model ACTS on these messages, so
+// one that contradicts the state is worse than no message at all.
+//
+// (This block sits above the failure gate below on purpose: placed after it, a failing assertion
+// increments `failures` that nothing ever re-reads, and the suite exits 0. Verified by mutation -
+// break one expectation and this suite must go red.)
+{
+    const announce = (jumped, label) => {
+        const cancelled = !!label && teleportCancels(jumped);
+        return cancelled ? 'cancelled' : (label ? 'still-running' : 'no-action');
+    };
+    check('a big teleport during an action reports a cancel', announce(64, 'action:buildBlueprint'), 'cancelled');
+    check('a small one says the action is STILL RUNNING', announce(21, 'action:buildBlueprint'), 'still-running');
+    check('exactly at the threshold cancels', announce(32, 'action:buildBlueprint'), 'cancelled');
+    check('one below the threshold does not', announce(31, 'action:buildBlueprint'), 'still-running');
+    check('with no action running there is nothing to announce', announce(64, null), 'no-action');
+    // and the source must keep the two in step
+    const src = fs.readFileSync('src/agent/agent.js', 'utf8');
+    check('agent.js gates the sentence on the same value as the cancel',
+        /const cancelled = interrupted && teleportCancels\(jumped\)/.test(src), true);
+    check('...and no longer announces a cancel merely because an action was running',
+        /\+ \(interrupted\n\s*\? `Your action '\$\{interrupted\}' was cancelled/.test(src), false);
+}
+
 if (failures) { console.error(`\n${failures} check(s) FAILED`); process.exit(1); }
 console.log('PASS: teleport detection correct');
 
@@ -109,5 +140,5 @@ console.log('PASS: teleport detection correct');
     const swimSrc = fs.readFileSync('src/agent/library/swim_assist.js', 'utf8');
     c('swim_assist.js does not hardcode the band',
       /correctionMax:\s*\d/.test(swimSrc) || /correctionMin:\s*\d/.test(swimSrc), false);
-    console.log('correction/teleport constant: shared, checks passed');
+console.log('correction/teleport constant: shared, checks passed');
 }

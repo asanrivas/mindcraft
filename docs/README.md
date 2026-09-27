@@ -24,7 +24,7 @@ thing is built the way it is, what was measured, and which bugs are still open.
 | [SWIMMING.md](SWIMMING.md) | Everything wet: measured swim speeds, the three wet states, **climbing out onto a bank** (the reason the bot used to dig canals), SwimAssist, the `drowning` mode, and the still-open failure modes |
 | [MARATHON.md](MARATHON.md) | `travelToward`, checkpoint marathons, route surveying, and who owns a running action |
 | [WORLD_TOOLS.md](WORLD_TOOLS.md) | Seed lookup, `/locate biome`, operator teleport/gamemode/spawnpoint, world-edit guards, block states, and placing blocks next to the bot |
-| [BLOCK_PLACEMENT.md](BLOCK_PLACEMENT.md) | Why `bot.placeBlock` is unusable for anything time-critical, and what `block_io.js` / `place_packet.js` do instead |
+| [BLOCK_PLACEMENT.md](BLOCK_PLACEMENT.md) | Why `bot.placeBlock` is unusable for anything time-critical, and what `block_io.js` / `place_packet.js` do instead, plus building a blueprint: facing verification, build order, temporary supports, preflight and the progress watchdog |
 | [CONTAINERS.md](CONTAINERS.md) | Chests: the owned container protocol, mineflayer's three defects, the double-chest rule, and the item-loss path |
 | [MODES.md](MODES.md) | The modes system, interrupts, action ownership, follow, tool selection, `night_safety`, the difficulty lie, and teleport detection |
 

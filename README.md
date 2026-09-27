@@ -17,6 +17,44 @@
 > [!Caution]
 Do not connect this bot to public servers with coding enabled. This project allows an LLM to write/execute code on your computer. The code is sandboxed, but still vulnerable to injection attacks. Code writing is disabled by default, you can enable it by setting `allow_insecure_coding` to `true` in `settings.js`. Ye be warned.
 
+# ✨ What's New in This Fork
+
+<p align="center">
+  <img src="docs/media/crew-build.gif" alt="Timelapse from bob's first-person viewer while he and three hired helpers build a blueprint" width="560"/>
+  <br/>
+  <em>20 minutes in 27 seconds: bob's own view as he flies between work cells on <code>survival_base.json</code> (3,648 blocks), with bob2–bob4 hired as crew on the same build. Recorded live with <code>tools/timelapse.mjs</code>.
+  <a href="docs/media/crew-build.mp4">▶ Full-quality MP4</a></em>
+</p>
+
+### 🏗️ Blueprint builder + crew builds
+- **`!buildBlueprint("file.json", x, y, z)`** builds a blueprint block by block and checks each placement against the world. The 35,142-block cathedral stands at **99.8%** verified.
+- **`!hireCrew(n)`** starts up to 3 helper bots that split the same blueprint. A lease ledger in `bots/.builds/` keeps two bots from claiming the same cell, and the crew is dismissed when the build finishes. You can also start one by hand with `bun tools/crew_build.mjs <bp> x y z bob bob2`.
+- **Site preflight** rejects wet or unreachable sites before any digging starts. Each block is placed facing the direction the blueprint specifies.
+- **Live progress** (rate, ETA, failures by cause) in the web UI build panel, or with `bun tools/build_status.mjs --watch` (add `--crew` to see every member).
+
+### 🧭 A navigator that actually moves the bot
+- An A\* planner with a lookahead executor in `nav.js` replaces mineflayer-pathfinder's executor, which could not move this bot. It handles jumping, bridging, climbing out of pits, and digging through walls when that is cheaper than walking around.
+- **Swimming** runs on owned physics: SwimAssist, diving and surfacing, climbing out onto a bank, and drowning detection based on measured submersion. `!swimTo`, `!dive`, `!surface`.
+- **Long journeys**: `!travel` / `!navTo` with checkpoint marathons and route surveying.
+
+### 🧠 A brain that doesn't go down
+- **LLM failover**: `backup_model` plus a circuit breaker. The bot switches to the backup model when the primary is unavailable, and `!stats` shows `Brain: BACKUP` while it runs on it.
+- **System-one router**: plain commands like "follow me" skip the LLM turn when a small local model is confident about them.
+- **Memory that stays useful**: paraphrased memories are folded into one, the least-reinforced are evicted first, and goals can only come from `!goal` (memory summarisation can't create them).
+- **Steering** (`bots/<name>/steering.json`): short directives added to the prompt word for word, which the model cannot overwrite while it is self-prompting.
+
+### 🛡️ Safer, more obedient bots
+- A user's command can't be cancelled by the model. Modes such as drowning and self-defence still take priority.
+- World-edit guards: `!serverFill` / `!serverSetblock` refuse to destroy beds, chests or spawners, to bury the bot, or to overwrite its respawn point.
+- Chest, block-placement and creative-inventory code sends its own packets, because mineflayer's versions of these hang on this server.
+- Each mode has a timeout and backs off after repeated failures. `night_safety` and `food_supply` stop and log the reason instead of retrying forever.
+
+### 🎥 Recording and observability
+- **Timelapse recorder**: `bun tools/timelapse.mjs --seconds 1200 --interval 3` records the bot's viewer to MP4 (follows the bot from above when `viewer_first_person: false`). See [docs/OPERATIONS.md](docs/OPERATIONS.md).
+- `tailgate` shows a combined live view of the bot log and server console, and `bun tools/rcon.mjs` is a reliable RCON client.
+
+Every subsystem has a design doc with the measurements behind it. Start at [docs/README.md](docs/README.md). `bun run test` runs every suite in parallel in about 13s, with no server needed.
+
 # Getting Started
 ## Requirements
 
@@ -262,6 +300,10 @@ Here are some commonly used bot commands:
 | `!getCraftingPlan("item", num)` | `!gcp` | Get crafting requirements for an item |
 | `!surroundings` | `!sur` | 3D view of blocks in all directions (front/back/left/right/up/down) |
 | `!nearbyBlocks` | `!nb` | List nearby blocks + important blocks with distance/direction |
+| `!buildBlueprint("file.json", x, y, z)` | - | Build a blueprint block by block (`!blueprints` lists them) |
+| `!hireCrew(n)` | - | Add up to 3 helper bots to your build; `!hireCrew(0)` dismisses them |
+| `!travel` / `!navTo` | - | Long-distance travel and precise navigation (preferred over `!goToCoordinates`) |
+| `!swimTo` / `!dive` / `!surface` | - | Water movement |
 
 ### Storage Commands
 The bot can interact with all storage types (chests, ender chests, shulker boxes, barrels):

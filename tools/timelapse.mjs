@@ -27,7 +27,7 @@ import fs from 'fs';
 import path from 'path';
 import { spawn } from 'child_process';
 
-const require = createRequire('/home/asanrivas/mindcraft/');
+const require = createRequire(import.meta.url);
 const puppeteer = require('puppeteer');
 
 const arg = (name, fallback) => {

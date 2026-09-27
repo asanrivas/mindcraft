@@ -71,7 +71,9 @@ export function selectAPI(profile) {
     if (!apiMap[profile.api]) {
         throw new Error('Unknown api:', profile.api);
     }
-    let model_name = profile.model.replace(profile.api + '/', ''); // remove prefix
+    // profile.model may be absent when the profile specifies only `api`
+    // (e.g. {"api": "local-embed"}); fall back to the api's default model.
+    let model_name = (profile.model ?? '').replace(profile.api + '/', ''); // remove prefix
     profile.model = model_name === "" ? null : model_name; // if model is empty, set to null
     return profile;
 }

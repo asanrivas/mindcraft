@@ -9,7 +9,16 @@ let lockeddown = false;
 export function lockdown() {
   if (lockeddown) return;
   lockeddown = true;
-  lockdown({
+  // NOTE: must call the SES global explicitly. A bare `lockdown(...)` here resolves to
+  // this exported function (the module-scope declaration shadows the SES global), so it
+  // recursed into itself, hit the `lockeddown` guard, and returned - meaning SES
+  // hardening was never actually applied.
+  const sesLockdown = globalThis.lockdown;
+  if (typeof sesLockdown !== 'function') {
+    console.warn('SES lockdown() unavailable; compartments will run unhardened.');
+    return;
+  }
+  sesLockdown({
     // basic devex and quality of life improvements
     localeTaming: 'unsafe',
     consoleTaming: 'unsafe',

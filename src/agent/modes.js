@@ -1,6 +1,14 @@
 import * as skills from "./library/skills.js";
+import { isFallingBlockName } from "./library/tools.js";
+import * as swim from "./library/swim.js";
+import * as night from "./library/night.js";
+import { isPeaceful } from "./difficulty.js";
+import * as nav from "./library/nav.js";
 import * as world from "./library/world.js";
 import * as mc from "../utils/mcdata.js";
+import * as farming from "./library/farming.js";
+import * as furnaceIO from "./library/furnace_io.js";
+import * as shield_guard from "./library/shield_guard.js";
 import settings from "./settings.js";
 import convoManager from "./conversation.js";
 
@@ -8,6 +16,45 @@ function say(agent, message) {
     agent.bot.modes.behavior_log += message + "\n";
     if (agent.shut_up || !settings.narrate_behavior) return;
     agent.openChat(message);
+}
+
+/**
+ * Live threats for `shield_guard.shieldVerdict`, gathered fresh every call - no persistent
+ * belief here for a caller to desync from (the SwimAssist lesson).
+ *
+ * Melee proximity (creeper/skeleton) is a plain `bot.entities` scan - reliable, cheap, and per
+ * CLAUDE.md's rule against trusting version-sensitive metadata alone, `ignited` is read
+ * best-effort and never the only qualifying signal (`shield_guard.qualifies` still requires
+ * proximity even when ignited is unknown). Arrows are read straight from the live entity
+ * object: mineflayer already populates `.velocity` from the `entity_velocity` packet, so there
+ * is no need to hand-roll the entitySpawn/next-tick-velocity tracking a physicsTick-driven
+ * class would need. `hurt_by` reads `bot.lastDamageTime`/`lastDamageTaken`, wired in agent.js.
+ */
+function shieldThreats(bot) {
+    const threats = [];
+    const botPos = bot.entity.position;
+    const entities = bot.entities || {};
+    for (const id in entities) {
+        const e = entities[id];
+        if (!e || e === bot.entity || !e.position) continue;
+        if (e.name === 'creeper' || e.name === 'skeleton') {
+            const dist = botPos.distanceTo(e.position);
+            if (dist > 16) continue;
+            let ignited = false;
+            if (e.name === 'creeper') {
+                try { ignited = !!(Array.isArray(e.metadata) && e.metadata[16]); }
+                catch (err) { /* version-sensitive index; absence just means "not confirmed ignited" */ }
+            }
+            threats.push({ kind: e.name, dist, ignited, entity: e });
+        } else if (e.name === 'arrow' || e.name === 'spectral_arrow') {
+            const r = shield_guard.arrowThreat(e.position, e.velocity, botPos);
+            if (r.incoming) threats.push({ kind: 'arrow', incoming: true, ticksToImpact: r.ticksToImpact, entity: e });
+        }
+    }
+    if (typeof bot.lastDamageTime === 'number' && bot.lastDamageTime > 0) {
+        threats.push({ kind: 'hurt_by', ageMs: Date.now() - bot.lastDamageTime });
+    }
+    return threats;
 }
 
 // a mode is a function that is called every tick to respond immediately to the world
@@ -21,7 +68,146 @@ function say(agent, message) {
 // the order of this list matters! first modes will be prioritized
 // while update functions are async, they should *not* be awaited longer than ~100ms as it will block the update loop
 // to perform longer actions, use the execute function which won't block the update loop
+/**
+ * Is a real person connected and not asleep?
+ *
+ * Used to stand `night_safety` down: the bot cannot skip the night on its own - vanilla
+ * requires every player to be in bed - so digging in while a person is up buys nothing and
+ * costs the bot the night, plus whatever it was asked to do.
+ *
+ * Other agents are excluded deliberately: bots counting each other as "people" would just make
+ * both of them stop.
+ */
+/**
+ * Is there a solid roof close overhead - a dungeon, a building, a shallow cave, an overhang?
+ *
+ * Complements the "deep underground" depth test: that one only fires more than 8 blocks below
+ * the surface, so a bot standing inside a room at surface level reads as exposed and digs
+ * itself a hole in the floor of a building it is already safe in.
+ *
+ * An unloaded chunk reads as NO roof: unknown must not be mistaken for cover.
+ */
+function hasRoofOverhead(bot, maxUp = 5) {
+    const p = bot.entity.position.floored();
+    for (let i = 2; i <= maxUp + 1; i++) {
+        const b = bot.blockAt(p.offset(0, i, 0));
+        if (b && b.boundingBox === 'block') return true;
+    }
+    return false;
+}
+
+function humanAwakeOnline(bot) {
+    const players = bot.players ?? {};
+    for (const [name, p] of Object.entries(players)) {
+        if (name === bot.username) continue;
+        if (convoManager.isOtherAgent(name)) continue;   // another bot, not a person
+        // `entity` is absent for players outside render distance - still online, still awake.
+        if (p?.entity?.isSleeping || p?.entity?.metadata?.isSleeping) continue;
+        return true;
+    }
+    return false;
+}
+
+/**
+ * Is a real person currently IN BED? The mirror of `humanAwakeOnline`, and needed for the
+ * opposite reason: vanilla skips the night only when every player sleeps, and this bot counts
+ * as a player, so an awake bot silently holds a person's night hostage.
+ *
+ * Other agents are excluded for the same reason they are there: a bot is not a person, and two
+ * bots each getting into bed because the other did is not a vote, it is a mirror.
+ */
+function anyHumanSleeping(bot) {
+    const players = bot.players ?? {};
+    for (const [name, p] of Object.entries(players)) {
+        if (name === bot.username) continue;
+        if (convoManager.isOtherAgent(name)) continue;   // another bot, not a person
+        if (p?.entity?.isSleeping || p?.entity?.metadata?.isSleeping) return true;
+    }
+    return false;
+}
+
 const modes_list = [
+    {
+        // First on purpose: nothing else matters if the bot drowns, and drowning is the one
+        // hazard with a hard clock on it (300 ticks of air, then 1 heart every second).
+        //
+        // Replaces a branch inside self_preservation that read `if (blockAbove.name === "water")
+        // bot.setControlState("jump", true)`. That was wrong in four ways: it bypassed execute()
+        // so it had no timeout and never marked itself active, it NEVER released the jump key,
+        // it was gated on `bot.pathfinder.goal` which this project no longer uses, and it fired
+        // on any submerged head - so it fought every deliberate dive.
+        name: "drowning",
+        description: "Surface for air before oxygen runs out. Interrupts all actions.",
+        interrupts: ["all"],
+        // Drowning outranks builds and travel - but NOT a surface run that is already under way.
+        // Interrupting one is self-defeating: each interruption sets bot.interrupt_code, which
+        // aborts the other's climb mid-rise, and the two then trade interrupts indefinitely.
+        // Observed live at 2 hearts of drowning damage:
+        //   mode:drowning  interrupts  action:surface
+        //   action:surface interrupts  mode:drowning
+        //   mode:drowning  interrupts  action:surface   ...
+        excludeFromInterrupt: ["action:surface"],
+        on: true,
+        active: false,
+        threshold: 8,             // bubbles. One bubble is ~0.75s of air, so this is ~6s.
+        // Backstop, in ms of continuous submersion. Vanilla air is 300 ticks = 15s, so this
+        // fires with a few seconds to spare.
+        maxSubmergedMs: 10000,
+        submergedSince: 0,
+        cooldownUntil: 0,
+        failures: 0,
+        update: async function (agent) {
+            const bot = agent.bot;
+            const submerged = swim.isSubmerged(bot);
+            // Measure submersion ourselves. `bot.oxygenLevel` is set from the `air_supply`
+            // entity metadata, and that packet does not reliably reach this client for its own
+            // entity here - `!stats` cheerfully reported "Air: 20 / 20" while the SERVER had 13
+            // ticks of air left, so the guard below never tripped and the bot drowned at
+            // (4322.60, 61.00, 5034.30) with its safety net silent. Trust measured state over
+            // reported state, exactly as the movement code has to.
+            if (!submerged) this.submergedSince = 0;
+            else if (!this.submergedSince) this.submergedSince = Date.now();
+
+            if (Date.now() < this.cooldownUntil) return;
+            if (!submerged) return;
+            // Require BOTH the number and the block read: oxygenLevel arrives by entity
+            // metadata, so a late packet during lag could otherwise trigger a surface run
+            // while the bot is stood on dry land.
+            const outOfAir = swim.oxygen(bot) <= this.threshold;
+            const tooLong = Date.now() - this.submergedSince > this.maxSubmergedMs;
+            if (!outOfAir && !tooLong) return;
+
+            // Why it fired, at the moment it fired. This mode interrupts every action in the
+            // agent, so a spurious trigger is expensive, and after the fact the only evidence
+            // left is a bare "finished executing" line.
+            console.log(`[${agent.name}] mode:drowning firing - air=${swim.oxygen(bot)}/20 `
+                + `submerged=${submerged} inWater=${swim.inWater(bot)} `
+                + `under=${((Date.now() - this.submergedSince) / 1000).toFixed(1)}s `
+                + `trigger=${outOfAir ? 'air' : 'duration'} pos=${bot.entity.position.floored()}`);
+            execute(this, agent, async () => {
+                const r = await swim.surface(bot, { timeoutMs: 12000 });
+                if (r.surfaced) {
+                    this.failures = 0;
+                    // Air refills over a second or so, so without a short pause the mode
+                    // re-fires every tick while oxygen climbs back past the threshold - observed
+                    // firing four times in ten seconds, each one interrupting the running action.
+                    this.cooldownUntil = Date.now() + 1500;
+                    return;
+                }
+                // Cannot reach air. Back off before retrying, or this mode spins every tick and
+                // pins currentActionLabel exactly like the bug it replaces.
+                this.failures++;
+                this.cooldownUntil = Date.now() + 5000;
+                say(agent, `I can't reach air (${r.reason}${r.blocker ? `: ${r.blocker}` : ''}) `
+                    + `at y=${r.y.toFixed(0)} with ${swim.oxygen(bot)}/20 air.`);
+            }, 0.5);
+        },
+        unpause: function () {
+            this.cooldownUntil = 0;
+            this.failures = 0;
+            this.submergedSince = 0;
+        },
+    },
     {
         name: "self_preservation",
         description:
@@ -29,24 +215,25 @@ const modes_list = [
         interrupts: ["all"],
         on: true,
         active: false,
-        fall_blocks: ["sand", "gravel", "concrete_powder"], // includes matching substrings like 'sandstone' and 'red_sand'
         update: async function (agent) {
             const bot = agent.bot;
             let block = bot.blockAt(bot.entity.position);
             let blockAbove = bot.blockAt(bot.entity.position.offset(0, 1, 0));
             if (!block) block = { name: "air" }; // hacky fix when blocks are not loaded
             if (!blockAbove) blockAbove = { name: "air" };
-            if (blockAbove.name === "water") {
-                // does not call execute so does not interrupt other actions
-                if (!bot.pathfinder.goal) {
-                    bot.setControlState("jump", true);
-                }
-            } else if (
-                this.fall_blocks.some((name) => blockAbove.name.includes(name))
+            if (
+                isFallingBlockName(blockAbove.name)
             ) {
+                // Dig it out rather than run from it. Fleeing surrenders the position - and
+                // mid-journey it actively undoes progress - whereas the sand above is a couple
+                // of seconds' work with a shovel. moveAway stays only as the last resort.
+                // Bounded timeout: with -1, a mode that cannot finish pins currentActionLabel
+                // forever and no action can ever start again (observed: the agent stuck on
+                // mode:self_preservation at full health, travel unable to run).
                 execute(this, agent, async () => {
-                    await skills.moveAway(bot, 2);
-                });
+                    const dug = await skills.clearFallingBlocksAbove(bot);
+                    if (!dug) await skills.moveAway(bot, 2);
+                }, 0.5);
             } else if (
                 block.name === "lava" ||
                 block.name === "fire" ||
@@ -70,7 +257,7 @@ const modes_list = [
                                 agent,
                                 "Placed some water, ahhhh that's better!",
                             );
-                    });
+                    }, 0.5);
                 } else {
                     execute(this, agent, async () => {
                         let waterBucket = bot.inventory.findInventoryItem('water_bucket');
@@ -111,7 +298,7 @@ const modes_list = [
                             return;
                         }
                         await skills.moveAway(bot, 5);
-                    });
+                    }, 0.5);
                 }
             } else if (
                 Date.now() - bot.lastDamageTime < 3000 &&
@@ -120,9 +307,11 @@ const modes_list = [
                 say(agent, "I'm dying!");
                 execute(this, agent, async () => {
                     await skills.moveAway(bot, 20);
-                });
-            } else if (agent.isIdle()) {
-                bot.clearControlStates(); // clear jump if not in danger or doing anything else
+                }, 1);
+            } else if (agent.isIdle() && !swim.inWater(bot) && !bot.isSleeping) {
+                // Not while wet: SwimAssist holds jump to keep the head above water, and
+                // clearing it here every idle tick would quietly sink the bot.
+                bot.clearControlStates();
             }
         },
     },
@@ -132,7 +321,22 @@ const modes_list = [
             "Attempt to get unstuck when in the same place for a while. Interrupts some actions.",
         interrupts: ["all"],
         // Building operations should not be interrupted - they have their own timeout
-        excludeFromInterrupt: ["action:fill", "action:plantTrees"],
+        // travel pauses to mine through obstructions, which looks like being stuck;
+        // it has its own stall detection and a hard deadline, so let it run.
+        //
+        // `action:marathonRun` is the same case and was simply missed when it was added: it
+        // wraps travelToward, so it already detects a stalled checkpoint and shoves sideways
+        // itself. Letting unstuck fire on top ran a SECOND moveAway and CANCELLED the whole
+        // run - observed twice in one race, each time costing the bot a checkpoint's progress.
+        excludeFromInterrupt: ["action:fill", "action:plantTrees", "action:travel", "action:navTo",
+            "action:marathonRun",
+            "action:swimTo", "action:dive", "action:surface", "action:swimProbe", "mode:drowning",
+            "action:goToBed", "action:shelter", "mode:night_safety",
+            // A bot parked on a vein, or working through progressTo's craft/smelt/mine chain,
+            // looks exactly like "stuck" to this mode - both have their own stall detection and
+            // deadlines (mining.js's MAX_STALLS, progressTo's 3-consecutive-failures guard), so
+            // unstuck firing on top just cancels real progress (docs/gaps/resource-progression.exec.md).
+            "action:branchMine", "action:progressTo"],
         on: true,
         active: false,
         prev_location: null,
@@ -148,6 +352,14 @@ const modes_list = [
                 return; // don't get stuck when idle
             }
             const bot = agent.bot;
+            // Water is the drowning mode's territory. Sinking runs at 0.5 blocks/s and holding
+            // depth is stationary by this test, so a legitimate 20s dive would trip the stuck
+            // timer - and this mode arms a cleanKill 10s after that.
+            if (swim.inWater(bot)) {
+                this.prev_location = null;
+                this.stuck_time = 0;
+                return;
+            }
             const cur_dig_block = bot.targetDigBlock;
             if (cur_dig_block && !this.prev_dig_block) {
                 this.prev_dig_block = cur_dig_block;
@@ -178,7 +390,7 @@ const modes_list = [
                     await skills.moveAway(bot, 5);
                     clearTimeout(crashTimeout);
                     say(agent, "I'm free.");
-                });
+                }, 1);
             }
             this.last_time = Date.now();
         },
@@ -214,7 +426,7 @@ const modes_list = [
                 say(agent, `Aaa! A ${enemy.name.replace("_", " ")}!`);
                 execute(this, agent, async () => {
                     await skills.avoidEnemies(agent.bot, 24);
-                });
+                }, 1);
             }
         },
     },
@@ -252,8 +464,395 @@ const modes_list = [
                 say(agent, `Fighting ${enemy.name}!`);
                 execute(this, agent, async () => {
                     await skills.defendSelf(agent.bot, 8);
-                });
+                }, 2);
             }
+        },
+    },
+    {
+        // A reflex, not an action: it NEVER calls execute() and NEVER sets `active`, so it
+        // never blocks a later mode in this list and never competes for currentActionLabel -
+        // the same "assist" shape as SwimAssist/AutoJump, just riding the ~300ms mode-update
+        // cadence (agent.js's update loop) rather than a physicsTick listener, since this
+        // integration deliberately does not touch agent.js. `interrupts: ["all"]` with no
+        // exclusions means update() runs on every tick regardless of what else is happening -
+        // required, because the whole point is to re-derive live state and re-assert every
+        // tick rather than trust a cached "I raised it" belief (the exact SwimAssist lesson
+        // that let a cached flag silently kill buoyancy while `!stats` reported `jump=true`).
+        name: "shield_guard",
+        description: "Raise a shield against creepers, skeletons and incoming arrows.",
+        interrupts: ["all"],
+        on: true,
+        active: false,
+        lastThreatAt: 0,
+        update: async function (agent) {
+            const bot = agent.bot;
+            const slot45 = bot.inventory?.slots?.[45];
+            // Exact name check, never a substring - the CLAUDE.md rule applies to item names
+            // exactly as it does to block names.
+            const hasShieldOffhand = !!slot45 && slot45.name === 'shield';
+            if (!hasShieldOffhand) return; // nothing to raise; cheapest possible exit
+
+            const wet = swim.inWater(bot);
+            const submerged = swim.isSubmerged(bot);
+            // bot.itemUseOwner: bow.js's lock over the same off-hand use channel. Reading it
+            // live (never cached) is what lets rule 1 of shield_guard.js work with zero changes
+            // to bow.js: it already refuses to draw while any other owner holds the channel.
+            const useOwner = bot.itemUseOwner ?? null;
+            // mineflayer-auto-eat exposes this as a live boolean (dist/index.js), no event
+            // wiring needed - it calls deactivateItem()/activateItem(offhand) on every health
+            // event while hungry, which is exactly the moment a shield matters most.
+            const eating = !!bot.autoEat?.isEating;
+            const pvpTargetSet = !!(bot.pvp && bot.pvp.target);
+            const now = Date.now();
+            const threats = shieldThreats(bot);
+
+            const sinceLastThreatMs = this.lastThreatAt ? now - this.lastThreatAt : null;
+            const verdict = shield_guard.shieldVerdict({
+                hasShieldOffhand, wet, submerged, useOwner, eating, pvpTargetSet,
+                cooldownUntil: 0, // axe-disable set_cooldown delivery is unverified on this server (docs/gaps/ranged-combat.exec.md); default to "no cooldown" rather than guess
+                now, sinceLastThreatMs, threats,
+            });
+
+            if (verdict.raise) {
+                this.lastThreatAt = now;
+                const faceEntity = verdict.faceIndex != null ? threats[verdict.faceIndex]?.entity : null;
+                if (faceEntity) {
+                    try { await bot.lookAt(faceEntity.position.offset(0, faceEntity.height ? faceEntity.height * 0.9 : 1, 0)); }
+                    catch (e) { /* the threat may have despawned between the scan and the look */ }
+                }
+                // Assert against REAL state every tick, never a cached "I raised it" flag.
+                if (!bot.usingHeldItem || bot.itemUseOwner !== 'shield') {
+                    bot.itemUseOwner = 'shield';
+                    try { bot.activateItem(true); } catch (e) { /* channel contention; retried next tick */ }
+                }
+            } else if (bot.itemUseOwner === 'shield') {
+                // Only ever lower a channel we ourselves own - never steal it from bow/pvp/auto-eat.
+                try { bot.deactivateItem(); } catch (e) { /* already released */ }
+                bot.itemUseOwner = null;
+            }
+        },
+    },
+    {
+        // Positioned AFTER self_defense and BEFORE hunting, deliberately. Everything above keeps
+        // updating while this is active - a creeper at the bedside still triggers self_defense,
+        // low air still triggers drowning. Everything below goes quiet, which is what we want:
+        // chasing a pig at dusk is how you meet a skeleton.
+        name: "night_safety",
+        description: "At dusk, sleep in a bed (or place one), or dig in when there is none.",
+        interrupts: ["all"],
+        // Never interrupt the survival modes above us, nor the commands doing this same job -
+        // that mutual-interrupt livelock cost the bot 2 hearts of drowning damage once already
+        // (!surface vs mode:drowning, docs/SWIMMING.md 5.2).
+        excludeFromInterrupt: [
+            "mode:drowning", "mode:self_preservation", "mode:self_defense",
+            "action:goToBed", "action:shelter", "action:surface",
+            "action:fill", "action:plantTrees", "action:!stay",
+        ],
+        on: true,
+        active: false,
+        cooldownUntil: 0,
+        sheltered: null,
+        // Consecutive failed shelter attempts, and whether we have given up for tonight.
+        // Both reset at dawn - see the dig-out branch.
+        failures: 0,
+        gaveUp: false,
+        update: async function (agent) {
+            const bot = agent.bot;
+            if (Date.now() < this.cooldownUntil) return;
+            if (bot.isSleeping) return;
+
+            const t = bot.time.timeOfDay;
+
+            // Dawn: break out of last night's hole, and forget last night's failures.
+            //
+            // The reset is gated on FULL DAYLIGHT, not merely `!isNight`. The two predicates do
+            // not partition the day: `isNight` starts at 13000 while `isDuskApproaching` starts
+            // 600 ticks earlier, so the dusk window is "not night" AND "time to shelter". A
+            // reset on `!isNight` alone therefore cleared the counter on every tick of exactly
+            // the window in which the mode is trying and failing - measured as 35 attempts in
+            // 110 seconds, with the give-up never latching.
+            const daylight = !night.isNight(t) && !night.isDuskApproaching(t);
+            if (daylight) {
+                this.failures = 0;
+                this.gaveUp = false;
+            }
+            if (!night.isNight(t) && this.sheltered) {
+                const seal = this.sheltered;
+                this.sheltered = null;
+                execute(this, agent, async () => { await skills.digOut(bot, seal); }, 1);
+                return;
+            }
+            if (!night.isDuskApproaching(t) && !(bot.thunderState > 0)) return;
+
+            // A HUMAN IS IN BED: join the vote.
+            //
+            // Vanilla skips the night only when EVERY player is asleep, and this bot counts as
+            // a player - so an awake bot silently prevents a person from skipping the night,
+            // with nothing in chat to say why. Voting is a different goal from sheltering:
+            // it is worth doing on Peaceful, under a roof, deep underground, and after the
+            // shelter attempts have given up for the night. Every stand-down below correctly
+            // blocks SHELTERING and would wrongly block VOTING, which is the whole reason this
+            // block sits above all of them - and below the dawn dig-out, so a bot sealed in
+            // last night is let out before it is asked to walk anywhere.
+            if (anyHumanSleeping(bot)) {
+                const bedNearby = bot.findBlocks({
+                    matching: (b) => night.isBedName(b.name), maxDistance: 48, count: 1,
+                }).length > 0;
+                const bedItem = night.bedInInventory(bot.inventory.items());
+                const verdict = night.sleepVoteVerdict({
+                    anyHumanSleeping: true, timeOfDay: t, thundering: bot.thunderState > 0,
+                    isSleeping: bot.isSleeping, dimension: bot.game.dimension,
+                    inWater: swim.inWater(bot),
+                    hasBed: bedNearby || !!bedItem,
+                    // A courtesy must not cancel what a person explicitly asked for. Modes are
+                    // exempt from the ownership rule so that DROWNING and SELF_DEFENSE can save
+                    // the bot's life; a sleep vote is not that, and killing a user's marathon
+                    // to be polite about their bedtime is damage this repo has already paid for
+                    // once. Nothing is lost by waiting: a sleeping human stays in bed, so the
+                    // first tick after their action finishes joins the vote anyway.
+                    userActionRunning: agent.actions.isUserOwned(),
+                });
+                if (verdict === 'join') {
+                    // A failed join must not become a metronome - same rule as the shelter
+                    // backoff below. Worst case for a bed-less bot beside a sleeping human is
+                    // one interrupted action per 30s, and only inside the vote window.
+                    this.cooldownUntil = Date.now() + 30000;
+                    execute(this, agent, async () => {
+                        if (!bedNearby && bedItem) await skills.placeNearby(bot, bedItem.name);
+                        const r = await skills.goToBed(bot);
+                        say(agent, r.slept ? `Joining the sleep vote.`
+                                           : `Could not join the sleep: ${r.reason}.`);
+                    }, 3);   // 3 minutes, never -1
+                    return;
+                }
+                // 'defer' or 'no': fall THROUGH to the ordinary chain. Returning here would
+                // silently disable every stand-down below whenever anyone was in bed.
+            }
+
+            // Nothing hostile spawns on Peaceful, so a night shelter costs a whole night and
+            // buys exactly nothing. This mode interrupts every action in the agent, so on a
+            // Peaceful world it is a pure tax: an in-flight journey stops at dusk, digs a hole,
+            // and resumes at dawn having gained no safety at all. Read the difficulty rather
+            // than assuming danger - the bot is told it on login and on every /difficulty.
+            //
+            // Deliberately AFTER the dawn dig-out above: a bot that sealed itself in while the
+            // world was on Normal must still be let out if the difficulty is lowered overnight.
+            if (isPeaceful(bot.game)) return;
+
+            // A HUMAN IS ONLINE AND AWAKE: do not dig in.
+            //
+            // Sheltering only pays for itself if it skips the night, and the bot cannot skip it
+            // alone - vanilla needs every player asleep. So while a person is connected and not
+            // in bed, a shelter costs the bot the whole night and changes nothing about when
+            // morning arrives. Worse, it does it by cancelling whatever the person asked for:
+            // observed cancelling a user's marathon 12 seconds after it started.
+            //
+            // Other agents do not count as people - two bots digging in because the other one
+            // is "online" is just both of them stopping.
+            if (humanAwakeOnline(bot)) return;
+
+            // Water belongs to the drowning mode; never contest the jump key with SwimAssist.
+            if (swim.inWater(bot)) return;
+
+            // Already underground = already sheltered. Observed live: the mode fired while the
+            // bot was mining at y=25, dug a hole in the floor and sealed itself in at y=9 -
+            // 50 blocks of stone overhead was strictly better cover than anything it built,
+            // and it abandoned the job it was sent to do. Mobs underground are a self_defense
+            // problem, not a nightfall one.
+            const surf = nav.surfaceY(bot, Math.floor(bot.entity.position.x),
+                                      Math.floor(bot.entity.position.z), 140,
+                                      Math.floor(bot.entity.position.y));
+            if (surf !== null && surf - bot.entity.position.y > 8) return;
+
+            // ALREADY UNDER COVER: a dungeon, a building, a shallow cave, an overhang. The
+            // depth test above only catches being DEEP underground (>8 blocks); it misses a bot
+            // standing inside a room at surface level, which is already sheltered by anything
+            // that matters. Digging a second hole inside a structure is pure waste.
+            if (hasRoofOverhead(bot)) return;
+
+            // Stand off while something is trying to kill us: self_defense owns that tick. The
+            // cooldown below means we retry after the fight instead of fighting IT for control.
+            const hostile = world.getNearbyEntities(bot, 12)
+                .find(e => e && mc.isHostile(e));
+            if (hostile) { this.cooldownUntil = Date.now() + 8000; return; }
+
+            // GIVE UP FOR THE NIGHT rather than retrying until dawn.
+            //
+            // A flat 20s cooldown on failure is not a backoff, it is a metronome: the mode
+            // interrupts every action in the agent, so on ground it cannot shelter on - bare
+            // stone, no pickaxe, nothing to place - it cancelled whatever the bot was doing
+            // three times a minute, all night. Observed exactly that during the chest work.
+            // Nothing about the ground or the inventory changes while the bot stands still, so
+            // the third identical failure is evidence, not bad luck.
+            if (this.gaveUp) return;
+
+            execute(this, agent, async () => {
+                const outcome = await skills.nightRoutine(bot, this);
+                say(agent, outcome);
+                if (/could not|cannot|nowhere/i.test(outcome)) {
+                    this.failures++;
+                    if (this.failures >= 3) {
+                        this.gaveUp = true;
+                        // Console as well as chat, and named: this is the line that explains why
+                        // the bot spent a night in the open, and `say` only reaches Minecraft
+                        // chat - which is not where anyone debugs a mode from.
+                        console.log(`[${agent.name}] night_safety: giving up for tonight after `
+                            + `3 failed attempts (${outcome.trim()})`);
+                        say(agent, `I cannot shelter here tonight; carrying on in the open.`);
+                        return;
+                    }
+                    // Escalating, so a transient failure (a mob wandered past the spot) still
+                    // gets a prompt second try while a permanent one stops costing actions.
+                    this.cooldownUntil = Date.now() + [20000, 60000][this.failures - 1];
+                } else {
+                    this.failures = 0;
+                }
+            }, 3);   // 3 minutes, never -1
+        },
+        unpause: function () {
+            this.cooldownUntil = 0;
+            // An explicit unpause is a person putting the mode back in charge; that is new
+            // information, so last night's "I cannot shelter here" no longer stands.
+            this.failures = 0;
+            this.gaveUp = false;
+        },
+    },
+    {
+        // Sits after night_safety (skeletons at dusk still outrank dinner) and before the
+        // recreational `hunting` mode below (which now need-gates on this mode's own supply
+        // check - see F3, docs/gaps/food-survival.exec.md). Every decision routes through the
+        // pure `farming.explainFoodAction` - this update() only gathers live state and dispatches.
+        //
+        // THE FAILURE LADDER. Measured live: 53 x `Mode food_supply finished executing` /
+        // `There is no furnace nearby and you have no furnace.` / `Could not cook anything`,
+        // contending with `mode:unstuck` and `mode:self_preservation` because this mode
+        // interrupts everything. Two halves, both from `night_safety`'s written cure:
+        //
+        //  - **It gives up**, on a named line, after `FOOD_BACKOFF_MS` runs out (20s, 60s, stop).
+        //  - **The reset is an INPUT CHANGE, not a clock.** Nothing about the world or the bag
+        //    changes while the bot stands still, so a timer can only re-run a failure that is
+        //    still impossible. A furnace appearing, the inventory changing, or the bot moving
+        //    `FOOD_MOVE_RESET_BLOCKS` is new information; more time is not. That is the same
+        //    distinction as gating night_safety's reset on FULL DAYLIGHT rather than `!isNight`.
+        name: "food_supply",
+        description: "Acquire food when supply is low: cook raw meat, harvest crops, hunt only when starving.",
+        interrupts: ["all"],
+        excludeFromInterrupt: ["action:surface", "action:dive", "action:swimTo", "mode:drowning",
+            "mode:self_preservation", "mode:self_defense", "action:cookFood",
+            "action:harvestCrops", "action:huntFood"],
+        on: true,
+        active: false,
+        // `{ signature, failures, cooldownUntil, gaveUp, reason, pos }` or null - see
+        // farming.recordFoodFailure / farming.foodRetryVerdict. Null means "no failure stands".
+        failure: null,
+        update: async function (agent) {
+            const bot = agent.bot;
+            // Hunger cannot drain on Peaceful, so acquiring food buys nothing and the mode
+            // would be a pure tax on whatever a person asked for - same reasoning as
+            // night_safety. difficulty.isPeaceful, never the raw bot.game.difficulty field
+            // (CLAUDE.md: it is a lie on Peaceful worlds).
+            if (isPeaceful(bot.game)) return;
+            // Never contest the jump key with SwimAssist, and never start a land errand
+            // (walking to a furnace, chasing an animal) from inside a lake.
+            if (swim.inWater(bot)) return;
+
+            const inv = world.getInventoryCounts(bot);
+            const supply = farming.summarizeFoodSupply(inv);
+            // Cheapest gate first: everything below is a findBlocks sweep or an entity scan, and
+            // for a well-fed bot the answer is "do nothing" for the whole day. A full larder is
+            // also the most decisive input change there is, so any standing failure is void.
+            if (!supply.low) { this.failure = farming.clearFoodFailure(); return; }
+
+            // Existence checks only (capped at 1 result) - explainFoodAction only needs
+            // "is there at least one", and scanning further every ~300ms tick is wasted work.
+            const matureCropCount = world.getNearestBlocksWhere(bot, (block) => {
+                const props = typeof block.getProperties === 'function' ? block.getProperties() : undefined;
+                return farming.isMatureCrop(block.name, props);
+            }, 16, 1).length;
+            const huntableCount = world.getNearestEntityWhere(bot, (entity) => mc.isHuntable(entity), 24) ? 1 : 0;
+            // The COOK precondition, as an input rather than a discovery. smeltItem needs a
+            // furnace within 16 (or one in the bag to place) AND fuel; without both, "cook" is
+            // an action that cannot succeed however many times it is chosen.
+            const furnaceReachable = !!world.getNearestBlock(bot, 'furnace', 16);
+            const furnaceInBag = (inv['furnace'] || 0) > 0;
+            const fuelInBag = !!furnaceIO.pickFuelName(
+                Object.keys(inv).map((name) => ({ name, count: inv[name] })));
+
+            const state = {
+                food: bot.food,
+                ediblePoints: supply.ediblePoints,
+                rawCookableCount: supply.rawCookableCount,
+                matureCropCount,
+                huntableCount,
+                furnaceReachable,
+                furnaceInBag,
+                fuelInBag,
+                inWater: false,        // already refused above; kept explicit so the pure call reads standalone
+                peaceful: false,       // already refused above
+                cooldownActive: false, // the backoff is the gate below, not a field of the decision
+            };
+            const { action, reason } = farming.explainFoodAction(state);
+            if (action === 'none') return;
+
+            // May we attempt this again? A give-up is permanent with respect to TIME and
+            // temporary with respect to the WORLD, so the reset conditions are tested first.
+            const signature = farming.foodAttemptSignature({ action, ...state });
+            const pos = bot.entity.position;
+            const movedBlocks = this.failure && this.failure.pos
+                ? Math.hypot(pos.x - this.failure.pos.x, pos.z - this.failure.pos.z)
+                : 0;
+            const gate = farming.foodRetryVerdict(this.failure, { now: Date.now(), signature, movedBlocks });
+            if (gate.verdict === 'backoff' || gate.verdict === 'gave_up') return;
+            if (gate.reset) {
+                console.log(`[${agent.name}] food_supply retrying (${gate.reason}).`);
+                this.failure = farming.clearFoodFailure();
+            }
+
+            // Cooking/harvesting are maintenance - they wait for a genuinely idle moment.
+            // Hunting is the one branch explainFoodAction reaches while actually starving
+            // (food<=6 and nothing edible at all), so it alone may interrupt other work.
+            if (action !== 'hunt' && !agent.isIdle()) return;
+
+            const label = action === 'hunt' ? 'hunting' : action === 'cook' ? 'cooking' : 'harvesting';
+            say(agent, `Food supply low - ${label}.`);
+            const onDone = (result) => {
+                // The skills refuse to say VERIFIED over an empty bag (farming.harvestOutcome /
+                // huntOutcome), which is what makes this test mean anything: it used to read a
+                // `VERIFIED HARVEST ... gained nothing` as a success and reset the escalation.
+                if (typeof result === 'string' && result.startsWith('VERIFIED')) {
+                    this.failure = farming.clearFoodFailure();
+                    return;
+                }
+                const next = farming.recordFoodFailure(this.failure, {
+                    now: Date.now(), signature, reason: typeof result === 'string' ? result : reason,
+                });
+                // Where the bot was when it FAILED, not where it set off from: "have I moved
+                // since?" is only new information if it is measured from the place that failed.
+                next.pos = { x: bot.entity.position.x, z: bot.entity.position.z };
+                this.failure = next;
+                if (next.gaveUp) {
+                    // Name the give-up, the way night_safety's "I cannot shelter here tonight"
+                    // does. Silence here is indistinguishable from the mode never running.
+                    say(agent, `Giving up on ${label} for now: ${next.reason} Nothing here changes by waiting, so I will try again when a furnace, my inventory or my position does.`);
+                    console.log(`[${agent.name}] food_supply gave up on ${action} after ${next.failures} identical failures: ${next.reason}`);
+                }
+            };
+            // Two literal-timeout call sites rather than one with a computed value - a hunt
+            // (3 min) is a shorter commitment than cooking/harvesting a whole plan (5 min), and
+            // tests/modes.test.mjs's execute() scan requires the timeout to be a plain literal
+            // it can read statically, not an expression.
+            if (action === 'hunt') {
+                execute(this, agent, async () => { onDone(await skills.huntForFood(bot)); }, 3);
+            } else if (action === 'cook') {
+                execute(this, agent, async () => { onDone(await skills.cookFood(bot)); }, 5);
+            } else {
+                execute(this, agent, async () => { onDone(await skills.harvestCrops(bot)); }, 5);
+            }
+        },
+        unpause: function () {
+            // New information from a person putting the mode back in charge - last attempt's
+            // failure, and any give-up, no longer stand.
+            this.failure = farming.clearFoodFailure();
         },
     },
     {
@@ -263,6 +862,12 @@ const modes_list = [
         on: true,
         active: false,
         update: async function (agent) {
+            // Need-gated (F3, docs/gaps/food-survival.exec.md): this mode used to hunt
+            // recreationally regardless of supply, which fired in a bright desert at dawn with
+            // a full bag. Now it only engages while supply is actually low - food_supply above
+            // owns the dire-starvation branch (food<=6, nothing edible at all); this one is the
+            // gentler top-up for "low but not yet starving".
+            if (!farming.summarizeFoodSupply(world.getInventoryCounts(agent.bot)).low) return;
             const huntable = world.getNearestEntityWhere(
                 agent.bot,
                 (entity) => mc.isHuntable(entity),
@@ -272,15 +877,20 @@ const modes_list = [
                 execute(this, agent, async () => {
                     say(agent, `Hunting ${huntable.name}!`);
                     await skills.attackEntity(agent.bot, huntable);
-                });
+                }, 2);
             }
         },
     },
     {
         name: "item_collecting",
         description:
-            "Collect nearby items when idle or when items are dropped.",
-        interrupts: ["action:followPlayer", "action:!stop", "action:!stayHere"],
+            "Collect nearby items when idle.",
+        // ONLY WHEN NOT BUSY. `action:followPlayer` used to be in this list, so a single dropped
+        // item within 3 blocks ended a follow outright - and mining drops items constantly, so
+        // the bot interrupted itself on its own output. What is left are the two actions whose
+        // whole purpose is to stand still: those are idleness with a name, and picking things up
+        // during them is the point of them.
+        interrupts: ["action:!stop", "action:!stayHere"],
         on: true,
         active: false,
 
@@ -296,12 +906,21 @@ const modes_list = [
             );
             let empty_inv_slots = agent.bot.inventory.emptySlotCount();
 
-            // More aggressive item collection - interrupt more actions when items are very close
             const distance = item
                 ? agent.bot.entity.position.distanceTo(item.position)
                 : 999;
-            const is_very_close = distance < 3; // items within 3 blocks are considered "given" items
-            const can_interrupt = agent.isIdle() || is_very_close;
+            // Still used to shorten the wait and to speak up: an item dropped at the bot's feet
+            // is almost always a person handing it something, and should not sit for 1.5s.
+            const is_very_close = distance < 3;
+            // PROXIMITY IS NOT PERMISSION. This was `agent.isIdle() || is_very_close`, which let
+            // any item within 3 blocks preempt a running action - the "more aggressive" comment
+            // that used to sit here was describing the bug. The mode framework already gates
+            // `update()` on `isIdle() || interruptible` (see runAll), and `interrupts` above is
+            // now only the stand-still actions, so this states the same rule rather than widening
+            // it: pick up when there is nothing else to do.
+            const standingStill = agent.actions.currentActionLabel === 'action:!stop'
+                || agent.actions.currentActionLabel === 'action:!stayHere';
+            const can_interrupt = agent.isIdle() || standingStill;
 
             if (
                 item &&
@@ -358,7 +977,7 @@ const modes_list = [
                                 agent.handleMessage("system", message);
                             }, 500);
                         }
-                    });
+                    }, 1);
                     this.noticed_at = -1;
                 }
             } else {
@@ -388,7 +1007,7 @@ const modes_list = [
                         "bottom",
                         true,
                     );
-                });
+                }, 0.5);
                 this.last_place = Date.now();
             }
         },
@@ -396,7 +1015,29 @@ const modes_list = [
     {
         name: "elbow_room",
         description: "Move away from nearby players when idle.",
-        interrupts: ["action:followPlayer"],
+        // IDLE MEANS IDLE. This used to carry `interrupts: ["action:followPlayer"]`, and on
+        // 2026-08-30 that stopped a follow dead. Log times below are UTC (the service log is
+        // UTC while this host is +0800 - worth remembering before concluding an event is old):
+        //
+        //   16:32:51  pinned: pos=(4744.5, 65.50, 4810.7)        <- stuck in sand
+        //   16:32:52  mode:elbow_room interrupts action:followPlayer
+        //   16:32:52  dig sand at (4744, 65, 4811): Digging aborted   <- the recovery, cancelled
+        //   16:32:52  pinned: nothing worked - recentring
+        //   16:32:55  mode:elbow_room interrupts action:followPlayer  (third time in 16s)
+        //   16:32:57  follow resumes, target now out of entity range, refuses
+        //   ...and the bot then stood on that block, motionless, until it was restarted.
+        //
+        // Three faults compounded. Being 0.5 blocks from the person you are FOLLOWING is the
+        // goal state, not a problem to fix. The remedy - shuffle half a block - competes with
+        // the navigator's own stall ladder and aborted the dig that was getting the bot out.
+        // And each interrupt tears the follow down and restarts it from the top, so a target
+        // who keeps walking eventually gets out of range during one of the gaps.
+        //
+        // `followPlayer` already pauses this mode when it is within `distance + 2`, but that
+        // line sits at the BOTTOM of a loop iteration which blocks for seconds inside
+        // navigateTo - so a player walking up to a stuck bot beats the pause every time. The
+        // pause stays as belt-and-braces; not interrupting is what actually fixes it.
+        interrupts: [],
         on: true,
         active: false,
         distance: 0.5,
@@ -423,7 +1064,7 @@ const modes_list = [
                             this.distance,
                         );
                     }
-                });
+                }, 0.5);
             }
         },
     },
@@ -478,6 +1119,15 @@ const modes_list = [
     },
 ];
 
+/**
+ * Run a mode's action through the action manager.
+ *
+ * ALWAYS pass a timeout. The `-1` default means "no timeout", and a mode action that cannot
+ * finish then pins `currentActionLabel` forever - after which NO action can ever start again.
+ * That is not hypothetical: one `self_preservation` trigger left the agent frozen at full
+ * health for 11 minutes (CLAUDE.md, "Tools and modes"). `tests/modes.test.mjs` fails the build
+ * if a call site here omits it.
+ */
 async function execute(mode, agent, func, timeout = -1) {
     if (agent.self_prompter.isActive()) agent.self_prompter.stopLoop();
     let interrupted_action = agent.actions.currentActionLabel;
@@ -487,11 +1137,17 @@ async function execute(mode, agent, func, timeout = -1) {
         async () => {
             await func();
         },
-        { timeout },
+        // 'mode', explicitly: `agent.command_author` still holds whoever issued the LAST
+        // command, so without this a safety interrupt would inherit "user" and then be
+        // protected from being interrupted itself.
+        { timeout, author: 'mode' },
     );
     mode.active = false;
+    // Name the agent. This log is the ONLY record that a mode fired, and with two bots
+    // sharing one service log an unattributed "Mode drowning finished executing" is
+    // undiagnosable - you cannot tell which bot is wet, or even that only one of them is.
     console.log(
-        `Mode ${mode.name} finished executing, code_return: ${code_return.message}`,
+        `[${agent.name}] Mode ${mode.name} finished executing, code_return: ${code_return.message}`,
     );
 
     let should_reprompt =
@@ -539,6 +1195,11 @@ class ModeController {
 
     isOn(mode_name) {
         return modes_map[mode_name].on;
+    }
+
+    /** Is this mode currently mid-action? Lets a command stand down rather than compete. */
+    isActive(mode_name) {
+        return !!modes_map[mode_name]?.active;
     }
 
     pause(mode_name) {

@@ -1,5 +1,26 @@
 import net from 'net';
 import mc from 'minecraft-protocol';
+import minecraftData from 'minecraft-data';
+
+/**
+ * Maps a protocol number (response.version.protocol) to the real Minecraft
+ * major version, via minecraft-data's own protocol table - the same table
+ * mineflayer, prismarine-chunk and prismarine-registry are keyed on.
+ *
+ * This used to be skipped entirely: mcserver.js only regex-extracted a
+ * version from the server's ping *name* string (e.g. "Purpur 1.21.11"),
+ * which is a label the server operator chose and can lag or misrepresent
+ * the real protocol. Against this server that mislabeling is exactly what
+ * hid the 1.21.11-vs-26.1 mismatch documented in CLAUDE.md - see "Movement".
+ *
+ * @returns {string|null} the majorVersion (e.g. "26.1"), or null if this
+ *   protocol number isn't in minecraft-data's table.
+ */
+function majorVersionForProtocol(protocol) {
+    const entries = minecraftData.postNettyVersionsByProtocolVersion?.pc?.[protocol];
+    if (!entries || entries.length === 0) return null;
+    return entries[0].majorVersion || entries[0].minecraftVersion || null;
+}
 
 /**
  * Gets the player count from a Minecraft server.
@@ -71,12 +92,29 @@ export async function serverInfo(ip, port, timeout = 1000, verbose = false) {
                 console.log(`Modded server found (${version}), attempting to use ${numericVersion}...`);
             }
 
+            // The name string is a label the operator chose and can lag the
+            // real protocol (this server's says "Purpur 1.21.11" while
+            // protocol 775 is actually 26.1). Cross-check it here so the
+            // mismatch is visible instead of silently ignored - but keep
+            // `version` (the string mindcraft.js actually connects with)
+            // pinned to the name-derived value: mineflayer's testedVersions
+            // gate still caps at 1.21.11, so switching the connect version
+            // to the true protocol version would break the live bot until
+            // that gate is lifted (see settings.mc_client / CLAUDE.md).
+            const protocol = response?.version?.protocol ?? null;
+            const majorVersion = protocol != null ? majorVersionForProtocol(protocol) : null;
+            if (majorVersion && majorVersion !== numericVersion) {
+                console.log(`[mcserver] Server ping name says "${numericVersion}" but protocol ${protocol} is actually Minecraft ${majorVersion}. Connecting as ${numericVersion} - the mineflayer backend's testedVersions gate caps there; see settings.mc_client and CLAUDE.md "Movement".`);
+            }
+
             const serverInfo = {
                 host: ip,
                 port,
                 name: response.description.text || 'No description provided.',
                 ping: response.latency,
-                version: numericVersion
+                version: numericVersion,
+                protocol,
+                majorVersion,
             };
 
             resolve(serverInfo);

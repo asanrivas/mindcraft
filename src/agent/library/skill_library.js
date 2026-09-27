@@ -7,24 +7,31 @@ export class SkillLibrary {
         this.agent = agent;
         this.embedding_model = embedding_model;
         this.skill_docs_embeddings = {};
+        // Searchable text per doc, populated unconditionally. Kept separate from the
+        // embeddings map so the word-overlap fallback still has something to score
+        // when the embedding model is unavailable.
+        this.skill_doc_texts = {};
         this.skill_docs = null;
         this.always_show_skills = ['skills.placeBlock', 'skills.wait', 'skills.breakBlockAt']
     }
     async initSkillLibrary() {
         const skillDocs = getSkillDocs();
         this.skill_docs = skillDocs;
+        for (const doc of skillDocs) {
+            this.skill_doc_texts[doc] = doc.split('\n').slice(0, 2).join('');
+        }
         if (this.embedding_model) {
             try {
                 const embeddingPromises = skillDocs.map((doc) => {
                     return (async () => {
-                        let func_name_desc = doc.split('\n').slice(0, 2).join('');
-                        this.skill_docs_embeddings[doc] = await this.embedding_model.embed(func_name_desc);
+                        this.skill_docs_embeddings[doc] = await this.embedding_model.embed(this.skill_doc_texts[doc]);
                     })();
                 });
                 await Promise.all(embeddingPromises);
             } catch (error) {
-                console.warn('Error with embedding model, using word-overlap instead.');
+                console.warn('Error with embedding model, using word-overlap instead:', error.message);
                 this.embedding_model = null;
+                this.skill_docs_embeddings = {};
             }
         }
         this.always_show_skills_docs = {};
@@ -43,18 +50,20 @@ export class SkillLibrary {
         let skill_doc_similarities = [];
 
         if (select_num === -1) {
-            skill_doc_similarities = Object.keys(this.skill_docs_embeddings)
+            skill_doc_similarities = Object.keys(this.skill_doc_texts)
             .map(doc_key => ({
                 doc_key,
                 similarity_score: 0
             }));
         }
         else if (!this.embedding_model || typeof this.embedding_model.embed !== 'function') {
-            // Fallback to word overlap if embedding model unavailable or doesn't have embed method
-            skill_doc_similarities = Object.keys(this.skill_docs_embeddings)
+            // Fallback to word overlap if embedding model unavailable or doesn't have embed method.
+            // Score against the doc TEXT - scoring against skill_docs_embeddings would either
+            // iterate an empty object or feed a number[] into a string function.
+            skill_doc_similarities = Object.keys(this.skill_doc_texts)
                 .map(doc_key => ({
                     doc_key,
-                    similarity_score: wordOverlapScore(message, this.skill_docs_embeddings[doc_key])
+                    similarity_score: wordOverlapScore(message, this.skill_doc_texts[doc_key])
                 }))
                 .sort((a, b) => b.similarity_score - a.similarity_score);
         }

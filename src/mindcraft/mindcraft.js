@@ -48,7 +48,15 @@ export async function createAgent(settings) {
             const server = await getServer(settings.host, settings.port, settings.minecraft_version);
             settings.host = server.host;
             settings.port = server.port;
-            settings.minecraft_version = server.version;
+            // Only adopt the server's reported version when the user hasn't pinned one.
+            // Previously this overwrote an explicit pin unconditionally, which silently
+            // defeated `minecraft_version` in settings.js (the "forced to compatible
+            // version" comment there had stopped having any effect).
+            if (!settings.minecraft_version || settings.minecraft_version === "auto") {
+                settings.minecraft_version = server.version;
+            } else if (settings.minecraft_version !== server.version) {
+                console.log(`[Version] Server reports ${server.version}; using pinned ${settings.minecraft_version} from settings.`);
+            }
         } catch (error) {
             console.warn(`Error getting server:`, error);
             if (settings.minecraft_version === "auto") {

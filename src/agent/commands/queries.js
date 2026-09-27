@@ -1,14 +1,61 @@
 import * as world from '../library/world.js';
 import * as skills from '../library/skills.js';
+import * as swim from '../library/swim.js';
+import * as farming from '../library/farming.js';
+import * as mining from '../library/mining.js';
 import * as mc from '../../utils/mcdata.js';
 import { getCommandDocs } from './index.js';
 import convoManager from '../conversation.js';
 import { checkLevelBlueprint, checkBlueprint } from '../tasks/construction_tasks.js';
 import { load } from 'cheerio';
 import Vec3 from 'vec3';
+import fs from 'fs';
 
 const pad = (str) => {
     return '\n' + str + '\n';
+}
+
+/**
+ * Pure: describe one already-parsed blueprint JSON as a placement count and bounding-box
+ * footprint. `blueprint_builder.js` owns the actual build/status engines and its own
+ * `placements || raw` shape - mirrored here rather than imported, since queries.js is the only
+ * file this integration pass may edit for this feature (blueprint_builder.js is a different
+ * workstream's file). Never throws on junk: an empty or malformed placements array reads as
+ * `count: 0`, not an exception - the caller (`listBlueprints`, below) is what decides a file is
+ * unreadable, from a JSON.parse failure, not from a shape it merely didn't expect.
+ */
+export function summarizeBlueprint(parsed) {
+    const placements = Array.isArray(parsed?.placements) ? parsed.placements
+        : Array.isArray(parsed) ? parsed : [];
+    if (placements.length === 0) return { count: 0, size: null, name: parsed?.meta?.name || null };
+
+    let minX = Infinity, minY = Infinity, minZ = Infinity;
+    let maxX = -Infinity, maxY = -Infinity, maxZ = -Infinity;
+    for (const p of placements) {
+        if (typeof p?.x !== 'number' || typeof p?.y !== 'number' || typeof p?.z !== 'number') continue;
+        if (p.x < minX) minX = p.x; if (p.x > maxX) maxX = p.x;
+        if (p.y < minY) minY = p.y; if (p.y > maxY) maxY = p.y;
+        if (p.z < minZ) minZ = p.z; if (p.z > maxZ) maxZ = p.z;
+    }
+    const size = Number.isFinite(minX)
+        ? { width: maxX - minX + 1, height: maxY - minY + 1, length: maxZ - minZ + 1 }
+        : null;
+    return { count: placements.length, size, name: parsed?.meta?.name || null };
+}
+
+/** Pure: render a `!blueprints` listing. Empty is a true answer, not an error. */
+export function formatBlueprintList(entries) {
+    if (!entries || entries.length === 0) return 'No blueprints found in blueprints/.';
+    let res = 'BLUEPRINTS:';
+    for (const e of entries) {
+        if (e.error) {
+            res += `\n- ${e.file} (unreadable: ${e.error})`;
+            continue;
+        }
+        const sizeStr = e.size ? `${e.size.width}x${e.size.height}x${e.size.length}` : 'unknown size';
+        res += `\n- ${e.file}: ${e.count} blocks, ${sizeStr}${e.name ? ` ("${e.name}")` : ''}`;
+    }
+    return res;
 }
 
 // queries are commands that just return strings and don't affect anything in the world
@@ -27,6 +74,29 @@ export const queryList = [
             res += `\n- Health: ${Math.round(bot.health)} / 20`;
             res += `\n- Hunger: ${Math.round(bot.food)} / 20`;
             res += `\n- Biome: ${world.getBiomeName(bot)}`;
+            // Only while wet, so the normal prompt costs nothing. Air matters urgently or not
+            // at all, and the model cannot see oxygen any other way.
+            if (swim.inWater(bot)) {
+                res += `\n- In water: ${swim.isSubmerged(bot) ? 'SUBMERGED' : 'at surface'}, Air: ${swim.oxygen(bot)} / 20`;
+                // Buoyancy state, because "the bot will not rise" is otherwise undiagnosable
+                // from outside: it looks identical whether the assist is off, stuck in sink,
+                // or holding jump against a ceiling.
+                const sa = bot.swimAssist;
+                if (sa) res += ` [assist: ${sa.stats.mode}, jump=${sa.stats.holdingJump}, boost=${sa.stats.boosted}]`;
+                // The PHYSICS flag, not our block-name fallback. If these disagree, every water
+                // control is a no-op: prismarine-physics applies neither water movement nor
+                // ground acceleration, and the bot sits at vel=0 with the keys held.
+                res += ` [physics.isInWater=${bot.entity.isInWater} vel.y=${bot.entity.velocity.y.toFixed(3)}]`;
+            }
+            // Jumping, but ONLY once it has been disabled or is mid-flight - the same rule the
+            // water line follows, so the ordinary prompt costs nothing. "The bot will not jump"
+            // is otherwise undiagnosable from outside: a tripped anti-cheat valve and a bot that
+            // simply never met a gap look identical.
+            const ja = bot.jumpAssist;
+            if (ja && (ja.disabled || ja.active)) {
+                res += `\n- Jump: ${ja.disabled ? 'DISABLED (server corrections)' : 'in flight'}`
+                     + ` [jumps=${ja.stats.jumps} failures=${ja.stats.failures}]`;
+            }
             let weather = "Clear";
             if (bot.rainState > 0)
                 weather = "Rain";
@@ -52,6 +122,27 @@ export const queryList = [
             if (agent.isIdle())
                 action = 'Idle';
             res += `\- Current Action: ${action}`;
+
+            // Only shown while failed over, so the normal prompt costs nothing. Without it the
+            // only symptom of the local server being down is that Andy suddenly writes differently.
+            if (agent.prompter?.chat_model?.on_backup) {
+                const st = agent.prompter.chat_model.status;
+                res += `\n- Brain: BACKUP (${agent.prompter.chat_model.model_name}) - local model unreachable`;
+                // Duration and retry cadence, so a multi-hour outage reads as an outage rather
+                // than as "the bot is being weird today".
+                if (st) res += ` for ${st.downMinutes.toFixed(0)} min, ${st.failures} failed attempt(s), next retry in ${st.retryInSec}s`;
+            }
+
+            // Only rendered when supply is low or hunger is about to matter - a well-fed bot
+            // with a full bag pays zero extra prompt tokens, same rule as the water/jump lines.
+            const foodLine = farming.foodSupplyLine(
+                farming.summarizeFoodSupply(world.getInventoryCounts(bot)), bot.food);
+            if (foodLine) res += `\n- ${foodLine}`;
+
+            // Only rendered underground (y < 0) - this is the awareness that was missing when
+            // the model dug DOWN toward an ore band it was already below, for two hours.
+            const depthLine = mining.depthAdvisory(pos.y);
+            if (depthLine) res += `\n- Depth: ${depthLine}`;
 
 
             let players = world.getNearbyPlayerNames(bot);
@@ -104,7 +195,7 @@ export const queryList = [
     },
     {
         name: "!nearbyBlocks",
-        description: "Get the blocks near the bot, including important blocks with distance/direction.",
+        description: "List the block types within reach of the bot, each with a distance and compass direction. Use to find out what is available nearby; !surroundings instead when you need to know what is directly in front of you.",
         perform: function (agent) {
             let bot = agent.bot;
             let res = 'NEARBY_BLOCKS';
@@ -143,7 +234,7 @@ export const queryList = [
     },
     {
         name: "!surroundings",
-        description: "Get a 3D view of blocks in each direction (front/back/left/right/up/down) based on where the bot is facing.",
+        description: "Report what is immediately front/back/left/right/up/down of the bot, relative to its facing. Use before stepping, digging or placing; !nearbyBlocks for what exists in the area at all.",
         perform: function (agent) {
             let bot = agent.bot;
             let dirBlocks = world.getDirectionalBlocks(bot, 4);
@@ -313,7 +404,8 @@ export const queryList = [
     },
     {
         name: '!getCraftingPlan',
-        description: "Provides a comprehensive crafting plan for a specified item. This includes a breakdown of required ingredients, the exact quantities needed, and an analysis of missing ingredients or extra items needed based on the bot's current inventory.",
+        description: "Provides a comprehensive crafting plan for a specified item. This includes a breakdown of required ingredients, the exact quantities needed, and an analysis of missing ingredients or extra items needed based on the bot's current inventory. "
+            + "Use !progressTo to actually acquire the item; this only prints the plan.",
         params: {
             targetItem: { 
                 type: 'string', 
@@ -383,8 +475,29 @@ export const queryList = [
         }
     },
     {
+        name: '!buildStatus',
+        description: 'Diff the world against a blueprint JSON: how much is built, and the nearest wrong blocks as Place/Replace fixes. '
+            + 'Use !blueprints to list valid file paths.',
+        params: {
+            'file': { type: 'string', description: 'Placements JSON path relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
+            'x': { type: 'int', description: 'World X of the blueprint origin.' },
+            'y': { type: 'int', description: 'World Y of the blueprint origin.' },
+            'z': { type: 'int', description: 'World Z of the blueprint origin.' },
+            'limit': { type: 'int', description: 'Max fixes to list (default 10).', optional: true }
+        },
+        perform: async function (agent, file, x, y, z, limit = 10) {
+            const { blueprintStatus } = await import('../library/blueprint_builder.js');
+            try {
+                return pad(blueprintStatus(agent, file,
+                    new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)), Math.floor(limit)));
+            } catch (e) {
+                return `buildStatus failed: ${e.message}`;
+            }
+        }
+    },
+    {
         name: '!scanArea',
-        description: 'Scan a rectangular area and report what blocks are present. Useful for understanding surroundings before building or planting.',
+        description: 'List which block types fill a rectangle, with counts and percentages, at one Y level. Use to check the ground before building or planting. Use !gridView instead when you need each block\'s exact position.',
         params: {
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
             'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
@@ -407,7 +520,7 @@ export const queryList = [
     },
     {
         name: '!gridView',
-        description: 'Generate an ASCII grid view of blocks in an area. Perfect for verifying builds - shows exact block positions as characters.',
+        description: 'Draw one Y level of a rectangle as an ASCII map, one character per block. Use to verify a build or find the exact block that is wrong. Use !scanArea instead when you only need which blocks are present.',
         params: {
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
             'z1': { type: 'int', description: 'Z coordinate of the first corner.' },
@@ -474,6 +587,33 @@ export const queryList = [
         description: 'Lists all available commands and their descriptions.',
         perform: async function (agent) {
             return getCommandDocs(agent);
+        }
+    },
+    {
+        name: '!blueprints',
+        description: 'List the blueprint JSON files available to !buildBlueprint and !buildStatus, with block counts and footprint. '
+            + 'Use this first to get a valid file path.',
+        params: {},
+        perform: function (agent) {
+            const dir = 'blueprints';
+            let files;
+            try {
+                files = fs.readdirSync(dir).filter(f => f.endsWith('.json'));
+            } catch (e) {
+                return pad(`No blueprints directory found (${e.message}).`);
+            }
+            const entries = files.map((f) => {
+                const file = `${dir}/${f}`;
+                try {
+                    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+                    return { file, ...summarizeBlueprint(parsed) };
+                } catch (e) {
+                    // A malformed file is listed as unreadable, not hidden - it must not silently
+                    // drop the rest of an otherwise-good directory listing.
+                    return { file, error: e.message };
+                }
+            });
+            return pad(formatBlueprintList(entries));
         }
     },
 ];

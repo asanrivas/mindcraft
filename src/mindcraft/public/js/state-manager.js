@@ -129,8 +129,14 @@ class StateManager {
             let html = entries.map(([name, count]) => {
                 const displayName = Utils.formatItemName(name);
                 const safeName = name.replace('minecraft:', '').toLowerCase();
-                // Using 1.21.1 as it is a recent stable version for assets
-                const imageUrl = `https://mc.nerothe.com/img/1.21.11/minecraft_${safeName}.png`;
+                // Asset version, bumped 2026-09-23 from 1.21.11 to 1.26.2. Not cosmetic: the
+                // 1.21.11 tree 404s on items this world actually uses - short_grass,
+                // iron_chain, pale_oak_log, copper_chest and firefly_bush all returned 404
+                // there and 200 here. A 404 is INVISIBLE in the UI because the onerror below
+                // hides the image and swaps in the item's name, so the only symptom was an
+                // inventory slot that rendered as text while its neighbours showed icons.
+                // Verify a bump before making it: curl the same item on both paths.
+                const imageUrl = `https://mc.nerothe.com/img/1.26.2/minecraft_${safeName}.png`;
 
                 return `<div class="inventory-item" data-tooltip="${displayName}">
                     <img src="${imageUrl}" onerror="this.style.display='none'; this.parentNode.innerText='${displayName}'" alt="${displayName}">

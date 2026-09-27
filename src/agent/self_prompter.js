@@ -21,7 +21,21 @@ export class SelfPrompter {
         }
         this.state = ACTIVE;
         this.prompt = prompt;
+        this.persist();
         this.startLoop();
+    }
+
+    /**
+     * Write the loop's state to memory.json the moment it changes.
+     *
+     * `history.save()` records `self_prompt: isStopped() ? null : prompt`, so whether a restart
+     * finds a task at all depended on WHEN the last save happened to be taken. A save while the
+     * loop was momentarily down - `!endGoal` forces one - persisted null even though the goal
+     * record lived on, and the bot came back with nothing to resume. Saving on the transitions
+     * themselves makes the file track reality instead of sampling it.
+     */
+    persist() {
+        try { this.agent.history?.save?.(); } catch { /* a failed save must not kill the loop */ }
     }
 
     isActive() {
@@ -63,8 +77,16 @@ export class SelfPrompter {
         let no_command_count = 0;
         const MAX_NO_COMMAND = 3;
         while (!this.interrupt) {
+            // Wait for any in-flight action to finish before prompting again. Long actions
+            // (e.g. !fill on a large area) would otherwise be interrupted and restarted from
+            // scratch by the next self-prompt, livelocking the goal so it never completes.
+            while (!this.interrupt && !this.agent.isIdle()) {
+                await new Promise(r => setTimeout(r, 500));
+            }
+            if (this.interrupt) break;
+
             const msg = `You are self-prompting with the goal: '${this.prompt}'. Your next response MUST contain a command with this syntax: !commandName. Respond:`;
-            
+
             let used_command = await this.agent.handleMessage('system', msg, -1);
             if (!used_command) {
                 no_command_count++;
@@ -123,6 +145,7 @@ export class SelfPrompter {
             await this.agent.actions.stop();
         this.stopLoop();
         this.state = STOPPED;
+        this.persist();
     }
 
     async pause() {

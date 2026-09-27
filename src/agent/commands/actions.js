@@ -1,7 +1,49 @@
 import * as skills from '../library/skills.js';
+import * as swim from '../library/swim.js';
+import { measureSwim, formatProbe } from '../library/swim_probe.js';
+import * as worldGuard from '../library/world_guard.js';
+import * as creative from '../library/creative.js';
+import * as mining from '../library/mining.js';
+import { ORIGIN as MEM_ORIGIN } from '../memory_store.js';
+import { Vec3 } from 'vec3';
+import fs from 'fs';
 import settings from '../settings.js';
+import { BUILD_BLUEPRINT_TIMEOUT_MIN } from '../library/build_telemetry.js';
 import convoManager from '../conversation.js';
 
+
+/**
+ * Send a slash command and wait for the server's reply.
+ *
+ * There is no request/response channel for commands - the answer arrives as an ordinary chat
+ * line - so listen on `messagestr` for something matching `pattern` and give up after
+ * `timeoutMs` rather than hanging if the bot lacks permission and the server says nothing.
+ *
+ * @returns {Promise<string|null>} the matching line, or null on timeout
+ */
+async function runServerCommand(bot, command, pattern, timeoutMs = 8000) {
+    return await new Promise((resolve) => {
+        let done = false;
+        const finish = (val) => {
+            if (done) return;
+            done = true;
+            bot.removeListener('messagestr', onMsg);
+            clearTimeout(timer);
+            resolve(val);
+        };
+        const onMsg = (message) => {
+            // Skip player chat. The agent narrates every command it runs ("*asanrivas used
+            // worldSeed*"), and that echo matched the reply pattern before the real answer
+            // arrived - so the command returned its own announcement as the server's response.
+            if (/^<[^>]+>/.test(message)) return;
+            if (message.includes(bot.username)) return;
+            if (pattern.test(message)) finish(message);
+        };
+        const timer = setTimeout(() => finish(null), timeoutMs);
+        bot.on('messagestr', onMsg);
+        bot.chat(command);
+    });
+}
 
 function runAsAction (actionFn, resume = false, timeout = -1) {
     let actionLabel = null;  // Will be set on first use
@@ -14,21 +56,33 @@ function runAsAction (actionFn, resume = false, timeout = -1) {
         }
 
         const actionFnWithAgent = async () => {
-            await actionFn(agent, ...args);
+            return await actionFn(agent, ...args);
         };
         const code_return = await agent.actions.runAction(`action:${actionLabel}`, actionFnWithAgent, { timeout, resume });
         if (code_return.interrupted && !code_return.timedout)
             return;
+        // Surface the command's own return value alongside the bot output log. Commands
+        // report concrete outcomes ("Filled area with 0 sandstone blocks"); dropping them
+        // left the model free to assume success from prose alone.
+        const summary = code_return.result;
+        if (summary !== undefined && summary !== null && summary !== '') {
+            return code_return.message ? `${code_return.message}\n${summary}` : String(summary);
+        }
         return code_return.message;
     }
 
+    // Mark it as taking over the bot. `agent.js` refuses a MODEL-issued command of this kind
+    // while a user-issued action is running - but only this kind. A command that merely reads
+    // state (!marathonStatus) cannot cancel anything, and blocking it left the model unable to
+    // find out what was going on, which is the opposite of what the guard is for.
+    wrappedAction.takesOverBot = true;
     return wrappedAction;
 }
 
 export const actionsList = [
     {
         name: '!newAction',
-        description: 'Perform new and unknown custom behaviors that are not available as a command.', 
+        description: 'Write and run new code for a behavior no other command covers. Use only as a last resort, after checking that no command above does the job - it is slower and far more likely to fail than a real command.', 
         params: {
             'prompt': { type: 'string', description: 'A natural language prompt to guide code generation. Make a detailed step-by-step plan.' }
         },
@@ -51,6 +105,343 @@ export const actionsList = [
         }
     },
     {
+        name: '!travel',
+        description: 'Travel a long distance in a compass direction (west/east/north/south). Walks and mines through obstructions; does not rely on jumping. Reports VERIFIED distance actually covered.',
+        params: {
+            'direction': { type: 'string', description: 'One of: west, east, north, south.' },
+            'distance': { type: 'int', description: 'How many blocks to travel.', domain: [1, 100000] }
+        },
+        perform: runAsAction(async (agent, direction, distance) => {
+            const dirs = { west: [-1, 0], east: [1, 0], north: [0, -1], south: [0, 1] };
+            const d = dirs[String(direction).toLowerCase()];
+            if (!d) return `Unknown direction "${direction}". Use west, east, north or south.`;
+            return await skills.travelDirection(agent.bot, d[0], d[1], distance);
+        }, true, 45)  // resume=true so it can be continued; 45 min ceiling
+    },
+    {
+        name: '!navTo',
+        description: 'Walk to exact coordinates you already know. Use this for any trip to a specific x y z; !travel is for heading off in a compass direction with no fixed destination. Climbs, bridges, digs and towers up its way there.',
+        params: {
+            'x': { type: 'int', description: 'target x' },
+            'y': { type: 'int', description: 'target y' },
+            'z': { type: 'int', description: 'target z' }
+        },
+        perform: runAsAction(async (agent, x, y, z) => {
+            const nav = await import('../library/nav.js');
+            const { Vec3 } = await import('vec3');
+            const start = agent.bot.entity.position.clone();
+            const t0 = Date.now();
+            const probe = nav.planPath(agent.bot, new Vec3(x, y, z));
+            console.warn(`[navTo] plan took ${Date.now() - t0}ms length=${probe ? probe.length : 'null'} first=${probe && probe[1] ? JSON.stringify(probe[1]) : '-'} last=${probe && probe.length ? JSON.stringify(probe[probe.length-1]) : '-'}`);
+            // `debug` on for the manual command: !navTo is the tool you reach for when the bot
+            // will not move, and without the per-second pos/fwd/onGround/vel line there is
+            // nothing to distinguish "no plan" from "plan fine, executor stuck".
+            const res = await nav.navigateTo(agent.bot, new Vec3(x, y, z), { debug: true });
+            const p = agent.bot.entity.position;
+            return `NAV: arrived=${res.arrived} covered=${res.covered.toFixed(1)} replans=${res.replans} `
+                + `from=(${start.x.toFixed(0)},${start.y.toFixed(0)},${start.z.toFixed(0)}) `
+                + `to=(${p.x.toFixed(0)},${p.y.toFixed(0)},${p.z.toFixed(0)})`;
+        }, true, 10)
+    },
+    {
+        name: '!climbBankTest',
+        description: 'Debug: repeatedly attempt swim.climbBank toward a compass direction for N seconds.',
+        params: {
+            'direction': { type: 'string', description: 'west/east/north/south' },
+            'seconds': { type: 'int', description: 'how long to keep trying', domain: [1, 120] }
+        },
+        perform: runAsAction(async (agent, direction, seconds) => {
+            const swimMod = await import('../library/swim.js');
+            const dirs = { west: [-1, 0], east: [1, 0], north: [0, -1], south: [0, 1] };
+            const d = dirs[String(direction).toLowerCase()];
+            if (!d) return `Unknown direction "${direction}".`;
+            const bot = agent.bot;
+            const start = bot.entity.position.clone();
+            const deadline = Date.now() + seconds * 1000;
+            let tries = 0, out = false;
+            while (Date.now() < deadline && !bot.interrupt_code) {
+                tries++;
+                const r = await swimMod.climbBank(bot, d[0], d[1], { timeoutMs: 6000 });
+                if (r.out) { out = true; break; }
+                await new Promise((res) => setTimeout(res, 200));
+            }
+            const p = bot.entity.position;
+            return `CLIMBOUT: out=${out} tries=${tries} y ${start.y.toFixed(2)} -> ${p.y.toFixed(2)} `
+                + `pos=(${p.x.toFixed(1)}, ${p.y.toFixed(2)}, ${p.z.toFixed(1)})`;
+        }, false, 3)
+    },
+    {
+        name: '!buildFooting',
+        description: 'Debug: while afloat, place blocks on the pool floor beneath you until you can stand.',
+        perform: runAsAction(async (agent) => {
+            const before = agent.bot.entity.position.clone();
+            const placed = await skills.buildFootingBelow(agent.bot, 3);
+            const p = agent.bot.entity.position;
+            return `FOOTING: placed ${placed}, y ${before.y.toFixed(2)} -> ${p.y.toFixed(2)}, `
+                + `at (${p.x.toFixed(1)}, ${p.y.toFixed(2)}, ${p.z.toFixed(1)})`;
+        }, false, 1)
+    },
+    {
+        name: '!marathonPlan',
+        description: 'Lay out a ring of checkpoints around where you are standing, as a route you can then run with !marathonRun.',
+        params: {
+            'checkpoints': { type: 'int', description: 'How many checkpoints.', domain: [2, 12] },
+            'maxTotal': { type: 'int', description: 'Straight-line budget for the whole route, in blocks.', domain: [50, 20000] },
+            'startAngleDeg': { type: 'int', description: 'Rotate the ring; 0 puts checkpoint 1 due east.', domain: [0, 359] }
+        },
+        perform: async (agent, checkpoints, maxTotal, startAngleDeg) => {
+            const marathon = await import('../library/marathon.js');
+            const p = agent.bot.entity.position;
+            const center = { x: Math.round(p.x), z: Math.round(p.z) };
+            const { radius, checkpoints: cps } = marathon.planLoop(center, {
+                count: checkpoints, maxTotal, startAngleDeg,
+            });
+            const length = marathon.routeLength(center, cps);
+            // Refuse rather than quietly overspend: the budget is the whole point of the route.
+            if (length > maxTotal)
+                return `Planned route is ${Math.round(length)} blocks, over the ${maxTotal} budget. Nothing saved.`;
+            const state = {
+                created: new Date().toISOString(),
+                start: { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) },
+                center, radius: Math.round(radius), plannedLength: length,
+                checkpoints: cps, finishedAt: null,
+            };
+            marathon.saveState(agent.name, state);
+            return `Planned ${cps.length} checkpoints on a ${Math.round(radius)}-block ring, `
+                + `${Math.round(length)} blocks of route (budget ${maxTotal}).\n`
+                + marathon.describe(state, agent.bot);
+        }
+    },
+    {
+        name: '!marathonRoute',
+        description: 'Set an explicit checkpoint marathon from coordinates, e.g. "4412,4934 4362,5021 ...".',
+        params: {
+            'points': { type: 'string', description: 'Space-separated x,z pairs, in running order.' },
+            'maxTotal': { type: 'int', description: 'Straight-line budget for the whole route, in blocks.', domain: [50, 20000] }
+        },
+        perform: async (agent, points, maxTotal) => {
+            const marathon = await import('../library/marathon.js');
+            const parsed = marathon.routeFromPairs(points);
+            if (parsed.error) return parsed.error;
+            const p = agent.bot.entity.position;
+            const start = { x: Math.round(p.x), y: Math.round(p.y), z: Math.round(p.z) };
+            const length = marathon.routeLength(start, parsed.checkpoints);
+            if (length > maxTotal)
+                return `That route is ${Math.round(length)} blocks, over the ${maxTotal} budget. Nothing saved.`;
+            const state = {
+                created: new Date().toISOString(),
+                start, center: { x: start.x, z: start.z }, radius: null,
+                plannedLength: length, checkpoints: parsed.checkpoints, finishedAt: null,
+            };
+            marathon.saveState(agent.name, state);
+            return `Route set: ${parsed.checkpoints.length} checkpoints, ${Math.round(length)} blocks `
+                + `(budget ${maxTotal}).\n` + marathon.describe(state, agent.bot);
+        }
+    },
+    {
+        name: '!marathonRun',
+        description: 'Run the planned checkpoint marathon on foot, in order, resuming where a previous run left off.',
+        perform: runAsAction(async (agent) => {
+            const marathon = await import('../library/marathon.js');
+            const state = marathon.loadState(agent.name);
+            if (!state) return 'No marathon planned. Use !marathonPlan first.';
+            if (state.finishedAt) return `Marathon already finished at ${state.finishedAt}. !marathonPlan again to start a new one.`;
+
+            const t0 = Date.now();
+            const res = await marathon.runMarathon(agent.bot, state, {
+                name: agent.name,
+                // Checkpoint-level events go to the model AND the console; per-leg detail goes
+                // to the console only. bot.output is fed to the LLM and is budgeted, so a
+                // 40-minute run's worth of leg lines would crowd out everything else.
+                onProgress: (msg) => { skills.log(agent.bot, msg); console.log(`[${agent.name}] marathon: ${msg}`); },
+                onDetail: (msg) => console.log(`[${agent.name}] marathon: ${msg}`),
+            });
+            const mins = ((Date.now() - t0) / 60000).toFixed(1);
+            const head = res.finished
+                ? `MARATHON FINISHED: all ${state.checkpoints.length} checkpoints in ${mins} min.`
+                : `MARATHON ${res.reason.toUpperCase()} after ${mins} min`
+                    + (res.stuckAt ? ` at checkpoint #${res.stuckAt}, still ${Math.round(res.remaining)} blocks out` : '')
+                    + '. Run !marathonRun again to continue.';
+            // The OUTCOME has to reach the log too. This string is returned to the model and
+            // routed to chat; every per-checkpoint line goes to the console, but the one line
+            // that says whether the whole route finished did not - so the service log showed six
+            // checkpoints reached and never said "finished", and anything watching for that
+            // waited forever.
+            console.log(`[${agent.name}] marathon: ${head}`);
+            return `${head}\n${marathon.describe(state, agent.bot)}`;
+        }, true, 120)   // resume=true so an interrupt can be continued; 2h ceiling
+    },
+    {
+        name: '!marathonStatus',
+        description: 'Report progress through the checkpoint marathon.',
+        perform: async (agent) => {
+            const marathon = await import('../library/marathon.js');
+            return marathon.describe(marathon.loadState(agent.name), agent.bot);
+        }
+    },
+    {
+        name: '!marathonReset',
+        description: 'Forget the planned checkpoint marathon.',
+        perform: async (agent) => {
+            const marathon = await import('../library/marathon.js');
+            return marathon.clearState(agent.name) ? 'Marathon cleared.' : 'There was no marathon to clear.';
+        }
+    },
+    {
+        name: '!climbOut',
+        description: 'Climb up to the surface from underground. Use when buried, sealed in, or stuck in a cave or tunnel.',
+        perform: runAsAction(async (agent) => {
+            const before = agent.bot.entity.position.y;
+            const gained = await skills.climbToSurface(agent.bot);
+            const p = agent.bot.entity.position;
+            return `CLIMB: gained ${gained.toFixed(0)} blocks, y ${before.toFixed(0)} -> ${p.y.toFixed(0)}.`;
+        }, true, 15)
+    },
+    {
+        name: '!swimTo',
+        description: 'Swim to a point in or across water. Handles depth automatically and sprint-swims when submerged.',
+        params: {
+            'x': { type: 'float', description: 'x coordinate.' },
+            'y': { type: 'float', description: 'y coordinate.' },
+            'z': { type: 'float', description: 'z coordinate.' }
+        },
+        perform: runAsAction(async (agent, x, y, z) => {
+            const bot = agent.bot;
+            if (!swim.inWater(bot)) return 'Not in water - walk to the water first, then swim.';
+            const r = await swim.swimTo(bot, new Vec3(x, y, z));
+            const p = bot.entity.position;
+            const speed = r.ms > 0 ? (r.covered / (r.ms / 1000)) : 0;
+            return `VERIFIED SWIM: arrived=${r.arrived}, covered ${r.covered.toFixed(1)} blocks in `
+                + `${(r.ms / 1000).toFixed(1)}s (${speed.toFixed(2)} b/s), ${r.remaining.toFixed(1)} to go, `
+                + `oxygen ${r.oxygenStart}->${r.oxygenEnd}, reason=${r.reason}. `
+                + `Now at (${p.x.toFixed(0)}, ${p.y.toFixed(0)}, ${p.z.toFixed(0)}).`;
+        }, true, 5)
+    },
+    {
+        name: '!dive',
+        description: 'Dive down underwater by a number of blocks. Surfaces automatically when air runs low.',
+        params: {
+            'depth': { type: 'int', description: 'How many blocks to descend.', domain: [1, 100] }
+        },
+        perform: runAsAction(async (agent, depth) => {
+            const bot = agent.bot;
+            if (!swim.inWater(bot)) return 'Not in water - get in the water first.';
+            // The hunting mode will chase a cod mid-dive and fight the descent for the controls.
+            bot.modes.pause('hunting');
+            try {
+                const startY = bot.entity.position.y;
+                const r = await swim.dive(bot, startY - depth);
+                return `VERIFIED DIVE: y ${startY.toFixed(0)} -> ${r.y.toFixed(0)} `
+                    + `(${r.descended.toFixed(1)}/${depth} blocks in ${(r.ms / 1000).toFixed(1)}s), `
+                    + `oxygen ${r.oxygenStart}->${r.oxygenEnd}, reason=${r.reason}.`;
+            } finally {
+                bot.modes.unpause('hunting');
+            }
+        }, false, 2)
+    },
+    {
+        name: '!surface',
+        description: 'Swim up to the surface for air. Finds another way up if the water above is capped.',
+        perform: runAsAction(async (agent) => {
+            const bot = agent.bot;
+            // The drowning mode does exactly this job and already has the controls. Racing it
+            // starves both: each interrupt aborts the other's climb, and the bot keeps drowning
+            // while the two hand off. Whoever got there first finishes the job.
+            if (bot.modes.exists('drowning') && bot.modes.isActive('drowning')) {
+                return 'The drowning response is already surfacing me - leaving it to finish.';
+            }
+            bot.modes.pause('hunting');
+            try {
+                const r = await swim.surface(bot);
+                if (!r.surfaced) {
+                    return `VERIFIED SURFACE: FAILED, reason=${r.reason}`
+                        + `${r.blocker ? ` (blocked by ${r.blocker})` : ''}, still at y=${r.y.toFixed(0)} `
+                        + `with ${r.oxygenEnd}/20 air.`;
+                }
+                return `VERIFIED SURFACE: y ${(r.y - r.rose).toFixed(0)} -> ${r.y.toFixed(0)} in `
+                    + `${(r.ms / 1000).toFixed(1)}s, oxygen ${r.oxygenStart}->${r.oxygenEnd}, reason=${r.reason}.`;
+            } finally {
+                bot.modes.unpause('hunting');
+            }
+        }, false, 1)
+    },
+    {
+        // Hidden measurement harness. The agent could not pillar where a CLEAN mineflayer bot on
+        // this same server pillars perfectly (+4.00 blocks, apex 1.25, 4/4 placed) - so this runs
+        // the identical test from inside the agent, on the same ground, to find the difference.
+        name: '!pillarTest',
+        description: 'Pillar straight up n blocks and report the apex of each jump. Diagnostic.',
+        params: { 'blocks': { type: 'int', description: 'how many blocks to climb' } },
+        perform: runAsAction(async (agent, blocks) => {
+            const before = agent.bot.entity.position.y;
+            const gained = await skills.pillarUp(agent.bot, blocks);
+            const msg = `PILLAR TEST: +${gained.toFixed(2)} of ${blocks} requested, `
+                + `y ${before.toFixed(2)} -> ${agent.bot.entity.position.y.toFixed(2)}`;
+            console.log(msg);
+            return msg;
+        }, false, 2)
+    },
+    {
+        // Diagnostic, and hidden for the same reason !swimProbe is. The ENTIRE movement stack is
+        // a workaround for `onGround` reading false while the bot is standing - a fact that was
+        // observed many times and never explained, so every fix could only route around it.
+        name: '!groundProbe',
+        description: 'Measure what onGround actually reports while standing still. Diagnostic.',
+        perform: runAsAction(async (agent) => {
+            const { measureGround, formatGround } = await import('../library/ground_probe.js');
+            return formatGround(await measureGround(agent.bot, 3000));
+        }, false, 2)
+    },
+    {
+        // Diagnostic. The whole water cost model in nav.js rests on a claim that the bot "barely
+        // moves while swimming"; this is what settles it with numbers instead of a comment.
+        name: '!swimProbe',
+        description: 'Measure how fast this server actually lets you swim. Run while floating in open water.',
+        perform: runAsAction(async (agent) => {
+            const m = await measureSwim(agent.bot);
+            return formatProbe(m);
+        }, false, 3)
+    },
+    {
+        // Steering is rendered verbatim into every prompt and is never round-tripped through the
+        // model the way `history.memory` is - that channel is model-written and has already
+        // corrupted itself once in this project, rewriting a command signature until the bot
+        // acted on its own bad note. Directives change only when a user asks; the guard below
+        // stops an autonomous loop from rewriting its own instructions.
+        name: '!steer',
+        description: 'Give me a standing instruction that shapes how I talk and act. Persists across restarts. Example: !steer("be brief, no questions")',
+        params: {
+            'instruction': { type: 'string', description: 'The standing instruction, kept short.' }
+        },
+        perform: async function (agent, instruction) {
+            // Refuse while self-prompting. Relaying what a user just asked for is the point of
+            // this command, but an autonomous loop editing its own standing instructions is the
+            // same self-corruption that wrecked `history.memory` in this project.
+            if (agent.self_prompter && agent.self_prompter.isActive())
+                return 'I will not change my own standing instructions while running autonomously. Ask me directly.';
+            return agent.steering.add(instruction).message;
+        }
+    },
+    {
+        name: '!steering',
+        description: 'List the standing instructions currently steering me, numbered.',
+        perform: async function (agent) {
+            return agent.steering.list();
+        }
+    },
+    {
+        name: '!unsteer',
+        description: 'Remove a standing instruction by its number from !steering, or "all" to clear them.',
+        params: {
+            'which': { type: 'string', description: 'The number shown by !steering, or "all".' }
+        },
+        perform: async function (agent, which) {
+            if (agent.self_prompter && agent.self_prompter.isActive())
+                return 'I will not remove my own standing instructions while running autonomously. Ask me directly.';
+            return agent.steering.remove(which).message;
+        }
+    },
+    {
         name: '!stop',
         description: 'Force stop all actions and commands that are currently executing.',
         perform: async function (agent) {
@@ -60,7 +451,8 @@ export const actionsList = [
             agent.bot.emit('idle');
             let msg = 'Agent stopped.';
             if (agent.self_prompter.isActive())
-                msg += ' Self-prompting still active.';
+                msg += ' Self-prompting still active - but it will NOT come back after a restart;'
+                    + ' say !goal again to restart it, or !endGoal to drop it for good.';
             return msg;
         }
     },
@@ -155,7 +547,9 @@ export const actionsList = [
                 range = 32;
             }
             await skills.goToNearestBlock(agent.bot, block_type, 4, range);
-        })
+        }, false, 3)   // bounded: this routes through mineflayer-pathfinder, which cannot move
+                       // the bot here, so without a ceiling it pins currentActionLabel until
+                       // something else forces a stop (observed: 5 minutes frozen mid-igloo)
     },
     {
         name: '!searchForEntity',
@@ -289,7 +683,7 @@ export const actionsList = [
     },
     {
         name: '!chestList',
-        description: 'List all storage containers (chests, barrels, shulker boxes) within range, sorted by distance.',
+        description: 'List the storage containers physically nearby (chests, barrels, shulker boxes), sorted by distance. Use to discover containers you have not seen before; it does not say what is inside them.',
         params: {
             'range': { type: 'int', description: 'Search radius in blocks. Default 32.', optional: true, domain: [1, 128] }
         },
@@ -302,7 +696,8 @@ export const actionsList = [
             }
             skills.log(agent.bot, `Found ${containers.length} storage containers within ${searchRange} blocks:`);
             for (const c of containers.slice(0, 10)) {
-                skills.log(agent.bot, `  ${c.type} at (${c.position.x}, ${c.position.y}, ${c.position.z}) - ${c.distance} blocks away`);
+                const half = c.otherHalf ? ` + (${c.otherHalf.x}, ${c.otherHalf.y}, ${c.otherHalf.z})` : '';
+                skills.log(agent.bot, `  ${c.type} at (${c.position.x}, ${c.position.y}, ${c.position.z})${half} - ${c.distance} blocks away`);
             }
             if (containers.length > 10) {
                 skills.log(agent.bot, `  ... and ${containers.length - 10} more`);
@@ -333,7 +728,7 @@ export const actionsList = [
     },
     {
         name: '!chestListNamed',
-        description: 'List all named chests that have been saved.',
+        description: 'List the chests you have given names to, wherever they are. Use to recall a name for !chestPutNamed or !chestTakeNamed; !chestList instead for containers that happen to be nearby.',
         params: {},
         perform: runAsAction(async (agent) => {
             skills.listNamedChests(agent.bot);
@@ -341,7 +736,7 @@ export const actionsList = [
     },
     {
         name: '!chestForget',
-        description: 'Remove a named chest from memory.',
+        description: 'Forget the name you gave a chest. Only the label is lost - the container and everything in it is untouched, but the name does not come back on restart.',
         params: {
             'name': { type: 'string', description: 'Name of the chest to forget.' }
         },
@@ -417,7 +812,7 @@ export const actionsList = [
     },
     {
         name: '!chestFind',
-        description: 'Search for an item across all nearby chests and report which containers have it.',
+        description: 'Search for one item across every nearby chest and report which containers hold it. Use when you know what you want but not where it is; !chestList instead when you want the containers themselves.',
         params: {
             'item_name': { type: 'ItemName', description: 'The item to search for.' },
             'range': { type: 'int', description: 'Search radius in blocks. Default 32.', optional: true, domain: [1, 128] }
@@ -460,7 +855,7 @@ export const actionsList = [
     },
     {
         name: '!collectBlocks',
-        description: 'Collect the nearest blocks of a given type.',
+        description: 'Collect the nearest blocks of a given type. Do NOT use for ores - use !branchMine, which digs down to the ore layer instead of searching for exposed ore. Do NOT use on wheat/carrots/potatoes - use !harvestCrops, which checks maturity and replants.',
         params: {
             'type': { type: 'BlockName', description: 'The block type to collect.' },
             'num': { type: 'int', description: 'The number of blocks to collect.', domain: [1, Number.MAX_SAFE_INTEGER] }
@@ -487,14 +882,16 @@ export const actionsList = [
             'item_name': { type: 'ItemName', description: 'The name of the input item to smelt.' },
             'num': { type: 'int', description: 'The number of times to smelt the item.', domain: [1, Number.MAX_SAFE_INTEGER] }
         },
+        // NO RESTART. This used to `cleanKill('Safely restarting to update inventory.')` on
+        // success, which is why smelting anything killed the agent process. It was a workaround
+        // for a real bug that is now fixed at the source: `bot.inventory` is frozen while a
+        // window is open and is only refreshed by `closeWindow -> copyInventory`, and the old
+        // furnace path could leave the window open (mineflayer's furnace helpers have no
+        // deadline), so the bag really did stay stale. `furnace_io.withFurnace` closes in a
+        // `finally` on every path, so the inventory is current the moment this returns.
         perform: runAsAction(async (agent, item_name, num) => {
-            let success = await skills.smeltItem(agent.bot, item_name, num);
-            if (success) {
-                setTimeout(() => {
-                    agent.cleanKill('Safely restarting to update inventory.');
-                }, 500);
-            }
-        })
+            await skills.smeltItem(agent.bot, item_name, num);
+        }, false, 10)   // 10 min ceiling - the default -1 pins currentActionLabel forever
     },
     {
         name: '!clearFurnace',
@@ -506,16 +903,37 @@ export const actionsList = [
     },
         {
         name: '!placeHere',
-        description: 'Place a given block in the current location. Do NOT use to build structures, only use for single blocks/torches.',
+        description: 'Place a given block next to you. Do NOT use to build structures, only use for single blocks/torches/beds.',
         params: {'type': { type: 'BlockOrItemName', description: 'The block type to place.' }},
         perform: runAsAction(async (agent, type) => {
-            let pos = agent.bot.entity.position;
-            await skills.placeBlock(agent.bot, type, pos.x, pos.y, pos.z);
+            // Next to the bot, not inside it - see skills.placeNearby.
+            const ok = await skills.placeNearby(agent.bot, type);
+            return ok ? `Placed ${type}.` : `Could not place ${type} nearby.`;
         })
     },
     {
+        name: '!placeWithSupport',
+        description: 'Creative only: place ONE block at x,y,z even with nothing to attach to - builds a temporary dirt support, places, removes it. block may carry states: "oak_log[axis=z]". Not for structures.',
+        params: {
+            'block': { type: 'string', description: 'Block name, optionally with states, e.g. "oak_log[axis=z]" or "lever[face=wall,facing=east]".' },
+            'x': { type: 'int', description: 'World X.' },
+            'y': { type: 'int', description: 'World Y.' },
+            'z': { type: 'int', description: 'World Z.' }
+        },
+        perform: runAsAction(async (agent, block, x, y, z) => {
+            const { parseBlockSpec, placeWithSupport } = await import('../library/blueprint_builder.js');
+            const spec = parseBlockSpec(block);
+            if (!spec) return `Could not read "${block}" - use a block name, optionally with states like oak_log[axis=z].`;
+            const r = await placeWithSupport(agent, new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)), spec);
+            // Logged, not only returned: the return goes to the model's context, and a failure no
+            // one can read afterwards costs a probe to reconstruct.
+            console.log(`[${agent.name}] placeWithSupport: ${r.message}`);
+            return r.message;
+        }, false, 5)
+    },
+    {
         name: '!fill',
-        description: 'Fill a rectangular area with blocks. Can build floors (height=1) or walls (height=5+). Like Minecraft /fill command.',
+        description: 'Walk and place blocks by hand (slow, can fail on rough terrain). Takes only X/Z corners then a SINGLE y and a height: (blockType, x1, z1, x2, z2, y, height). This is NOT the vanilla /fill order.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "dirt", "cobblestone").' },
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
@@ -526,13 +944,53 @@ export const actionsList = [
             'height': { type: 'int', description: 'How many levels high to build (default 1). Use 5 for standard walls.', optional: true }
         },
         perform: runAsAction(async (agent, blockType, x1, z1, x2, z2, y, height = 1) => {
-            const placed = await skills.fill(agent.bot, blockType, x1, z1, x2, z2, y, height);
-            return `Filled area with ${placed} ${blockType} blocks.`;
+            // skills.fill returns a VERIFIED summary read back from world state, not a
+            // self-reported count - pass it through unchanged.
+            return await skills.fill(agent.bot, blockType, x1, z1, x2, z2, y, height);
         }, true, 600)  // resume=true allows resuming after interruption
     },
     {
+        name: '!buildBlueprint',
+        description: 'Hand-build a blueprint JSON block by block, flying to each position and placing by hand. Slow, but leaves a survival-legal build. '
+            + 'Use !blueprints to list valid file paths.',
+        params: {
+            'file': { type: 'string', description: 'Path to the placements JSON, relative to the mindcraft root (e.g. "blueprints/survival_base.json").' },
+            'x': { type: 'int', description: 'World X of the blueprint origin (its local 0,0,0 min-corner).' },
+            'y': { type: 'int', description: 'World Y of the blueprint origin.' },
+            'z': { type: 'int', description: 'World Z of the blueprint origin.' }
+        },
+        perform: runAsAction(async (agent, file, x, y, z) => {
+            const { buildBlueprint } = await import('../library/blueprint_builder.js');
+            return await buildBlueprint(agent, file, new Vec3(Math.floor(x), Math.floor(y), Math.floor(z)));
+        }, true, BUILD_BLUEPRINT_TIMEOUT_MIN)  // RESUMABLE, and MINUTES. See the notes below.
+        // 240 was measured to be short: the wizard tower (8,335 cells) was force-stopped at
+        // exactly four hours on 2026-09-22 with `Code execution timed out after 240 minutes`,
+        // mid-way through retry round 2. The throw propagates past the verification block, so the
+        // run ends with no `VERIFIED BUILD` line at all - the work is in the world, but the report
+        // that reads it back never runs, which is the worst possible way to end a four-hour job.
+        //
+        // The clock was standing in for a stop condition the builder did not have. It has three
+        // now, all of which end a bad run in minutes rather than hours: `progressVerdict` (200
+        // consecutive attempts that placed nothing), `ctx.stuck` (rescues that make no progress
+        // toward the station), and the retry loop's own `gained === 0`. A longer clock is safe
+        // precisely because none of those existed when 240 was chosen.
+        // resume:true because a blueprint build is long enough that a mode WILL interrupt it.
+        // Measured 2026-08-31: `self_preservation` (which the builder deliberately does not
+        // pause, being a genuine safety mode) fired during a night with hostiles about; the
+        // builder's `finally` then ran `unPauseAll`, every other mode became live, and the run
+        // simply ended at 480/581 of its retry pass with the bot standing motionless for fifteen
+        // minutes. Nothing was wrong with the build - nothing brought it back.
+        // Replaying is safe and cheap: placeOne returns `skipped` for any cell already correct,
+        // and a resumed run now skips the terrain clear too, so a resume costs seconds.
+        //
+        // 600 was short too, and for the same reason: the cathedral (35,142 cells) was force-stopped
+        // at exactly ten hours on 2026-09-25, 63% built and placing 22/min, still in pass 1 - it
+        // needs ~27h at that rate. The ceiling is now derived from the largest blueprint at the
+        // slowest measured rate, and tests/build_timeout.test.mjs fails if a blueprint outgrows it.
+    },
+    {
         name: '!serverFill',
-        description: 'FAST fill using server /fill command - places thousands of blocks INSTANTLY. Requires operator permissions. Use this for large builds instead of !fill.',
+        description: 'PREFERRED for building. Instant server /fill - thousands of blocks at once, no walking. Takes BOTH corners in full 3D: (blockType, x1, y1, z1, x2, y2, z2). Note this is a DIFFERENT argument order from !fill.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place (e.g., "stone_bricks", "cobblestone").' },
             'x1': { type: 'int', description: 'X coordinate of the first corner.' },
@@ -547,16 +1005,39 @@ export const actionsList = [
             const validModes = ['replace', 'hollow', 'outline', 'destroy', 'keep'];
             if (!validModes.includes(mode)) mode = 'replace';
 
+            // Refuse edits that destroy something irreplaceable or bury the bot. A model cannot
+            // see that the cell it is about to overwrite holds its own bed; the edit itself has
+            // to notice. See world_guard.js for the night this cost.
+            // Pass the MODE, never a substituted blockType: hollow paints the shell with
+            // blockType and only the interior with air, so 'air' here disabled the entombment
+            // check on exactly the fills that can bury the bot.
+            const guard = worldGuard.checkEditForBot(agent.bot,
+                { x: x1, y: y1, z: z1 }, { x: x2, y: y2, z: z2 }, blockType, { mode });
+            if (!guard.ok) {
+                return `REFUSED: ${guard.reason} Move it, or use !forceFill if you really mean it.`;
+            }
+            const guardNote = guard.warning ? ` [GUARD: ${guard.warning}]` : '';
+
             const command = `/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} ${mode}`;
             agent.bot.chat(command);
 
-            // Calculate approximate blocks
+            // Give the server a moment to apply, then read the region back. Reporting the
+            // requested block count would claim success even when the command silently
+            // failed (no operator permission, unloaded chunks, bad block name).
+            await new Promise(r => setTimeout(r, 600));
+            if (guardNote) console.warn(`[worldGuard]${guardNote}`);
+            if (mode === 'replace' || mode === 'keep') {
+                const check = skills.verifyRegion(agent.bot,
+                    Math.min(Math.floor(x1), Math.floor(x2)), Math.min(Math.floor(z1), Math.floor(z2)),
+                    Math.max(Math.floor(x1), Math.floor(x2)), Math.max(Math.floor(z1), Math.floor(z2)),
+                    Math.min(Math.floor(y1), Math.floor(y2)),
+                    Math.abs(Math.floor(y2) - Math.floor(y1)) + 1, blockType);
+                return `Ran ${command}\n${check.summary}`;
+            }
             const dx = Math.abs(x2 - x1) + 1;
             const dy = Math.abs(y2 - y1) + 1;
             const dz = Math.abs(z2 - z1) + 1;
-            const totalBlocks = dx * dy * dz;
-
-            return `Server fill executed: ${totalBlocks} blocks of ${blockType} (${mode} mode). Command: ${command}`;
+            return `Ran ${command} (${mode} mode, ${dx * dy * dz} blocks in region).`;
         }
     },
     {
@@ -581,8 +1062,155 @@ export const actionsList = [
         }
     },
     {
-        name: '!serverSetblock',
-        description: 'INSTANT setblock using server /setblock command. Places a single block immediately.',
+        // Rescue hatch, not a travel shortcut. Terrain edits made while testing have several
+        // times dropped the bot into a pit or sealed it underground with no reachable way out,
+        // and nothing in the normal movement stack can recover from that. This teleports it
+        // clear - but ONLY while an operator-created marker file exists on disk, so the model
+        // can never invoke it to skip a journey it is supposed to walk.
+        // Deliberately NOT a generic "run any server command" passthrough. The model can call
+        // every command in this list, and an unrestricted /-passthrough would hand it /op, /ban
+        // and /kill. Narrow commands keep the blast radius to what they say on the tin.
+        name: '!serverGamemode',
+        description: 'Operator: change this bot\'s gamemode (survival, creative, adventure, spectator).',
+        params: {
+            'mode': { type: 'string', description: 'survival, creative, adventure or spectator.' }
+        },
+        perform: runAsAction(async (agent, mode) => {
+            const m = String(mode).toLowerCase();
+            const allowed = ['survival', 'creative', 'adventure', 'spectator'];
+            if (!allowed.includes(m)) return `Unknown gamemode "${mode}". Use one of: ${allowed.join(', ')}.`;
+            const line = await runServerCommand(agent.bot, `/gamemode ${m} ${agent.name}`,
+                /game ?mode|permission|Unknown/i, 5000);
+            await new Promise(r => setTimeout(r, 600));
+            return `GAMEMODE: now ${agent.bot.game.gameMode}${line ? ` (server said: ${line})` : ''}.`;
+        }, false, 1)
+    },
+    {
+        // Death becomes possible the moment the bot leaves creative, and world spawn here is
+        // thousands of blocks from anywhere it is working. Set this before switching.
+        name: '!serverSpawnpoint',
+        description: 'Operator: set this bot\'s respawn point to its current position.',
+        perform: runAsAction(async (agent) => {
+            const p = agent.bot.entity.position;
+            const x = Math.floor(p.x), y = Math.floor(p.y), z = Math.floor(p.z);
+            const line = await runServerCommand(agent.bot, `/spawnpoint ${agent.name} ${x} ${y} ${z}`,
+                /spawn ?point|permission|Unknown/i, 5000);
+            return `SPAWNPOINT set to (${x}, ${y}, ${z})${line ? `. Server said: ${line}` : ' (no confirmation from server)'}.`;
+        }, false, 1)
+    },
+    {
+        name: '!shoot',
+        description: 'Shoot a mob with bow or crossbow from range. Refuses players. Needs arrows.',
+        params: {
+            'mob_type': { type: 'string', description: 'The mob to shoot, e.g. "zombie", "skeleton".' },
+            'weapon': { type: 'string', description: '"bow", "crossbow" or "auto".', optional: true }
+        },
+        perform: runAsAction(async (agent, mob_type, weapon) => {
+            const w = ['bow', 'crossbow', 'auto'].includes(String(weapon)) ? weapon : 'auto';
+            return await skills.shootBow(agent.bot, mob_type, w);
+        }, false, 3)
+    },
+    {
+        // Provisioning for survival-mode testing. Narrow like the rest: gives to THIS bot only,
+        // never to arbitrary players, so it cannot be used to shower someone else with gear.
+        name: '!serverGive',
+        description: 'Operator: give this bot an item via server /give.',
+        params: {
+            'item': { type: 'ItemName', description: 'The item to give.' },
+            'count': { type: 'int', description: 'How many.', domain: [1, 640] }
+        },
+        perform: runAsAction(async (agent, item, count) => {
+            // No runServerCommand here: its reply reader drops any line containing the bot's
+            // username (to ignore the agent's own chat echo), and "Gave 5 [Diamond] to andy"
+            // always contains it - so every give stalled the full 5s timeout and reported
+            // "no confirmation" even on success. The inventory recount is the real verification.
+            agent.bot.chat(`/give ${agent.name} ${item} ${Math.floor(count)}`);
+            await new Promise(r => setTimeout(r, 700));
+            const held = agent.bot.inventory.items().filter(i => i.name === item)
+                .reduce((n, i) => n + i.count, 0);
+            return `GIVE: now holding ${held} ${item}.`;
+        }, false, 1)
+    },
+    {
+        name: '!worldSeed',
+        description: 'Ask the server for the world seed. Requires operator permission.',
+        perform: runAsAction(async (agent) => {
+            const line = await runServerCommand(agent.bot, '/seed', /Seed:\s*\[|^\[?-?\d{6,}|permission|Unknown/i, 6000);
+            if (!line) return 'No reply from the server - /seed may need operator permission.';
+            const m = line.match(/(-?\d{4,})/);
+            return m ? `WORLD SEED: ${m[1]}` : `Server said: ${line}`;
+        }, false, 1)
+    },
+    {
+        // Uses the SERVER's own world generator, so the answer is exact for this seed - which
+        // beats reproducing the biome maths against a stale minecraft-data copy, especially on
+        // a 26.1 server the local stack does not fully understand.
+        name: '!locateBiome',
+        description: 'Find the nearest biome of a given type using the server world generator, e.g. "frozen_ocean" or "ice_spikes".',
+        params: {
+            'biome': { type: 'string', description: 'Biome id, with or without the minecraft: prefix.' }
+        },
+        perform: runAsAction(async (agent, biome) => {
+            const id = String(biome).includes(':') ? String(biome) : `minecraft:${biome}`;
+            const line = await runServerCommand(agent.bot, `/locate biome ${id}`, /nearest|could not|unknown|no biome/i, 15000);
+            if (!line) return `No reply from the server for ${id} - /locate may need operator permission.`;
+            // "The nearest minecraft:frozen_ocean is at [1234, ~, -5678] (890 blocks away)"
+            const m = line.match(/\[\s*(-?\d+)\s*,\s*(~|-?\d+)\s*,\s*(-?\d+)\s*\]/);
+            if (!m) return `Server said: ${line}`;
+            const p = agent.bot.entity.position;
+            const dist = Math.hypot(Number(m[1]) - p.x, Number(m[3]) - p.z);
+            return `BIOME ${id} at x=${m[1]} z=${m[3]} (y=${m[2]}), ${dist.toFixed(0)} blocks away. `
+                + `Server said: ${line}`;
+        }, false, 2)
+    },
+    {
+        name: '!serverTp',
+        description: 'Operator rescue only. Disabled unless a marker file is present; not usable for travel.',
+        params: {
+            'x': { type: 'int', description: 'X coordinate.' },
+            'y': { type: 'int', description: 'Y coordinate.' },
+            'z': { type: 'int', description: 'Z coordinate.' }
+        },
+        perform: async (agent, x, y, z) => {
+            const marker = './bots/' + agent.name + '/ALLOW_RESCUE_TP';
+            if (!fs.existsSync(marker))
+                return 'Refused: rescue teleport is disabled. Walk there instead.';
+            fs.unlinkSync(marker); // single use - re-arm deliberately, never by accident
+            // We are about to cause a teleport on purpose. Without this, the detector would
+            // report it as somebody moving the bot and cancel this very action mid-rescue.
+            agent.expectTeleport(5000, 'serverTp');
+            agent.bot.chat(`/tp ${agent.name} ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)}`);
+            await new Promise(r => setTimeout(r, 1200));
+            const p = agent.bot.entity.position;
+            return `Rescue teleport used (one-shot, now disarmed). Now at ` +
+                `(${p.x.toFixed(1)}, ${p.y.toFixed(1)}, ${p.z.toFixed(1)}).`;
+        }
+    },
+    {
+        // The escape hatches. A guard with no override becomes an obstacle people route around
+        // by other means; an explicit, separately-named command keeps the refusal meaningful
+        // while leaving the operator (and a model that has been told why) a way through.
+        name: '!forceFill',
+        description: 'Like !serverFill but ignores the guard protecting beds, chests, furnaces and the respawn point. Only use when a person has told you to override a specific refusal.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x1': { type: 'int', description: 'X of first corner.' },
+            'y1': { type: 'int', description: 'Y of first corner.' },
+            'z1': { type: 'int', description: 'Z of first corner.' },
+            'x2': { type: 'int', description: 'X of second corner.' },
+            'y2': { type: 'int', description: 'Y of second corner.' },
+            'z2': { type: 'int', description: 'Z of second corner.' }
+        },
+        perform: async (agent, blockType, x1, y1, z1, x2, y2, z2) => {
+            const g = worldGuard.checkEditForBot(agent.bot, { x: x1, y: y1, z: z1 }, { x: x2, y: y2, z: z2 }, blockType);
+            agent.bot.chat(`/fill ${Math.floor(x1)} ${Math.floor(y1)} ${Math.floor(z1)} ${Math.floor(x2)} ${Math.floor(y2)} ${Math.floor(z2)} ${blockType} replace`);
+            await new Promise(r => setTimeout(r, 600));
+            return `FORCED FILL done${g.ok ? '' : ` (guard had warned: ${g.reason})`}`;
+        }
+    },
+    {
+        name: '!forceSetblock',
+        description: 'Like !serverSetblock but ignores the protection guard that protects beds, chests, furnaces and the respawn point. Only use when a person has told you to override a specific refusal.',
         params: {
             'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
             'x': { type: 'int', description: 'X coordinate.' },
@@ -590,9 +1218,35 @@ export const actionsList = [
             'z': { type: 'int', description: 'Z coordinate.' }
         },
         perform: async (agent, blockType, x, y, z) => {
-            const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}`;
+            const g = worldGuard.checkEditForBot(agent.bot, { x, y, z }, { x, y, z }, blockType);
+            agent.bot.chat(`/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}`);
+            return `FORCED setblock ${blockType} at (${x}, ${y}, ${z})${g.ok ? '' : ` (guard had warned: ${g.reason})`}`;
+        }
+    },
+    {
+        name: '!serverSetblock',
+        description: 'INSTANT setblock using server /setblock command. Places a single block immediately.',
+        params: {
+            'blockType': { type: 'BlockOrItemName', description: 'The block type to place.' },
+            'x': { type: 'int', description: 'X coordinate.' },
+            'y': { type: 'int', description: 'Y coordinate.' },
+            'z': { type: 'int', description: 'Z coordinate.' },
+            // Block states have to be a SEPARATE argument: the BlockOrItemName validator checks
+            // the name against the registry, so "red_bed[part=foot]" is rejected outright. Some
+            // blocks are unusable without one - a bed placed with no part/facing is half a bed,
+            // which pops straight off and cannot set a respawn point.
+            'state': { type: 'string', description: 'Optional block state, e.g. "facing=east,part=foot". Use "none" for no state.' }
+        },
+        perform: async (agent, blockType, x, y, z, state) => {
+            // Same guard as !serverFill, and this is the command that actually did the damage:
+            // a single setblock landed on the bot's own bed.
+            const g = worldGuard.checkEditForBot(agent.bot, { x, y, z }, { x, y, z }, blockType);
+            if (!g.ok) return `REFUSED: ${g.reason} Use !forceSetblock if you really mean it.`;
+            const clean = String(state ?? '').trim().replace(/^\[|\]$/g, '');
+            const suffix = (!clean || clean.toLowerCase() === 'none') ? '' : `[${clean}]`;
+            const command = `/setblock ${Math.floor(x)} ${Math.floor(y)} ${Math.floor(z)} ${blockType}${suffix}`;
             agent.bot.chat(command);
-            return `Set block ${blockType} at (${x}, ${y}, ${z})`;
+            return `Set block ${blockType}${suffix} at (${x}, ${y}, ${z})`;
         }
     },
     {
@@ -613,7 +1267,7 @@ export const actionsList = [
     },
     {
         name: '!attack',
-        description: 'Attack and kill the nearest entity of a given type.',
+        description: 'Attack and kill the nearest entity of a given type. Do NOT use to gather food - use !huntFood, which chases fleeing animals and confirms kills.',
         params: {'type': { type: 'string', description: 'The type of entity to attack.'}},
         perform: runAsAction(async (agent, type) => {
             await skills.attackNearest(agent.bot, type, true);
@@ -642,8 +1296,23 @@ export const actionsList = [
         name: '!goToBed',
         description: 'Go to the nearest bed and sleep.',
         perform: runAsAction(async (agent) => {
-            await skills.goToBed(agent.bot);
-        })
+            // Stand down if the mode already owns this job. Both sides of the livelock fence:
+            // the guard here, "action:goToBed" in night_safety's excludeFromInterrupt.
+            if (agent.bot.modes.exists('night_safety') && agent.bot.modes.isActive('night_safety'))
+                return 'Night safety is already handling bed/shelter - leaving it to finish.';
+            const r = await skills.goToBed(agent.bot);
+            return r.slept ? 'Slept.' : `Did not sleep: ${r.reason}.`;
+        }, false, 3)   // 3 min ceiling - the default -1 is the pin-forever hazard
+    },
+    {
+        name: '!shelter',
+        description: 'Dig in and seal a one-block shelter for the night. Use when there is no bed.',
+        perform: runAsAction(async (agent) => {
+            if (agent.bot.modes.exists('night_safety') && agent.bot.modes.isActive('night_safety'))
+                return 'Night safety is already handling bed/shelter - leaving it to finish.';
+            const r = await skills.emergencyShelter(agent.bot);
+            return r.sheltered ? `VERIFIED SHELTER: sealed.` : `Could not shelter: ${r.reason}.`;
+        }, false, 3)
     },
     {
         name: '!stay',
@@ -677,6 +1346,20 @@ export const actionsList = [
             'selfPrompt': { type: 'string', description: 'The goal prompt.' },
         },
         perform: async function (agent, prompt) {
+            // Authorship comes from agent.command_author, stamped where the command entered the
+            // system. self_prompter.isActive() looked like the right signal and is NOT: the model
+            // emits !goal from an ordinary turn BEFORE the loop starts, so that check reported
+            // "user" and let a self-invented goal claim user immunity - observed live.
+            const fromModel = agent.command_author === 'model';
+            const res = fromModel
+                ? agent.history.store.setGoal(prompt, MEM_ORIGIN.AGENT)
+                : agent.history.setUserGoal(prompt);
+            if (!res.ok) {
+                return `Kept the existing goal: ${agent.history.store.goal()} (${res.reason}). `
+                     + 'Ask the player to change it if it is finished.';
+            }
+            agent.history.saveStore();
+
             if (convoManager.inConversation()) {
                 agent.self_prompter.setPromptPaused(prompt);
             }
@@ -687,9 +1370,54 @@ export const actionsList = [
     },
     {
         name: '!endGoal',
-        description: 'Call when you have accomplished your goal. It will stop self-prompting and the current action. ',
+        // "Will stop", not "It will stop": compactDescription() keeps a follow-up sentence
+        // only when it starts with an imperative in KEEP_SENTENCE, and "It" is not one - so
+        // this clause was deleted before any model saw it, exactly the §1 failure in
+        // docs/OBEDIENCE.md, on a command that sweep did not cover. The clause is the only
+        // thing separating !endGoal from !stop, and without it the choice is genuinely
+        // ambiguous. Measured 2026-09-20 with `bun scratchpad/obedience_jev.mjs`: the old
+        // wording scored 7/8 with this case landing on NONE 0.45 / !endGoal 0.29 / !stop 0.14,
+        // while the same run against the UNtruncated descriptions scored 8/8 - i.e. the
+        // disambiguator existed and the renderer ate it. With this wording, 8/8 three runs of
+        // three, !endGoal 0.62-0.65. Do not reword the opening word away from KEEP_SENTENCE.
+        // tests/obedience_contract.test.mjs pins it.
+        description: 'Call when you have accomplished your goal. Will stop self-prompting and the current action. Refused if the last build verification showed the work is incomplete.',
         perform: async function (agent) {
+            // Guard against declaring victory the world does not support. Prompt rules alone
+            // do not prevent this (the model will assert completion regardless), so the check
+            // is made against the last verified region read rather than against intent.
+            const v = agent.bot.last_verification;
+            const RECENT_MS = 5 * 60 * 1000;
+            if (v && !v.complete && (Date.now() - v.at) < RECENT_MS) {
+                return `Refusing to end goal: the last verification found only ${v.correct}/${v.total} `
+                    + `${v.blockType} blocks in place (${v.pct}%). The task is NOT finished. `
+                    + `Fix the missing blocks, then re-run the fill to re-verify.`;
+            }
             agent.self_prompter.stop();
+
+            // AND CLEAR THE PERSISTED GOAL. Stopping the self-prompt loop is only half of
+            // "end the goal": the goal also lives as a record in the typed memory store, which
+            // renders into `$MEMORY` and is injected into EVERY conversing prompt. Leaving it
+            // there meant a goal the user had cancelled was handed back to the model on every
+            // single turn, so it kept resuming the work - and `load_memory` restored it after a
+            // restart. Observed live: `self_prompt: null, self_prompting_state: 0` on disk while
+            // `goal:current` still read "Mine minerals below the base at 3391,62,4890...".
+            //
+            // Authority is deliberately NOT symmetric, and mirrors `!goal` above. A user-origin
+            // goal may only be cleared by the user; the store refuses an agent delete against a
+            // user row, which is the entire point of the typed store - the model must not be
+            // able to erase what a person asked for. It may drop a goal it set itself.
+            const by = agent.command_author === 'model' ? MEM_ORIGIN.AGENT : MEM_ORIGIN.USER;
+            const cleared = agent.history.clearGoal(by);
+            if (cleared.ok && cleared.cleared) {
+                return `Self-prompting stopped, and the goal is cleared: "${cleared.cleared}"`;
+            }
+            if (!cleared.ok) {
+                // The model trying to end a goal a person set. Say so plainly rather than
+                // reporting success - it would otherwise keep the goal AND believe it was done.
+                return 'Self-prompting stopped, but the goal was set by a player and stays in '
+                     + `memory: "${agent.history.store.goal()}". Ask them to end or change it.`;
+            }
             return 'Self-prompting stopped.';
         }
     },
@@ -784,7 +1512,8 @@ export const actionsList = [
     },
     {
         name: '!digDown',
-        description: 'Digs down a specified distance. Will stop if it reaches lava, water, or a fall of >=4 blocks below the bot.',
+        description: 'Digs down a specified distance. Will stop if it reaches lava, water, or a fall of >=4 blocks below the bot. '
+            + 'Do NOT use to reach an ore layer - use !progressTo or !branchMine, which stop at the right depth.',
         params: {'distance': { type: 'int', description: 'Distance to dig down', domain: [1, Number.MAX_SAFE_INTEGER] }},
         perform: runAsAction(async (agent, distance) => {
             await skills.digDown(agent.bot, distance)
@@ -792,7 +1521,7 @@ export const actionsList = [
     },
     {
         name: '!goToSurface',
-        description: 'Moves the bot to the highest block above it (usually the surface).',
+        description: 'Moves the bot to the highest block above it (usually the surface). Uses mineflayer-pathfinder and has no timeout, so it can hang - prefer !climbOut. Hidden from the model via settings.hidden_actions.',
         params: {},
         perform: runAsAction(async (agent) => {
             await skills.goToSurface(agent.bot);
@@ -832,5 +1561,141 @@ export const actionsList = [
         perform: runAsAction(async (agent, liquid_type) => {
             await skills.fillBucket(agent.bot, liquid_type);
         })
+    },
+    {
+        name: '!creativeGive',
+        description: 'Creative mode only: put an item straight into your own inventory, no /give needed.',
+        params: {
+            'item': { type: 'ItemName', description: 'The item to summon, e.g. "cobblestone".' },
+            'count': { type: 'int', description: 'How many.', domain: [1, 2304] }
+        },
+        perform: runAsAction(async (agent, item, count) => {
+            const r = await creative.giveItem(agent.bot, item, count);
+            if (!r.ok) return `CREATIVE GIVE FAILED: ${r.error || 'unknown error'}`;
+            return `CREATIVE GIVE: ${r.placed} ${r.item} across ${r.slots.length} slot(s).`;
+        }, false, 1)
+    },
+    {
+        name: '!creativeKit',
+        description: 'Creative mode only: stock a ready-made kit of items (building, mining, or survival).',
+        params: {
+            'kit': { type: 'string', description: 'Which kit: "building", "mining", "survival", or "all".' }
+        },
+        perform: runAsAction(async (agent, kit) => {
+            const r = await creative.giveKit(agent.bot, kit);
+            if (r.error) return `CREATIVE KIT FAILED: ${r.error}`;
+            const ok = r.results.filter(x => x.ok);
+            const bad = r.results.filter(x => !x.ok);
+            let line = `CREATIVE KIT "${r.kit}": ${ok.length} item(s) stocked`;
+            if (bad.length) line += `; ${bad.length} failed (${bad.slice(0, 3).map(b => `${b.item}: ${b.error}`).join(', ')})`;
+            return line + '.';
+        }, false, 2)
+    },
+    {
+        name: '!creativeClear',
+        description: 'Creative mode only: empty your entire inventory.',
+        perform: runAsAction(async (agent) => {
+            const r = await creative.clearInventory(agent.bot);
+            if (!r.ok) return `CREATIVE CLEAR FAILED: ${r.error}`;
+            return `CREATIVE CLEAR: emptied ${r.cleared} slot(s).`;
+        }, false, 1)
+    },
+    {
+        name: '!branchMine',
+        // Compact command docs render params as `name:type` only - the param DESCRIPTIONS are
+        // never shown. So this was reaching the model as `!branchMine(depth:num,length:num)`,
+        // where "depth" means the opposite of what it does: it is an absolute Y level, and
+        // !dive's `depth` right above IS a distance to descend. Measured against gemini flash,
+        // the model avoided the command rather than guess the argument - 4 of 5 runs escalated
+        // to !goal instead. The param is named `y` and the semantics live in the description,
+        // where compact mode will actually print them.
+        description: 'Dig down and branch-mine for ores, then return to where you started. Use this for ores instead of !collectBlocks. Takes an absolute Y level to mine at, not a distance down - use -12 unless told otherwise.',
+        params: {
+            'y': { type: 'int', description: 'Absolute Y level to mine at (NOT a distance down). -12 is the default compromise: deep enough for diamond/redstone/lapis/gold, shallow enough to walk home from.', domain: [-60, 60] },
+            'length': { type: 'int', description: 'Length of the main corridor in blocks.', domain: [4, 64] }
+        },
+        perform: runAsAction(async (agent, y, length) => {
+            console.log(`[mine] perform entered y=${y} length=${length}`);
+            try {
+                const r = await mining.branchMine(agent.bot, { targetY: y, mainLength: length });
+                console.log('[mine] branchMine returned');
+                return mining.formatMineReport(r);
+            } catch (err) {
+                // branchMine is documented never to throw; if it does, say so rather than letting
+                // the action manager swallow it into an idle state with no output at all.
+                console.error('[mine] branchMine THREW:', err?.stack || err);
+                return `MINE ERROR: ${err?.message || err}`;
+            }
+        }, false, 20)
+    },
+    {
+        name: '!progressTo',
+        description: 'Acquire an item via the full tech tree: gather, craft, smelt and mine every prerequisite automatically. '
+            + 'Use for tool or gear targets like iron_pickaxe. '
+            + 'Do NOT drive the steps yourself with !collectBlocks or !craftRecipe - one call runs the whole chain and reports VERIFIED counts. '
+            + 'Takes up to 55 minutes; interrupting it is safe, it resumes.',
+        params: {
+            'itemName': { type: 'ItemName', description: 'The item to acquire, e.g. iron_pickaxe.' },
+            'num': { type: 'int', description: 'How many to end up with. Default 1.', domain: [1, 64], optional: true }
+        },
+        perform: runAsAction(async (agent, itemName, num = 1) => {
+            return await skills.progressTo(agent.bot, itemName, num);
+        }, true, 60)
+    },
+    {
+        name: '!creativeIdSweep',
+        description: 'Diagnostic: give one of each id-sweep sample so item ids can be checked server-side.',
+        perform: runAsAction(async (agent) => {
+            const r = await creative.idSweep(agent.bot);
+            if (r.error) return `ID SWEEP FAILED: ${r.error}`;
+            return 'ID SWEEP: ' + r.asked.map(a => `${a.item}=${a.id}${a.placed ? '' : '(FAILED)'}`).join(' ');
+        }, false, 2)
+    },
+    {
+        name: '!creativeStatus',
+        description: 'Report your game mode, and whether creative item ids match this server.',
+        perform: runAsAction(async (agent) => {
+            const mode = creative.gameMode(agent.bot);
+            if (mode !== 'creative') return `GAME MODE: ${mode}. Creative commands are unavailable.`;
+            const p = await creative.probeIdMapping(agent.bot);
+            if (p.error) return `GAME MODE: creative. Probe failed: ${p.error}`;
+            return p.ok
+                ? `GAME MODE: creative. Item ids OK (asked ${p.asked}, got ${p.got}).`
+                : `GAME MODE: creative. ITEM ID MISMATCH - asked ${p.asked} (id ${p.askedId}), got ${p.got ?? 'nothing'} (id ${p.gotId ?? 'n/a'}).`;
+        }, false, 1)
+    },
+    {
+        name: '!huntFood',
+        description: 'Hunt nearby passive animals for raw meat and pick up the drops. '
+            + 'Do NOT use !attack for food - it loses fleeing animals. '
+            + 'Refused while in water. Use !cookFood afterward - raw chicken cannot be eaten.',
+        params: {
+            'maxKills': { type: 'int', description: 'Animals to kill before stopping.', domain: [1, 5] }
+        },
+        perform: runAsAction(async (agent, maxKills) => {
+            return await skills.huntForFood(agent.bot, maxKills);
+        }, false, 5)
+    },
+    {
+        name: '!cookFood',
+        description: 'Cook all raw meat and potatoes in your inventory at a furnace. '
+            + 'Use this instead of !smeltItem for food - it cooks everything raw in one pass, chicken first. '
+            + 'Takes no arguments. Needs a furnace nearby or in inventory, and coal/charcoal/logs.',
+        params: {},
+        perform: runAsAction(async (agent) => {
+            return await skills.cookFood(agent.bot);
+        }, false, 10)
+    },
+    {
+        name: '!harvestCrops',
+        description: 'Harvest mature crops within range and replant their seeds. '
+            + 'Do NOT use !collectBlocks on crops - it ignores maturity and destroys immature plants. '
+            + 'Takes range in blocks. Skips immature crops and protected build cells.',
+        params: {
+            'range': { type: 'int', description: 'Search radius in blocks.', domain: [2, 32] }
+        },
+        perform: runAsAction(async (agent, range) => {
+            return await skills.harvestCrops(agent.bot, range);
+        }, false, 5)
     },
 ];

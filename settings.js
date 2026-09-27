@@ -1,5 +1,6 @@
 const settings = {
-    minecraft_version: "1.21.11", // forced to compatible version (1.21.11 server unsupported)
+    minecraft_version: "auto", // Server protocol is 775 (MC 26.1) but its ping name says "Purpur 1.21.11". mineflayer's testedVersions gate stops at 1.21.11 - the packages below it (minecraft-protocol, minecraft-data, prismarine-chunk, prismarine-registry) already support 26.1 - so we connect as 1.21.11 until that gate is lifted. See CLAUDE.md "Movement".
+    mc_client: "mineflayer", // "mineflayer" (default) or "native" - see src/mc/index.js and docs/CLIENT_REPLACEMENT.md. Do not set "native" yet - it isn't built.
     host: "localhost", // or "localhost", "your.ip.address.here"
     port: 25565, // set to -1 to automatically scan for open ports
     auth: "offline", // or "microsoft"
@@ -12,6 +13,36 @@ const settings = {
     base_profile: "assistant", // survival, assistant, creative, or god_mode
     profiles: [
         "./andy.json",
+        // bob is back in this list ON PURPOSE (2026-08-26). He used to run in his own
+        // service (mindcraft-bob.service, MindServer :8082) so andy restarts could not
+        // kill his long builds - that cost is real and we accepted it, because two
+        // MindServers meant the bots could not see each other AT ALL:
+        //
+        //   serverProxy.agents only ever holds the agents of ITS OWN MindServer, so
+        //   agents.length was 1 on both sides. convoManager.isOtherAgent('bob') was
+        //   false, sendToBot bailed with "tried to send bot message to non-bot bob",
+        //   and - worse - agent.js's smart public-chat filter is gated on
+        //   getNumOtherAgents() > 0, so BOTH bots fell through to the
+        //   "Single agent mode - respond to all public chat" branch and treated the
+        //   other as an ordinary player. Andy ran a full LLM turn on 47 of bob's chat
+        //   lines. What stopped a runaway loop was bob's only_chat_with list, not any
+        //   safeguard in the code.
+        //
+        // One MindServer fixes both halves: the filter activates, and respondFunc's
+        // `if (convoManager.isOtherAgent(username))` branch now ignores the other bot's
+        // public chat outright, so bot-to-bot traffic goes over the socket protocol
+        // that actually has turn-taking brakes.
+        //
+        // Viewer ports do not collide: mindcraft.js does `3000 + agentIndex`, so andy
+        // gets 3000 and bob 3001 within one process.
+        //
+        // DISABLED 2026-08-26 to stop token burn. Bob was in a !stay(30) self-prompt loop -
+        // 1003 turns, one model round-trip every ~33s, producing nothing. Re-enable by
+        // uncommenting; everything above still holds and he will re-register with andy's
+        // MindServer automatically. NOTE: with him commented out andy is a single agent
+        // again, so getNumOtherAgents() is 0 and the smart public-chat filter goes back to
+        // "respond to all public chat" - that only matters if a second bot returns.
+        "./bob.json",
         // "./rosetta.json", // Letta-powered agent with persistent memory (requires ~/letta running)
         // "./profiles/andy-4-reasoning.json",
         // "./profiles/claude.json",
@@ -29,7 +60,17 @@ const settings = {
     ],
 
     load_memory: true, // load memory from previous session
-    init_message: "Respond with hello world and your name", // sends to all on spawn
+    // Sent to every agent on spawn. THE TEXT HERE IS NO LONGER USED VERBATIM: `agent.js`
+    // replaces it with `resume_policy.reconnectDirective(...)`, which decides from state
+    // (a real goal record, a running self-prompt loop, the last thing a human said) and hands
+    // the model the answer instead of the question. Treat this as an on/off switch - set it to
+    // null for a silent reconnect.
+    //
+    // It used to read: "Check your MEMORY for an unfinished task: if there is one, resume it
+    // right now with !goal(...)". That is an invitation to invent a task out of location notes,
+    // and no amount of a person saying "stop" beforehand could outvote it - reported as "after
+    // a restart Andy still does the past task even though I asked it to stop".
+    init_message: "reconnected", // replaced at spawn; see resume_policy.js
     only_chat_with: [], // users that the bots listen to and send general messages to. if empty it will chat publicly
 
     speak: false,
@@ -41,18 +82,98 @@ const settings = {
     chat_ingame: true, // bot responses are shown in minecraft chat
     language: "en", // translate to/from this language. Supports these language names: https://cloud.google.com/translate/docs/languages
     render_bot_view: true, // show bot's view in browser at localhost:3000, 3001...
+    // true = the bot's own eyes (what !vision wants). false = a third-person orbit camera,
+    // which is what tools/timelapse.mjs needs: first person disposes the OrbitControls it
+    // drives to park the camera overhead. Changing this needs a bot restart.
+    viewer_first_person: true,
 
     allow_insecure_coding: true, // allows newAction command and model can write/run code on your computer. enable at own risk
     allow_vision: true, // allows vision model to interpret screenshots as inputs
-    blocked_actions: [], // commands to disable and remove from docs. Ex: ["!setMode"]
-    code_timeout_mins: -1, // minutes code is allowed to run. -1 for no timeout
-    relevant_docs_count: 5, // number of relevant code function docs to select for prompting. -1 for all
+    // Pruned to cut command-doc tokens and reduce tool confusion on a small model.
+    // Blueprint commands are dead without a loaded task; !help re-emits the entire doc
+    // block into history.
+    // !startConversation / !endConversation were blocked because they "need a second bot".
+    // There IS a second bot now that andy and bob share a MindServer (see profiles above),
+    // so they are unblocked - they are the ONLY way to reach the turn-taking protocol in
+    // conversation.js (the 30s response monitor, the "I'm talking to someone else"
+    // rejection, endConversation). Re-block them if the two start burning tokens on chatter.
+    blocked_actions: ["!checkBlueprint", "!checkBlueprintLevel", "!getBlueprint", "!getBlueprintLevel",
+                      "!help",
+                      // OPERATOR AND CREATIVE COMMANDS ARE BLOCKED FOR TRAINING-DATA HONESTY.
+                      // These are RCON/creative shortcuts: they edit the world, grant items or
+                      // teleport without the bot playing the game. In a corpus captured for
+                      // fine-tuning they are poison twice over - the model learns to reach for
+                      // a cheat instead of the survival skill, and the resulting trajectory
+                      // teaches nothing about how the task is actually done. Measured before
+                      // blocking: 161 of 589 usable examples (27%) invoked one, and
+                      // !serverSetblock alone was the second most common command in the whole
+                      // dataset at 100 mentions.
+                      //
+                      // These stay reachable BY HAND over RCON (`mc "setblock ..."`), which is
+                      // where world setup belongs. Blocking only stops the MODEL choosing them.
+                      "!serverFill", "!serverSetblock", "!serverGive", "!serverSummon",
+                      "!serverGamemode", "!serverSpawnpoint", "!serverTp",
+                      "!forceFill", "!forceSetblock",
+                      "!creativeGive", "!creativeKit", "!creativeClear", "!creativeStatus",
 
-    max_messages: 30, // max number of messages to keep in context
-    num_examples: 2, // number of examples to give to the model
+                      // !fill is deliberately UNBLOCKED now. It and !serverFill take different
+                      // argument orders and exposing both reliably confused the 9B (it corrupted
+                      // its own memory over it), so the rule was "keep exactly one fill command
+                      // visible" - and !serverFill won on reliability (!fill managed 3/9 blocks
+                      // on flat ground). With !serverFill gone, !fill is that one command;
+                      // leaving both blocked would give the bot no way to fill an area at all,
+                      // and the observed behaviour was andy substituting !serverFill every time
+                      // !fill was asked for. Expect it to be flaky - that is the honest cost of
+                      // not cheating, and a failed !fill is still a real training record.
+                      // !goToCoordinates is mineflayer-pathfinder, which cannot move this bot.
+                      // Measured 2026-08-26: a 14-block walk on flat ground at constant Y hung
+                      // for 6+ hours, position unchanged to eight decimals across 24 checks,
+                      // CPU climbing 53% -> 77% the whole time. It never returned on its own.
+                      // !navTo and !travel do the same job with our own A* planner and work.
+                      // NOTE: this closes ONE entry point, not the bug. !goToPlayer and
+                      // !followPlayer still drive through pathfinder and can hang the same way.
+                      "!goToCoordinates"],
+
+    // Hidden from the model's command docs, but STILL CALLABLE from chat - unlike
+    // blocked_actions, which calls blacklistCommands() and deletes the command from
+    // commandMap for everyone. These are measurement harnesses a person drives by hand
+    // (CLAUDE.md documents !swimProbe and !creativeIdSweep as exactly that). The model
+    // must not see them: each burns a whole action slot producing numbers it cannot act
+    // on, and !climbBankTest rendered in the compact docs as "Debug: repeatedly attempt
+    // swim" - which reads like an ordinary swim command.
+    hidden_actions: ["!climbBankTest", "!buildFooting", "!swimProbe", "!groundProbe", "!pillarTest", "!creativeIdSweep",
+                     // !goToSurface is skills.goToSurface -> goToPosition -> bot.pathfinder,
+                     // the same executor !goToCoordinates was blocked for, and it is registered
+                     // with runAsAction(fn) i.e. timeout -1. A hang therefore pins
+                     // currentActionLabel forever and NO action can ever start again. !climbOut
+                     // does the same job through our own navigator. Hidden rather than blocked
+                     // so it stays available by hand for comparison.
+                     "!goToSurface"],
+    code_timeout_mins: 10, // minutes code is allowed to run. -1 for no timeout (leaves runaway generated code unbounded)
+    relevant_docs_count: "auto", // "auto" scales with context window; or a number, -1 for all
+
+    max_messages: "auto", // "auto" scales with context window; or a number
+    num_examples: "auto", // "auto" scales with context window; or a number
     max_commands: -1, // max number of commands that can be used in consecutive responses. -1 for no limit
+    // Plain-English orders a System One model is sure about ("follow me", "stop") run without
+    // an LLM turn - src/agent/system_one_router.js. Needs TYPESAFE_API_KEY; fails open to the
+    // LLM on anything else. threshold 0.7: scratchpad/router_gym.mjs, 2026-09-25 - 0 false
+    // routes at every threshold over 23 chat/trap messages x2, 26/30 real orders routed at 0.7,
+    // nearest false candidate 0.32. Hosted, not local Laya: Laya scored 2/8 on the same menu.
+    system_one_router: { enabled: true, threshold: 0.7, timeout_ms: 2500 },
+    // Jev second opinion on memory duplicates the Jaccard rule declines - src/agent/memory_fold_jev.js.
+    // Its 0.75 threshold is a constant there, not a setting: scratchpad/fold_gym.mjs pinned it as
+    // the lowest step with zero false merges (union 43/51 vs 38/51, 0 false merges).
+    memory_fold_jev: { enabled: true, timeout_ms: 4000 },
     show_command_syntax: "full", // "full", "shortened", or "none"
     narrate_behavior: true, // chat simple automatic actions ('Picking up item!')
+
+    // Context auto-scaling: limits below marked "auto" are derived from the model's real
+    // context window, probed from the server at startup (llama.cpp reports the runtime -c
+    // value). Set auto_scale_context: false to use literal values everywhere, or set
+    // context_limit to declare the window when the server does not report one.
+    auto_scale_context: true,
+    context_limit: 32768, // upper bound on context used; also the fallback if unprobeable
 
     // Token optimization settings
     command_docs_mode: "compact", // "full", "compact", or "minimal" - reduces command doc tokens
@@ -67,11 +188,55 @@ const settings = {
 
     log_all_prompts: true, // log ALL prompts to file
 
+    // Append every LLM turn to bots/<name>/corpus/<date>.jsonl for fine-tuning.
+    // Independent of log_all_prompts: that flag governs the rotated debug dump in
+    // bots/<name>/logs/, which cleanupOldLogs prunes to the newest 20 files once a minute -
+    // useless as a dataset. The corpus is never rotated. See src/utils/corpus.js.
+    // TEARDOWN SWITCHES (2026-08-30). The movement assists were built on the belief that
+    // `onGround` is permanently false here. A clean bot measures 60/60 true and a vanilla 1.252
+    // apex on this very server, so some of them are now routing around a bug that is not there -
+    // and two subsystems both writing the jump key is a plausible cause of the run-to-run
+    // flakiness in the climb gyms.
+    //
+    // They are NOT deleted, because the stuck bots were real even though the explanation was
+    // not. Turn one OFF, run the gyms, and see what actually regresses. Naming them here rather
+    // than commenting out the construction keeps the experiment reproducible and reversible.
+    assists: {
+        auto_jump: true,     // clears a 1-block step; does not gate on onGround
+        jump_assist: true,   // deliberate gap jumps; asserts the flag for the take-off tick
+        // OFF by default, on its own evidence. Added 2026-08-30 to correct `onGround` from the
+        // world - then the teardown measured the climb gym at 4/4 WITHOUT it, and faster in 3
+        // of 4 cases (22.1s vs 34.2, 48.2 vs 57.2, 58.2 vs 66.3). It fires on 0 of 60 ticks on
+        // flat ground, so there is nothing for it to fix in the common case. The fault it
+        // targets is real but rare (a server correction zeroing vel.y defeats the engine's
+        // `oldVelY < 0` test), so the code and `!groundProbe` stay - shipping an assist that
+        // cannot show a benefit is how the last set of unexamined workarounds accumulated.
+        ground_truth: false,
+        swim_assist: true,   // owns the jump key while wet - water is NOT in question here
+    },
+
+    collect_corpus: true,
+
     // Auto-login settings
+    // Enabled 2026-08-26: only run andy while a human is on the server, so he stops burning
+    // model calls into an empty world. main.js polls the server ping every auto_login_interval
+    // minutes; on `online > 0` it starts the agents, and when they all exit it loops straight
+    // back to polling. The two settings below are HALVES OF ONE FEATURE - auto_login gets him
+    // back on, idle_disconnect_timeout is the only thing that ever gets him off.
+    // Turned OFF 2026-08-30 to keep andy in the world unattended while the training corpus
+    // fills (collect_corpus). idle_disconnect_timeout MUST be 0 alongside it: auto_login is
+    // the only thing that ever brings him back, so leaving the timeout armed here would let
+    // him idle out once and stay off forever.
     auto_login: false, // wait for players before logging in (or use --auto_login flag)
     auto_login_interval: 5, // minutes between server checks for players
 
     // Idle disconnect settings
+    // GOTCHA: the watchdog (agent.js ~line 813) requires ALL THREE of
+    //     !hasActiveGoal && !isExecutingAction && timeSincePlayerInteraction > timeout
+    // and `hasActiveGoal` is `self_prompter.isActive()`. Andy holds a persistent user-authored
+    // goal ("mine minerals below the base..."), so while that goal is set he will NEVER idle
+    // out and auto_login can never recycle him. Clear it with !endGoal if you want him to
+    // actually go offline between sessions.
     idle_disconnect_timeout: 0, // minutes of idle time before disconnecting (0 = disabled)
 };
 

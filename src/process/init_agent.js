@@ -1,6 +1,11 @@
 import { Agent } from '../agent/agent.js';
 import { serverProxy } from '../agent/mindserver_proxy.js';
+import { shareBuilds } from '../agent/library/build_guard.js';
 import yargs from 'yargs';
+
+// Each bot is its own process, so a build one bot registers is invisible to the others unless
+// it is shared. Only here, never by default - the test suites import build_guard too.
+shareBuilds();
 
 // Add timestamps to all console output
 const originalLog = console.log;

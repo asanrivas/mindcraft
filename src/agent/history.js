@@ -4,6 +4,9 @@ import settings from './settings.js';
 import { LocalEmbedding } from '../models/local_embedding.js';
 import { cosineSimilarity } from '../utils/math.js';
 import { getNamedChestsJson } from './library/skills.js';
+import { getBudget } from '../utils/context_budget.js';
+import { MemoryStore, ORIGIN, KIND, saveStore, loadStore } from './memory_store.js';
+import { planFolds, announceConflicts } from './memory_fold_jev.js';
 
 /**
  * Clean up old log files, keeping only the most recent ones
@@ -62,14 +65,35 @@ export class History {
 
         this.turns = [];
 
-        // Natural language memory as a summary of recent messages + previous memory
+        // Natural language memory as a summary of recent messages + previous memory.
+        // Kept as the rendered VIEW of `store`; the store is the source of truth.
         this.memory = '';
 
-        // Maximum number of messages to keep in context before saving chunk to memory
-        this.max_messages = settings.max_messages;
+        /**
+         * Typed, provenance-tracked memory. `this.memory` used to be a single blob that the
+         * summariser rewrote wholesale, so a user-assigned task survived only as long as the
+         * model chose to restate it - and one did not, silently replacing "build a base, mine,
+         * return" with a self-invented 5820-block trek that then reloaded on every restart.
+         *
+         * The store refuses an agent write against a user-authored record, so that class of
+         * loss is now impossible rather than merely discouraged. See memory_store.js.
+         */
+        this.store_fp = `./bots/${this.name}/memory_store.json`;
+        this.store = new MemoryStore();
+
+        // Maximum number of messages to keep in context before saving chunk to memory.
+        // Scaled from the model's context window unless explicitly configured.
+        const budget = getBudget();
+        this.max_messages = (settings.max_messages === 'auto' || !settings.max_messages)
+            ? budget.max_messages : settings.max_messages;
 
         // Number of messages to remove from current history and save into memory
-        this.summary_chunk_size = 5;
+        this.summary_chunk_size = budget.summary_chunk_size;
+
+        // Turns waiting to be distilled into memory. Consolidation is an extra LLM call, so
+        // it is deferred to the idle loop instead of blocking a reply (see IdleBehavior).
+        this.pending_summary = [];
+        this.consolidating = false;
         // chunking reduces expensive calls to promptMemSaving and appendFullHistory
         // and improves the quality of the memory summary
     }
@@ -78,14 +102,109 @@ export class History {
         return JSON.parse(JSON.stringify(this.turns));
     }
 
+    /** Persist the typed store (atomic write + journal append). Never throws. */
+    saveStore() {
+        try { saveStore(this.store, this.store_fp); }
+        catch (err) { console.warn('[History] could not save memory store:', err.message); }
+    }
+
+    /**
+     * Load the typed store, migrating the legacy blob the first time.
+     *
+     * The migration imports everything as AGENT origin: prose written by a model cannot prove a
+     * human asked for it, and marking it USER would grant exactly the immunity the store exists
+     * to withhold. A real user goal is set explicitly via setGoal(..., ORIGIN.USER).
+     */
+    loadStore(legacyBlob = '') {
+        try {
+            this.store = loadStore(this.store_fp);
+            if (this.store.records.size === 0 && legacyBlob) {
+                // allowGoal: this blob is the previous state being migrated, not a fresh
+                // invention by the summariser - see importLegacyBlob.
+                const n = this.store.importLegacyBlob(legacyBlob, { allowGoal: true });
+                console.log(`[History] migrated ${n} fact(s) from the legacy memory blob (all agent-origin).`);
+                this.saveStore();
+            }
+        } catch (err) {
+            console.warn('[History] could not load memory store:', err.message);
+            this.store = new MemoryStore();
+        }
+        return this.store;
+    }
+
+    /** Set the goal as a durable, user-authored record the model cannot overwrite. */
+    setUserGoal(text) {
+        const r = this.store.setGoal(text, ORIGIN.USER);
+        if (r.ok) {
+            this.memory = this.store.render(getBudget().memory_chars);
+            this.saveStore();
+        }
+        return r;
+    }
+
+    /**
+     * Drop the goal record entirely.
+     *
+     * This is the counterpart `setUserGoal` was missing, and its absence was a real bug: the
+     * goal is rendered into `$MEMORY`, which is injected into EVERY conversing prompt, so a
+     * goal the user had verbally cancelled kept being handed back to the model on every turn
+     * and it kept resuming the work. `!endGoal` only ever stopped the self-prompt LOOP - a
+     * different thing - so `self_prompt` went null while `goal:current` stayed, and
+     * `load_memory` restored it on the next restart.
+     *
+     * Authority matters here and is not symmetric. A USER-origin goal may only be cleared by
+     * the user; the store refuses an agent delete against a user row, and that refusal is the
+     * whole reason the typed store exists - the model must not be able to erase what a person
+     * asked for. An agent-origin goal is the model's own and it may drop it.
+     *
+     * @param {string} by ORIGIN.USER or ORIGIN.AGENT - who is asking
+     * @returns {{ok: boolean, reason?: string, cleared?: string}}
+     */
+    clearGoal(by = ORIGIN.AGENT) {
+        const had = this.store.goal();
+        if (!had) return { ok: true, cleared: null };
+        const r = this.store.delete(KIND.GOAL, 'current', by);
+        if (!r.ok) return r;
+        this.memory = this.store.render(getBudget().memory_chars);
+        this.saveStore();
+        return { ok: true, cleared: had };
+    }
+
     async summarizeMemories(turns) {
         console.log("Storing memories...");
-        this.memory = await this.agent.prompter.promptMemSaving(turns);
+        const summary = stripGroundedFacts(await this.agent.prompter.promptMemSaving(turns));
 
-        if (this.memory.length > 1000) {
-            this.memory = this.memory.slice(0, 1000);
-            this.memory += '...(truncated, compress more next time)';
+        // Route the model's summary through the store as AGENT-origin writes. Any line that
+        // tries to rewrite a user-authored record - the goal, above all - is rejected here
+        // rather than silently winning, which is the whole point of the store.
+        const before = this.store.goal();
+        const rejectedBefore = this.store.rejections;
+        // No allowGoal. A goal is a directive that arrives through `!goal`, never something
+        // derived from chat history - otherwise a goal the user just ended is re-minted on the
+        // next summarisation out of the very turns in which they ended it.
+        // foldHints: a Jev second opinion on the duplicates the store's own rule declines (the
+        // measured union - memory_fold_jev.js). Off, keyless or failing, it returns none and the
+        // import is exactly what it was.
+        const foldHints = await planFolds(this.store, summary);
+        this.store.importLegacyBlob(summary, { foldHints });
+        // Two lessons that contradict each other are both kept, and a person decides which is
+        // right - the store must not pick the casualty itself (memory_fold_jev.announceConflicts).
+        announceConflicts(this.agent, this.store, foldHints);
+        const blocked = this.store.rejections - rejectedBefore;
+        if (blocked > 0) {
+            console.log(`[History] memory store rejected ${blocked} agent write(s) against user-authored records.`);
         }
+        if (this.store.skippedGoals > 0) {
+            console.log(`[History] ignored ${this.store.skippedGoals} goal(s) the summariser tried `
+                + `to invent; goals come from !goal only. Current goal: ${this.store.goal() ?? 'none'}.`);
+        }
+        if (before && this.store.goal() !== before) {
+            console.warn('[History] user goal changed during summarisation - this should be impossible.');
+        }
+
+        const memory_cap = getBudget().memory_chars;
+        this.memory = this.store.render(memory_cap);
+        this.saveStore();
 
         console.log("Memory updated to: ", this.memory);
 
@@ -106,6 +225,28 @@ export class History {
             } catch (error) {
                 console.warn('[History] Failed to create memory embedding:', error.message);
             }
+        }
+    }
+
+    /**
+     * Distill any queued turns into memory. Safe to call repeatedly; no-ops when the queue is
+     * empty or a consolidation is already running.
+     * @returns {Promise<boolean>} whether work was done.
+     */
+    async consolidatePending() {
+        if (this.consolidating || this.pending_summary.length === 0) return false;
+        this.consolidating = true;
+        const chunk = this.pending_summary;
+        this.pending_summary = [];
+        try {
+            await this.summarizeMemories(chunk);
+            await this.save();
+            return true;
+        } catch (err) {
+            console.warn('[History] Consolidation failed:', err.message);
+            return false;
+        } finally {
+            this.consolidating = false;
         }
     }
 
@@ -147,7 +288,12 @@ export class History {
             // Check if memory saving is disabled (e.g., when using Letta which has its own memory)
             const useMemorySaving = this.agent.prompter?.profile?.use_memory_saving !== false;
             if (useMemorySaving) {
-                await this.summarizeMemories(chunk);
+                this.pending_summary.push(...chunk);
+                // Safety valve: if the bot never goes idle, don't let the backlog grow
+                // unbounded - fall back to consolidating inline.
+                if (this.pending_summary.length >= this.summary_chunk_size * 4) {
+                    await this.consolidatePending();
+                }
             } else {
                 console.log("[History] Memory saving disabled (external memory system in use)");
             }
@@ -164,6 +310,9 @@ export class History {
                 self_prompt: this.agent.self_prompter.isStopped() ? null : this.agent.self_prompter.prompt,
                 taskStart: this.agent.task.taskStartTime,
                 last_sender: this.agent.last_sender,
+                // Survives the restart on purpose: it is the whole point of the reconnect
+                // policy that a person's last instruction outlives the process.
+                last_directive: this.agent.last_directive ?? null,
                 saved_places: this.agent.memory_bank.getJson(),
                 named_chests: getNamedChestsJson()
             };
@@ -182,8 +331,16 @@ export class History {
                 return null;
             }
             const data = JSON.parse(readFileSync(this.memory_fp, 'utf8'));
-            this.memory = data.memory || '';
             this.turns = data.turns || [];
+
+            // The typed store is the source of truth; `this.memory` is its rendered view. On the
+            // first run it is seeded from the legacy blob so nothing already remembered is lost.
+            this.loadStore(data.memory || '');
+            this.memory = this.store.records.size ? this.store.render(getBudget().memory_chars)
+                                                  : (data.memory || '');
+            // The last human instruction, restored BEFORE the reconnect message is built - it is
+            // what decides whether the bot resumes anything at all.
+            if (data.last_directive) this.agent.last_directive = data.last_directive;
             // Load saved places if available
             if (data.saved_places && this.agent.memory_bank) {
                 this.agent.memory_bank.loadJson(data.saved_places);
@@ -259,4 +416,34 @@ export class History {
         }
         return formatted;
     }
+}
+
+/**
+ * Remove claims the model is not entitled to make in persistent memory.
+ *
+ * Command syntax is machine-derived from the command registry and injected every turn via
+ * $COMMAND_DOCS. When the model also writes its *own* version of that syntax into memory,
+ * the note is re-read and re-summarised each cycle, degrading a little each time - observed
+ * live: the real signature !fill(blockType, x1, z1, x2, z2, y, height) decayed into
+ * "!fill X1 Y1 Z1 X2 Y2 Z2 material" and then into "requires exactly 6 arguments", after
+ * which the bot confidently acted on its own corrupted note.
+ *
+ * Dropping these lines makes that failure structurally impossible: the only syntax the model
+ * ever sees is the generated one.
+ * @param {string} memory
+ * @returns {string}
+ */
+function stripGroundedFacts(memory) {
+    if (!memory) return memory;
+    const isSyntaxClaim = (line) => {
+        const l = line.toLowerCase();
+        const mentionsCallShape = /\b(arg|args|argument|parameter|param|syntax|format|signature)\w*\b/.test(l);
+        if (!mentionsCallShape) return false;
+        // Only strip when it is actually talking about how to CALL something: either it
+        // names a command, or it quantifies the call shape ("uses 6 args", "requires 6-7").
+        // Plain coordinates/counts elsewhere are left alone.
+        return /!\w+/.test(line) || /\d/.test(l);
+    };
+    const kept = memory.split('\n').filter(line => !isSyntaxClaim(line));
+    return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
 }

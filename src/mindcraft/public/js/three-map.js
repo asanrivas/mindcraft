@@ -160,32 +160,24 @@ class ThreeDMap {
     update(positions) {
         if (!this.initialized || !positions || positions.length === 0) return;
 
-        // Path data
+        // Anchor is the CURRENT (most recent) position, so the scene origin
+        // — and therefore the axes/grid — always represents "here". The
+        // trail is drawn behind it in relative coordinates.
         const points = [];
-        const startPos = positions[0]; // Anchor point
-        const origin = new THREE.Vector3(startPos.x, startPos.y, startPos.z);
-
-        let minX = Infinity, maxX = -Infinity;
-        let minY = Infinity, maxY = -Infinity;
-        let minZ = Infinity, maxZ = -Infinity;
+        const currentPos = positions[positions.length - 1];
+        const origin = new THREE.Vector3(currentPos.x, currentPos.y, currentPos.z);
 
         positions.forEach(p => {
             if (p) {
-                // Normalize relative to start (0,0,0)
                 const vec = new THREE.Vector3(p.x - origin.x, p.y - origin.y, p.z - origin.z);
-                
+
                 // Debounce/Filter very close points to avoid tube artifacts
                 if (points.length > 0) {
                     const last = points[points.length - 1];
                     if (last.distanceTo(vec) < 0.1) return;
                 }
-                
+
                 points.push(vec);
-                
-                // Track bounds
-                minX = Math.min(minX, vec.x); maxX = Math.max(maxX, vec.x);
-                minY = Math.min(minY, vec.y); maxY = Math.max(maxY, vec.y);
-                minZ = Math.min(minZ, vec.z); maxZ = Math.max(maxZ, vec.z);
             }
         });
 
@@ -203,42 +195,30 @@ class ThreeDMap {
             } else {
                 this.trail.geometry = this.tubeGeometry;
             }
-            
-            // Update last point marker
-            const lastPoint = points[points.length - 1];
-            this.marker.position.copy(lastPoint);
+        }
 
-            // Update Overlay with current absolute coordinates
-            const currentPos = positions[positions.length - 1];
-            this.overlay.innerHTML = `
-                <div style="margin-bottom: 4px; font-weight: bold; color: #fff;">POSITION</div>
-                <div><span style="color: #ff5252">X:</span> ${currentPos.x.toFixed(1)}</div>
-                <div><span style="color: #69f0ae">Y:</span> ${currentPos.y.toFixed(1)}</div>
-                <div><span style="color: #448aff">Z:</span> ${currentPos.z.toFixed(1)}</div>
-            `;
+        // Current position is always the anchor, so the marker sits at the
+        // scene origin — coincident with the axes helper — regardless of
+        // where the agent actually is in the world.
+        this.marker.position.set(0, 0, 0);
 
-            // Auto-center camera on first update
-            if (!this.hasCentered && this.controls) {
-                this.controls.target.copy(lastPoint);
-                // Position camera for isometric-style view
-                this.camera.position.set(lastPoint.x + 60, lastPoint.y + 60, lastPoint.z + 60);
-                this.camera.zoom = 2;
-                this.camera.updateProjectionMatrix();
-                this.controls.update();
-                this.hasCentered = true;
-            }
-        } else if (points.length === 1) {
-            // Single point case
-            const lastPoint = points[0];
-            this.marker.position.copy(lastPoint);
+        // Overlay still reports the true world coordinates of "here"
+        this.overlay.innerHTML = `
+            <div style="margin-bottom: 4px; font-weight: bold; color: #fff;">POSITION</div>
+            <div><span style="color: #ff5252">X:</span> ${currentPos.x.toFixed(1)}</div>
+            <div><span style="color: #69f0ae">Y:</span> ${currentPos.y.toFixed(1)}</div>
+            <div><span style="color: #448aff">Z:</span> ${currentPos.z.toFixed(1)}</div>
+        `;
 
-            const currentPos = positions[0];
-            this.overlay.innerHTML = `
-                <div style="margin-bottom: 4px; font-weight: bold; color: #fff;">POSITION</div>
-                <div><span style="color: #ff5252">X:</span> ${currentPos.x.toFixed(1)}</div>
-                <div><span style="color: #69f0ae">Y:</span> ${currentPos.y.toFixed(1)}</div>
-                <div><span style="color: #448aff">Z:</span> ${currentPos.z.toFixed(1)}</div>
-            `;
+        // "Here" is always (0,0,0) now, so the camera only needs to be
+        // aimed at the origin once — it never has to re-center again.
+        if (!this.hasCentered && this.controls) {
+            this.controls.target.set(0, 0, 0);
+            this.camera.position.set(60, 60, 60);
+            this.camera.zoom = 2;
+            this.camera.updateProjectionMatrix();
+            this.controls.update();
+            this.hasCentered = true;
         }
     }
 

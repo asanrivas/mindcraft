@@ -549,10 +549,88 @@ export async function isClearPath(bot, target) {
     return path.status === 'success';
 }
 
+/** Light level at or above which a torch buys nothing. Vanilla hostile spawning is at 0. */
+export const TORCH_LIGHT_LEVEL = 8;
+
+let _torchLightLoggedAt = 0;
+
+/**
+ * The torch decision, as pure arithmetic. Separated from the world reads so it can be tested
+ * without a server - the live check can only ever exercise whichever quadrant the world
+ * happens to be in right now.
+ *
+ * Verified live 2026-08-26 that the inputs are real on this server: a surface block read
+ * `block=0 sky=14 timeOfDay=17697`.
+ *
+ * @param {number} blockLight  light from torches/lava/etc at the bot's feet
+ * @param {number} skyLight    UNSCALED sky light - 15 at the surface at midnight just as at noon
+ * @param {number} timeOfDay   0..24000
+ */
+export function torchIsWorthIt(blockLight, skyLight, timeOfDay) {
+    // Already lit by something. A second torch changes nothing.
+    if (blockLight >= TORCH_LIGHT_LEVEL) return false;
+    // Sky light is stored unscaled - the client applies the time-of-day factor - so it alone
+    // cannot tell you whether daylight is actually reaching this block. Vanilla night is
+    // roughly 13000..23000.
+    const isNight = timeOfDay >= 13000 && timeOfDay < 23000;
+    if (skyLight >= TORCH_LIGHT_LEVEL && !isNight) return false;
+    return true;
+}
+
+/**
+ * Is it actually dark where the bot is standing?
+ *
+ * `block.light` is broken (which is why this used to be a TODO and torch placing was gated on
+ * "no torch within 6 blocks" alone), but the CHUNK light data is fine and reachable
+ * synchronously: `bot.world` is prismarine-world's `.sync` view, which exposes `getBlockLight`
+ * and `getSkyLight`.
+ *
+ * Why this matters beyond wasted torches: `torch_placing` lists `action:followPlayer` in its
+ * `interrupts`, so every firing stops the follow. Without a light check it fired in a bright
+ * desert at dawn, every 5 seconds, and the follow never got more than a few seconds of run.
+ *
+ * The decision itself is `torchIsWorthIt` above.
+ *
+ * Fails OPEN. If the light accessors are missing or throw, or the chunk is not loaded (both
+ * getters return 0 there, which would read as pitch dark), fall back to the old behaviour
+ * rather than silently disabling a mode.
+ */
+function isDarkEnoughForTorch(bot) {
+    const world = bot.world;
+    if (!world || typeof world.getBlockLight !== 'function'
+               || typeof world.getSkyLight !== 'function') return true;
+
+    const feet = getPosition(bot).floored();
+    // An unloaded column reports 0 light, which is indistinguishable from a dark cave. The bot
+    // is standing here, so its own chunk should be loaded; if it is not, do not guess.
+    if (!bot.blockAt(feet)) return true;
+
+    let blockLight, skyLight;
+    try {
+        blockLight = world.getBlockLight(feet);
+        skyLight = world.getSkyLight(feet);
+    } catch {
+        return true;
+    }
+    if (typeof blockLight !== 'number' || typeof skyLight !== 'number') return true;
+
+    const t = bot.time?.timeOfDay ?? 0;
+    const dark = torchIsWorthIt(blockLight, skyLight, t);
+
+    // Log only when the light data CHANGES the answer, and at most once every 10s. This runs on
+    // every mode update tick; an unconditional log would bury the service log.
+    if (!dark && Date.now() - _torchLightLoggedAt > 10000) {
+        _torchLightLoggedAt = Date.now();
+        console.log(`[${bot.username ?? '?'}] torch_placing: skipping, lit here `
+            + `(block=${blockLight} sky=${skyLight} timeOfDay=${t}) at ${feet}`);
+    }
+    return dark;
+}
+
 export function shouldPlaceTorch(bot) {
     if (!bot.modes.isOn('torch_placing') || bot.interrupt_code) return false;
     const pos = getPosition(bot);
-    // TODO: check light level instead of nearby torches, block.light is broken
+    if (!isDarkEnoughForTorch(bot)) return false;
     let nearest_torch = getNearestBlock(bot, 'torch', 6);
     if (!nearest_torch)
         nearest_torch = getNearestBlock(bot, 'wall_torch', 6);

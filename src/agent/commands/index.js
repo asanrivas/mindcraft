@@ -13,7 +13,13 @@ for (let command of commandList) {
 
 // ============= COMMAND ALIASES =============
 // Short aliases map to full command names (saves tokens in prompts)
-const COMMAND_ALIASES = {
+// An alias must resolve to a command the caller can actually reach. 'ca' -> !fill and
+// 'gtc' -> !goToCoordinates were left behind when those two were added to blocked_actions,
+// so they expanded into a name that blacklistCommands had already spliced out of commandMap
+// (expandCommandAlias resolves against its own table and never consults commandMap), leaving
+// a command that cannot be looked up. tests/command_docs.test.mjs fails the build if a new
+// dangling alias appears.
+export const COMMAND_ALIASES = {
     // Chest commands (all start with 'c' prefix)
     'cp': 'chestPut',
     'ct': 'chestTake',
@@ -22,18 +28,23 @@ const COMMAND_ALIASES = {
     'cl': 'chestList',
     'cn': 'chestName',
     'cln': 'chestListNamed',
-    'cf': 'chestForget',
+    // 'cf' USED TO MEAN chestForget, one letter from 'cfi' = chestFind - two commands that do
+    // opposite things (look an item up vs drop a saved chest name), and not the prefix pattern
+    // cp/cpn and ct/ctn follow. A model reaching for "chest find" and emitting !cf dropped a
+    // name instead. forgetChest deletes only the label, not the container - but it persists
+    // through saveNamedChestsCallback, so the name is gone across restarts. 'cf' now points at
+    // the READ-ONLY command, and chestForget has no alias at all: it is rare, it is the only
+    // one here that discards state, and an unrecognised !cfg is a harmless error.
+    'cf': 'chestFind',
     'cpn': 'chestPutNamed',
     'ctn': 'chestTakeNamed',
     'cvn': 'chestViewNamed',
     'cds': 'chestDepositSorted',
-    'cfi': 'chestFind',
     'ctr': 'chestTransfer',
     'dis': 'discard',
     
     // Movement commands
     'gtp': 'goToPlayer',
-    'gtc': 'goToCoordinates',
     'fp': 'followPlayer',
     'ma': 'moveAway',
     'sfb': 'searchForBlock',
@@ -48,9 +59,9 @@ const COMMAND_ALIASES = {
     'eat': 'consume',
     'ph': 'placeHere',
     'gtb': 'goToBed',
-    'ca': 'fill',
     'pt': 'plantTrees',
-    
+    'prg': 'progressTo',
+
     // Info commands
     'inv': 'inventory',
     'st': 'stats',
@@ -112,7 +123,11 @@ export function blacklistCommands(commands) {
             continue;
         }
         delete commandMap[command_name];
-        delete commandList.find(command => command.name === command_name);
+        // `delete commandList.find(...)` deleted a property off the found object rather
+        // than removing the element, so blacklisted commands stayed in commandList (and
+        // therefore in getCommandDocs). Splice the element out instead.
+        const idx = commandList.findIndex(command => command.name === command_name);
+        if (idx !== -1) commandList.splice(idx, 1);
     }
 }
 
@@ -121,6 +136,31 @@ const argRegex = /-?\d+(?:\.\d+)?|true|false|"[^"]*"/g;
 
 // Regex for space-separated format: !command "arg1" arg2 or !command arg1 arg2
 const spaceSeparatedRegex = /^!(\w+)\s+(.+)$/;
+
+/**
+ * Find the command invocation to act on, preferring one that actually carries arguments.
+ * Models routinely name a command in prose first ("I'll use the correct syntax for
+ * `!fill`:") and only then call it properly on the next line. Taking the plain first
+ * regex match grabs the bare mention, which makes a valid call report "given 0 args"
+ * and - via truncCommandMessage - discards the real invocation entirely.
+ * Only a later match of the SAME command is preferred, so an unrelated command later in
+ * the message is never run in place of the first one.
+ * @param {string} message
+ * @returns {RegExpMatchArray | null}
+ */
+function findCommandMatch(message) {
+    let best = null;
+    const globalCommandRegex = new RegExp(commandRegex.source, 'g');
+    for (const m of message.matchAll(globalCommandRegex)) {
+        if (!best) {
+            best = m; // fall back to the first mention
+            if (m[2]) break; // already has args, nothing better to find
+            continue;
+        }
+        if (m[2] && m[1] === best[1]) { best = m; break; }
+    }
+    return best;
+}
 
 /**
  * Normalize various quote characters to standard ASCII double quotes
@@ -337,7 +377,7 @@ export function parseCommandMessage(message) {
     // Normalize space-separated format to parenthesis format
     message = normalizeCommandFormat(message);
     
-    const commandMatch = message.match(commandRegex);
+    const commandMatch = findCommandMatch(message);
     if (!commandMatch) return `Command is incorrectly formatted`;
 
     const commandName = "!"+commandMatch[1];
@@ -423,11 +463,26 @@ export function parseCommandMessage(message) {
 export function truncCommandMessage(message) {
     // Normalize space-separated format first
     const normalized = normalizeCommandFormat(message);
-    const commandMatch = normalized.match(commandRegex);
+    // Must use the same selection as parseCommandMessage: truncating at a bare prose
+    // mention would cut off the real invocation that follows it.
+    const commandMatch = findCommandMatch(normalized);
     if (commandMatch) {
         return normalized.substring(0, commandMatch.index + commandMatch[0].length);
     }
     return message;
+}
+
+/**
+ * Would running this command take the bot over - stop what it is doing and drive it?
+ *
+ * Set by `runAsAction`, so it is true exactly for the commands that call
+ * `agent.actions.runAction` and therefore cancel whatever is already running. A command that
+ * only reads state (!marathonStatus) is in the action list but takes nothing over, and must not
+ * be blocked by the user-ownership guard - the model still needs to see what is happening.
+ */
+export function takesOverBot(name) {
+    const command = getCommand(name);
+    return !!command && command.perform?.takesOverBot === true;
 }
 
 export function isAction(name) {
@@ -501,6 +556,52 @@ function getCommandAlias(commandName) {
 }
 
 /**
+ * Whether a command should be left out of the docs the model sees. blocked_actions are
+ * already gone from commandList (blacklistCommands splices them out), so this is really
+ * about hidden_actions - commands that stay callable from chat but must not be offered
+ * to the model.
+ * @param {Object} agent
+ * @param {string} name
+ * @returns {boolean}
+ */
+function isHiddenFromDocs(agent, name) {
+    if (agent.blocked_actions?.includes(name)) return true;
+    if (agent.hidden_actions?.includes(name)) return true;
+    return false;
+}
+
+// The disambiguation in a command description lives in its SECOND sentence - "Use this
+// instead of !collectBlocks for ores", "Do NOT use to build structures", "Disabled unless a
+// marker file is present". Truncating to the first sentence deleted all of it, and the model
+// was left choosing between commands that read identically.
+const KEEP_SENTENCE = /^(Use|Do NOT|Do not|Don't|Prefer|Refuses|Refused|Needs|Requires|Takes|Will|Only|Disabled|Set up|Pauses)\b/;
+const DESC_FIRST_MAX = 120;   // first sentence
+const DESC_TOTAL_MAX = 210;   // first sentence + any kept follow-ups
+
+/**
+ * Shorten a command description for compact docs without losing the clause that
+ * distinguishes it from its neighbours.
+ * @param {string} description
+ * @returns {string}
+ */
+export function compactDescription(description) {
+    // A sentence ends at ". " followed by a CAPITAL or a "!command" - never at a bare "."
+    // ("swim.climbBank") and never mid-abbreviation ("e.g. \"4412,4934 ...\"", which is the
+    // only place !marathonRoute's argument format is documented).
+    const sentences = description.trim().split(/(?<=\.)\s+(?=[A-Z!])/);
+
+    let out = sentences[0];
+    if (out.length > DESC_FIRST_MAX) out = out.substring(0, DESC_FIRST_MAX - 3) + '...';
+
+    for (const sentence of sentences.slice(1)) {
+        if (!KEEP_SENTENCE.test(sentence)) continue;
+        if (out.length + sentence.length + 1 > DESC_TOTAL_MAX) break;
+        out += ' ' + sentence;
+    }
+    return out;
+}
+
+/**
  * Generate command documentation based on mode setting
  * @param {Object} agent 
  * @returns {string} command documentation
@@ -528,7 +629,7 @@ export function getCommandDocs(agent) {
         
         const cmdNames = [];
         for (let command of commandList) {
-            if (agent.blocked_actions.includes(command.name)) continue;
+            if (isHiddenFromDocs(agent, command.name)) continue;
             const alias = getCommandAlias(command.name);
             const aliasStr = (showAliases && alias) ? `[${alias}]` : '';
             cmdNames.push(`${command.name}${aliasStr}`);
@@ -542,14 +643,12 @@ export function getCommandDocs(agent) {
         docs += `*\n`;
         
         for (let command of commandList) {
-            if (agent.blocked_actions.includes(command.name)) continue;
+            if (isHiddenFromDocs(agent, command.name)) continue;
             
             const alias = getCommandAlias(command.name);
             const aliasStr = (showAliases && alias) ? `[${alias}]` : '';
             
-            // Shorten description to first sentence or 60 chars
-            let shortDesc = command.description.split('.')[0];
-            if (shortDesc.length > 60) shortDesc = shortDesc.substring(0, 57) + '...';
+            let shortDesc = compactDescription(command.description);
             
             // Inline params
             let paramStr = '';
@@ -571,7 +670,7 @@ export function getCommandDocs(agent) {
         docs += `\nUse double quotes for strings. One command per response.\n`;
         
         for (let command of commandList) {
-            if (agent.blocked_actions.includes(command.name)) continue;
+            if (isHiddenFromDocs(agent, command.name)) continue;
             
             const alias = getCommandAlias(command.name);
             const aliasStr = (showAliases && alias) ? ` [${alias}]` : '';
